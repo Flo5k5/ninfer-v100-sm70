@@ -55,7 +55,7 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 // ~0.17%; 19.6x measured speedup at the real N=5120/K=17408/T=256 down-proj shape on this
 // V100). Cold-cache sweeps place both CUTLASS crossovers at T=17: for k=6144 the last SIMT
 // win is T=16 (429us versus 439us), while for k=17408 the exact split2 route owns through T=16
-// and the former wide-T SIMT route is already slower than CUTLASS at T=17. See the V100 performance summary.
+// and the former wide-T SIMT route is already slower than CUTLASS at T=17. See docs/v100.md.
 constexpr std::array<RouteSpec, 4> kK6144Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
     {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},

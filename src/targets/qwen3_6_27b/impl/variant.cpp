@@ -43,10 +43,6 @@ void validate_token_interval(std::int32_t first, std::int32_t last) {
     }
 }
 
-// Volta has neither FP4 nor FP8 activation hardware: cvt.e2m1x2 is Blackwell, and the A8 route's
-// mma.sync.kind::f8f6f4 needs sm_89 (ptxas rejects the PTX below that, so it is a compile-time
-// fact, not a runtime one). Both weight formats keep their A16 routes, which is what W4A16/W8A16
-// on this card was always going to be.
 #ifdef NINFER_VOLTA_BUILD
 constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::A16Only;
 constexpr ops::LinearPolicy kFp8TextPolicy   = ops::LinearPolicy::A16Only;
@@ -353,9 +349,6 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        // Upper bound: nonzero only on Volta wide-T (the CUTLASS tensor-core route); the
-        // fused-payload branch and every other route need no transient allocation, so this
-        // conservatively over-reserves for those without being wrong.
         return ops::q4_q5_attn_input_proj_workspace_capacity_bytes(first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
@@ -396,9 +389,6 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        // Upper bound: nonzero only on Volta wide-T (the CUTLASS tensor-core route); the
-        // fused-payload branch and every other route need no transient allocation, so this
-        // conservatively over-reserves for those without being wrong.
         return ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,

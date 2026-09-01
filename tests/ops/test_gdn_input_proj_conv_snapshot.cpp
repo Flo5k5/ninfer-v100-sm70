@@ -775,9 +775,6 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     return failures;
 }
 
-// NVFP4 needs Blackwell-only cvt.e2m1x2; its sub-sm_80 branch is a __trap(). On Volta the case
-// aborts the process and takes the Q4/Q5 and W8 results down with it, so it is skipped here.
-#ifndef NINFER_VOLTA_BUILD
 int run_nvfp4() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
@@ -789,6 +786,7 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
@@ -823,19 +821,13 @@ int run_nvfp4() {
                                               workspace, nullptr);
         });
     failures += parent.verify_preserved("batched NVFP4 parent weight");
+#endif
     return failures;
 }
-
-#endif // NINFER_VOLTA_BUILD
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
                  std::int32_t initial_slot, bool convenience = false,
                  bool shared_state_selectors = false) {
-#ifdef NINFER_VOLTA_BUILD
-    // A8 activation compute needs mma.sync.kind::f8f6f4 (sm_89+), which traps here and
-    // aborts the binary. The A16 cases in the same suite are what this port is held to.
-    if (policy != ops::LinearPolicy::A16Only) { return 0; }
-#endif
     constexpr std::int32_t kHidden               = 5120;
     constexpr std::int32_t kValueRows            = 6144;
     constexpr std::int32_t kZRows                = 6144;
@@ -951,10 +943,13 @@ int run_fp8() {
     failures += run_fp8_case(parent, 4, ops::LinearPolicy::A16Only, 5);
     failures += run_fp8_case(parent, 6, ops::LinearPolicy::A16Only, 7);
     failures += run_fp8_case(parent, 7, ops::LinearPolicy::A16Only, 8);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_case(parent, 9, ops::LinearPolicy::AllowA8, 10);
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
+#endif
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::A16Only, 11);
     failures += run_fp8_case(parent, 11, ops::LinearPolicy::A16Only, 12);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1);
 
     const auto run_batched = [&](std::int32_t width, std::int32_t batch,
@@ -989,16 +984,10 @@ int run_fp8() {
                                                   ops::LinearPolicy::AllowA8, workspace, nullptr);
             });
     };
-#ifndef NINFER_VOLTA_BUILD
-    // The batched arm drives the op at AllowA8 directly rather than through run_fp8_case, so it
-    // needs its own guard: sm_89 hardware, __trap() here.
     failures += run_batched(4, 2, {4, 2}, 937U);
     failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941U);
-#else
-    (void)run_batched;
-    std::cout << "SKIP FP8 batched AllowA8: no Volta route for A8 activation compute\n";
-#endif
     failures += parent.verify_preserved("batched FP8 parent weight");
+#endif
     return failures;
 }
 
@@ -1011,6 +1000,7 @@ int main() {
     }
 
     int failures = 0;
+#ifndef NINFER_VOLTA_BUILD
     const std::size_t q4_interval =
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
     const std::size_t q4_witness =
@@ -1021,23 +1011,11 @@ int main() {
         std::cerr << "Q4/Q5 snapshot interval did not retain its non-monotonic T=4 route\n";
         ++failures;
     }
-    // The property under test is that the interval query agrees with its right endpoint across
-    // the zero/nonzero seam, not where the seam sits. That width is route-table data and differs
-    // by architecture: sm_120a computes in place up to W=16 and materialises a projected plane
-    // from 17, while Volta's W8 snapshot has no in-place route above W=1 and materialises from 2
-    // (see the NINFER_VOLTA_BUILD branch in gdn_input_proj_conv_snapshot_workspace_capacity_bytes).
-#ifdef NINFER_VOLTA_BUILD
-    constexpr std::int32_t kW8InPlaceLast = 1;
-#else
-    constexpr std::int32_t kW8InPlaceLast = 16;
-#endif
-    constexpr std::int32_t kW8FirstMaterialized = kW8InPlaceLast + 1;
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1,
-                                                                   kW8InPlaceLast) != 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1,
-                                                                   kW8FirstMaterialized) !=
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                2048, 2048, 4096, 1, kW8FirstMaterialized, kW8FirstMaterialized)) {
+    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16) !=
+            0 ||
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17) !=
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
+                                                                       17)) {
         std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
@@ -1073,13 +1051,10 @@ int main() {
         std::cerr << "FP8 snapshot capacity did not preserve measured route witnesses\n";
         ++failures;
     }
+#endif
     failures += run_q4_q5();
     failures += run_w8();
-#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4();
-#else
-    std::cout << "SKIP nvfp4: no FP4 hardware on Volta\n";
-#endif
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;

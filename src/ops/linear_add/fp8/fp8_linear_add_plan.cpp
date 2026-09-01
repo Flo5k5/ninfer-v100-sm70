@@ -34,11 +34,6 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
     }
     if (policy == LinearPolicy::A16Only) {
 #ifdef NINFER_VOLTA_BUILD
-        // T==1 keeps the fused decode kernel; T>=2 takes linear()+residual_add() instead of the
-        // fused small_t kernel, exactly mirroring the NVFP4 linear_add fix -- linear() now reaches
-        // QPN8 (fp8_dispatch.cpp's launch_a16) and this op's fused kernel never did. Safe the same
-        // way NVFP4's was: the only new rounding step feeds a plain addition, not a nonlinearity,
-        // so it doesn't compound the way linear_swiglu's did.
         return tokens == 1 ? Fp8LinearAddRoute::A16 : Fp8LinearAddRoute::LinearThenAdd;
 #else
         return Fp8LinearAddRoute::A16;
@@ -76,8 +71,8 @@ Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::i
 
 void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& residual,
                             WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope        = workspace.scope();
-    Tensor projected   = allocate_projected(workspace, weight.n, x.ne[1]);
+    auto scope      = workspace.scope();
+    Tensor projected = allocate_projected(workspace, weight.n, x.ne[1]);
     if (x.ne[1] >= 33) {
         fp8_cutlass_sm70_launch(x, weight, projected, workspace, stream);
     } else {
@@ -95,16 +90,18 @@ std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32
                                             std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected(layout, output_rows, tokens);
-    const std::size_t linear_bytes = tokens >= 33
-        ? fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens)
-        : std::max<std::size_t>(
-              linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S, output_rows, input_rows,
-                                              LinearPolicy::A16Only, tokens, tokens),
-              256);
+    const std::size_t linear_bytes =
+        tokens >= 33
+            ? fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens)
+            : std::max<std::size_t>(
+                  linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S, output_rows,
+                                                  input_rows, LinearPolicy::A16Only, tokens,
+                                                  tokens),
+                  256);
     (void)layout.alloc_bytes(linear_bytes, 256);
     return layout.peak_bytes(1);
 }
-#endif // NINFER_VOLTA_BUILD
+#endif
 
 } // namespace
 

@@ -2,8 +2,8 @@
 //
 // Drives the vendored llama.cpp MMA flash-attention kernel
 // (third_party/llama_cpp_fattn, pinned at 62bf73d25) from a ninfer-native
-// launcher. Rationale, phase gates and measurements: the V100 implementation and
-// the V100 implementation.
+// launcher. The implementation and qualification rationale are documented in
+// docs/v100.md.
 //
 // This is the only translation unit that sees the vendored headers, which is
 // why the vendored include directory is scoped to this file in CMake: the
@@ -22,10 +22,10 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
-#include "ops/kernel/gqa_attention_geometry.cuh"
-#include "ops/kernel/gqa_attention_kv_quant.cuh"
+#include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
+#include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
-#include "ops/launcher/gqa_attention.h"
+#include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -56,13 +56,13 @@ template <typename Geometry>
 struct VoltaFlashTiling;
 
 template <>
-struct VoltaFlashTiling<Gqa27Geometry> {
+struct VoltaFlashTiling<CausalD256H24Kv4> {
     static constexpr int ncols2 = 2;
     static constexpr int ncols1 = 16;
 };
 
 template <>
-struct VoltaFlashTiling<Gqa35Geometry> {
+struct VoltaFlashTiling<CausalD256H16Kv2> {
     static constexpr int ncols2 = 8;
     static constexpr int ncols1 = 4;
 };
@@ -133,9 +133,9 @@ __device__ __forceinline__ float volta_flash_warp_max(float value) {
     return value;
 }
 
-// BF16 input -> paged INT8-G64 cache. Eight warps independently own one
-// (token, kv-head, 64-d group), matching the cache's public quantization
-// contract and the existing prefill append kernel.
+// BF16 input -> paged INT8-G64 cache. One warp owns a complete D256 K/V row so
+// K crosses the exact normalized-Hadamard boundary before its four independent
+// G64 encoders. V is encoded without rotation.
 template <int kKVHeads>
 __launch_bounds__(256) __global__ void volta_flash_append_kv_i8_kernel(
         const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
@@ -147,48 +147,51 @@ __launch_bounds__(256) __global__ void volta_flash_append_kv_i8_kernel(
     const int warp       = static_cast<int>(threadIdx.x) >> 5;
     const int lane       = static_cast<int>(threadIdx.x) & 31;
     const int unit       = static_cast<int>(blockIdx.x) * kWarps + warp;
-    const int units      = width * kKVHeads * kGqaKvQuantGroups;
+    const int units      = width * kKVHeads;
     if (unit >= units) { return; }
 
-    const int group   = unit % kGqaKvQuantGroups;
-    const int tmp     = unit / kGqaKvQuantGroups;
-    const int h       = tmp % kKVHeads;
-    const int token   = tmp / kKVHeads;
-    const int d0      = group * kGqaKvQuantGroup + lane;
-    const std::int64_t src0 =
-        static_cast<std::int64_t>(d0) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * token);
-    const std::int64_t src1 = src0 + 32;
-
-    const float k0 = __bfloat162float(k[src0]);
-    const float k1 = __bfloat162float(k[src1]);
-    const float v0 = __bfloat162float(v[src0]);
-    const float v1 = __bfloat162float(v[src1]);
-    const float ka = volta_flash_warp_max(fmaxf(fabsf(k0), fabsf(k1)));
-    const float va = volta_flash_warp_max(fmaxf(fabsf(v0), fabsf(v1)));
-    const half ks  = __float2half_rn(ka > 0.0f ? ka / 127.0f : 0.0f);
-    const half vs  = __float2half_rn(va > 0.0f ? va / 127.0f : 0.0f);
-    const float ksf = __half2float(ks);
-    const float vsf = __half2float(vs);
-    const float ki  = ksf > 0.0f ? 1.0f / ksf : 0.0f;
-    const float vi  = vsf > 0.0f ? 1.0f / vsf : 0.0f;
+    const int h     = unit % kKVHeads;
+    const int token = unit / kKVHeads;
+    const std::int64_t src_base =
+        kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * token);
+    float k_values[8];
+    float v_values[8];
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        const int d  = lane + 32 * item;
+        k_values[item] = __bfloat162float(k[src_base + d]);
+        v_values[item] = __bfloat162float(v[src_base + d]);
+    }
+    normalized_hadamard_d256_inplace(k_values, lane);
 
     const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
     const int position               = positions[token];
     int physical_page = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     physical_page     = __shfl_sync(0xffffffffu, physical_page, 0);
     const int page_offset = position & kPagedKVPageMask;
-    const std::int64_t code_base = paged_kv_element_offset<kHeadDim, kKVHeads>(
-        physical_page, h, page_offset, group * kGqaKvQuantGroup);
-
-    k_pages[code_base + lane]      = gqa_kv_quant_code(k0, ki);
-    k_pages[code_base + lane + 32] = gqa_kv_quant_code(k1, ki);
-    v_pages[code_base + lane]      = gqa_kv_quant_code(v0, vi);
-    v_pages[code_base + lane + 32] = gqa_kv_quant_code(v1, vi);
-    if (lane == 0) {
-        const std::int64_t scale_offset = paged_kv_element_offset<kGqaKvQuantGroups, kKVHeads>(
-            physical_page, h, page_offset, group);
-        k_scales[scale_offset] = ks;
-        v_scales[scale_offset] = vs;
+    #pragma unroll
+    for (int group = 0; group < kKVCacheInt8Groups; ++group) {
+        const float k0 = k_values[2 * group];
+        const float k1 = k_values[2 * group + 1];
+        const float v0 = v_values[2 * group];
+        const float v1 = v_values[2 * group + 1];
+        const auto kp  = kv_cache_int8_quant_params(
+            volta_flash_warp_max(fmaxf(fabsf(k0), fabsf(k1))));
+        const auto vp  = kv_cache_int8_quant_params(
+            volta_flash_warp_max(fmaxf(fabsf(v0), fabsf(v1))));
+        const std::int64_t code_base = paged_kv_element_offset<kHeadDim, kKVHeads>(
+            physical_page, h, page_offset, group * kKVCacheInt8Group);
+        k_pages[code_base + lane] = kv_cache_int8_quant_code(k0, kp.inverse_scale);
+        k_pages[code_base + lane + 32] = kv_cache_int8_quant_code(k1, kp.inverse_scale);
+        v_pages[code_base + lane] = kv_cache_int8_quant_code(v0, vp.inverse_scale);
+        v_pages[code_base + lane + 32] = kv_cache_int8_quant_code(v1, vp.inverse_scale);
+        if (lane == 0) {
+            const std::int64_t scale_offset =
+                paged_kv_element_offset<kKVCacheInt8Groups, kKVHeads>(
+                    physical_page, h, page_offset, group);
+            k_scales[scale_offset] = kp.scale;
+            v_scales[scale_offset] = vp.scale;
+        }
     }
 }
 
@@ -249,9 +252,9 @@ __global__ void volta_flash_gather_kv_i8_kernel(
 
     const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
     const std::int64_t code = paged_kv_element_offset<kHeadDim, kKVHeads>(block_table, h, key, d);
-    const int group         = d / kGqaKvQuantGroup;
+    const int group         = d / kKVCacheInt8Group;
     const std::int64_t scale =
-        paged_kv_element_offset<kGqaKvQuantGroups, kKVHeads>(block_table, h, key, group);
+        paged_kv_element_offset<kKVCacheInt8Groups, kKVHeads>(block_table, h, key, group);
     k_out[dst] = __float2half(static_cast<float>(k_pages[code]) * __half2float(k_scales[scale]));
     v_out[dst] = __float2half(static_cast<float>(v_pages[code]) * __half2float(v_scales[scale]));
 }
@@ -263,6 +266,29 @@ __global__ void volta_flash_convert_q_kernel(const __nv_bfloat16* __restrict__ q
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
     out[i] = __bfloat162float(q[i]);
+}
+
+// INT8 K is stored in the rotated basis, so Q must cross the same transform
+// before the FP16 flash kernel evaluates QK.
+__launch_bounds__(256) __global__ void volta_flash_convert_q_i8_kernel(
+        const __nv_bfloat16* __restrict__ q, float* __restrict__ out, int rows) {
+    constexpr int kWarps = 8;
+    const int row = static_cast<int>(blockIdx.x) * kWarps +
+                    (static_cast<int>(threadIdx.x) >> 5);
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (row >= rows) { return; }
+    float values[8];
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        const int d = lane + 32 * item;
+        values[item] = __bfloat162float(q[static_cast<std::int64_t>(row) * kHeadDim + d]);
+    }
+    normalized_hadamard_d256_inplace(values, lane);
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        const int d = lane + 32 * item;
+        out[static_cast<std::int64_t>(row) * kHeadDim + d] = values[item];
+    }
 }
 
 // FP32 -> BF16 on the way back out, same element order.
@@ -445,7 +471,7 @@ std::size_t meta_elements_impl(std::int32_t tokens) {
 template <typename Geometry>
 void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& positions, const Tensor& table_rows, float scale,
-                             PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                             PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
                              std::int32_t q_block_tokens, Tensor& k_gathered, Tensor& v_gathered,
                              Tensor& mask, Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta,
                              Tensor& out, cudaStream_t stream) {
@@ -463,7 +489,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     // 1. Append this call's K/V for the whole width.
     if (cache.dtype == DType::I8) {
         constexpr int kWarpsPerBlock = 8;
-        const int units              = width * kKVHeads * kGqaKvQuantGroups;
+        const int units              = width * kKVHeads;
         const int blocks             = (units + kWarpsPerBlock - 1) / kWarpsPerBlock;
         volta_flash_append_kv_i8_kernel<kKVHeads><<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
@@ -516,10 +542,16 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
         const int convert_blocks =
             static_cast<int>((q_count + kConvertThreads - 1) / kConvertThreads);
 
-        volta_flash_convert_q_kernel<<<convert_blocks, kConvertThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data) +
-                static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
-            static_cast<float*>(q_f32.data), q_count);
+        const auto* q_begin = static_cast<const __nv_bfloat16*>(q.data) +
+                              static_cast<std::int64_t>(begin) * kQHeads * kHeadDim;
+        if (cache.dtype == DType::I8) {
+            const int rows = tokens * kQHeads;
+            volta_flash_convert_q_i8_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(
+                q_begin, static_cast<float*>(q_f32.data), rows);
+        } else {
+            volta_flash_convert_q_kernel<<<convert_blocks, kConvertThreads, 0, stream>>>(
+                q_begin, static_cast<float*>(q_f32.data), q_count);
+        }
 
         // The mask extent is the padded key count, so every key the kernel can touch
         // has a defined mask entry; keys past a row's causal limit -- padding included
@@ -548,27 +580,27 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 
 // The two registered geometries differ only in tiling; both are instantiated so
 // the route can serve 27B (24q/4kv) and 35B-A3B (16q/2kv) from one launcher.
-std::size_t gqa_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens) {
-    if (q_heads == Gqa27Geometry::QHeads) { return meta_elements_impl<Gqa27Geometry>(tokens); }
-    if (q_heads == Gqa35Geometry::QHeads) { return meta_elements_impl<Gqa35Geometry>(tokens); }
+std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens) {
+    if (q_heads == CausalD256H24Kv4::QHeads) { return meta_elements_impl<CausalD256H24Kv4>(tokens); }
+    if (q_heads == CausalD256H16Kv2::QHeads) { return meta_elements_impl<CausalD256H16Kv2>(tokens); }
     throw std::invalid_argument("gqa_attention volta flash: unsupported Q head geometry");
 }
 
-void gqa_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+void causal_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                       const Tensor& positions, const Tensor& table_rows,
                                       float scale, PagedKVBatchLayerView cache,
-                                      GqaExecutionEnvelope envelope, std::int32_t q_block_tokens,
+                                      CausalAttentionExecutionEnvelope envelope, std::int32_t q_block_tokens,
                                       Tensor& k_gathered, Tensor& v_gathered, Tensor& mask,
                                       Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta, Tensor& out,
                                       cudaStream_t stream) {
-    if (q.ne[1] == Gqa27Geometry::QHeads) {
-        volta_flash_launch_impl<Gqa27Geometry>(q, k, v, positions, table_rows, scale, cache,
+    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+        volta_flash_launch_impl<CausalD256H24Kv4>(q, k, v, positions, table_rows, scale, cache,
                                                envelope, q_block_tokens, k_gathered, v_gathered,
                                                mask, q_f32, out_f32, dst_meta, out, stream);
         return;
     }
-    if (q.ne[1] == Gqa35Geometry::QHeads) {
-        volta_flash_launch_impl<Gqa35Geometry>(q, k, v, positions, table_rows, scale, cache,
+    if (q.ne[1] == CausalD256H16Kv2::QHeads) {
+        volta_flash_launch_impl<CausalD256H16Kv2>(q, k, v, positions, table_rows, scale, cache,
                                                envelope, q_block_tokens, k_gathered, v_gathered,
                                                mask, q_f32, out_f32, dst_meta, out, stream);
         return;

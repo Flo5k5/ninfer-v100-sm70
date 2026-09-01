@@ -329,15 +329,6 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         const std::string case_label = std::string(label) + " [" + std::to_string(shape.n) + "," +
                                        std::to_string(shape.k) +
                                        "] T=" + std::to_string(invocation.t);
-#ifdef NINFER_VOLTA_BUILD
-        // A4 needs cvt.e2m1x2 (Blackwell) and A8 needs mma.sync.kind::f8f6f4 (sm_89+); both are
-        // __trap() here, and an abort in one case takes every later case's result with it. The
-        // A16 invocations in the same list are the ones this port can be held to.
-        if (invocation.policy != ops::LinearPolicy::A16Only) {
-            std::cout << "SKIP " << case_label << ": no Volta route for A4/A8 activation compute\n";
-            continue;
-        }
-#endif
         GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"));
         Tensor input(device_activation.p, DType::BF16, {shape.k, invocation.t});
         Tensor destination(output.data(), DType::BF16, {shape.n, invocation.t});

@@ -24,6 +24,6 @@ struct Profile {
 };
 
 int run_profile(std::string_view label, const Profile& profile,
-                std::span<const std::int32_t> token_cases, bool prepack_nvfp4 = false);
+                std::span<const std::int32_t> token_cases);
 
 } // namespace ninfer::test::linear_swiglu

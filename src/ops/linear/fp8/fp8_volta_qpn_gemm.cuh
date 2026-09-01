@@ -6,17 +6,8 @@
 // three. Same geometry, same fragment maps, same one-barrier structure: the four quadpairs of a
 // warp split N, share a single 8x4 activation tile, and the CTA's four warps split K.
 //
-// It exists because the FP8 A16 SIMT family decays in T where the groupwise routes do not. On the
-// MLP gate_up shape (34816x5120), measured cold with clocks locked:
-//
-//     T:              8      16      32
-//     FP8 A16:    192.7    96.9    48.8 GB/s
-//     W8G32 QPN:  410.6   247.6   232.3 GB/s
-//
-// W8's curve is step-flat because one weight stream feeds an 8-row tile; FP8's decays because each
-// pass re-reads the weights for a handful of tokens. The gap is 2.1x at T=8 and 4.8x at T=32, and
-// it is the kernel family rather than the schedule -- retuning the NVFP4 sibling's schedules
-// recovered up to 6.8x without changing the shape of its curve at all.
+// It exists because the FP8 A16 SIMT family decays with T where the groupwise routes do not. The
+// QPN mapping keeps the curve step-flat by feeding an eight-row tile from one weight stream.
 //
 // Parity is not the target. FP8_E4M3FN_ROW_BF16S carries 8 bits per weight plus one BF16 per
 // output row (~8.0 bits/weight) against W8G32_F16S's 8 plus an FP16 per 32 (8.5), so this kernel

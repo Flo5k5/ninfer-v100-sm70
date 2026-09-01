@@ -32,14 +32,15 @@ struct SparseMoePrefillPlan {
 struct SparseMoePrefillWorkspace {
     Tensor token_ids;
     Tensor token_alpha;
-    // Selection owns the rank local to one routing tile. Gather consumes it
-    // without mutation and writes the inverse token/route -> packed-column map
-    // separately, so replaying gather cannot reinterpret a global column as a
-    // tile-local rank.
+    // Selection writes one rank local to a routing tile. Gather must keep this source separate
+    // from the final inverse map because all threads in an assignment block consume the rank while
+    // thread 0 publishes the packed column.
     Tensor local_rank;
-    Tensor packed_index;
     Tensor shared_scale;
+    // Scan is the final consumer of tile_counts. The inverse map aliases its dead prefix for the
+    // remaining gather/reduce lifetime; 256 * ceil(T / 8) is at least 8 * T elements.
     Tensor tile_counts;
+    Tensor packed_index;
     Tensor tile_bases;
     Tensor expert_offsets;
     Tensor route_job_experts;
@@ -70,9 +71,9 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     out.token_ids      = arena.alloc(DType::I32, {assignments}, 256);
     out.token_alpha    = arena.alloc(DType::FP32, {assignments}, 256);
     out.local_rank     = arena.alloc(DType::I32, {assignments}, 256);
-    out.packed_index   = arena.alloc(DType::I32, {assignments}, 256);
     out.shared_scale   = arena.alloc(DType::FP32, {capacity_tokens}, 256);
     out.tile_counts    = arena.alloc(DType::I32, {256, route_tiles}, 256);
+    out.packed_index   = Tensor(out.tile_counts.data, DType::I32, {assignments});
     out.tile_bases     = arena.alloc(DType::I32, {256, route_tiles}, 256);
     out.expert_offsets = arena.alloc(DType::I32, {257}, 256);
     // A route job is one nonempty expert column tile. The bound is for the

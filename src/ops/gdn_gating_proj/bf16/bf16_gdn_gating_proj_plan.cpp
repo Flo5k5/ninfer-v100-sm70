@@ -31,7 +31,7 @@ struct RouteSpec {
 // bf16_gdn_gating_proj_gemm_mma_kernel, which is trap-stubbed on sm_70 (Ampere+ mma/ldmatrix).
 // SmallTSplit10 (ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu) is a plain SIMT
 // dot-product kernel that tiles over blockIdx.z in groups of 8 tokens, so it already handles
-// arbitrary T with no new kernel needed -- see the V100 performance summary.
+// arbitrary T with no new kernel needed -- see docs/v100.md.
 constexpr std::array<RouteSpec, 2> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, kAnyCols}, Bf16GdnGatingScheduleId::SmallTSplit10},

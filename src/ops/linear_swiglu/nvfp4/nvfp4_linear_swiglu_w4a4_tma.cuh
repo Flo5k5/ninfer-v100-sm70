@@ -52,7 +52,7 @@ __global__ __launch_bounds__(
                                                                   float alpha,
                                                                   __nv_bfloat16* __restrict__ output) {
 // Same story as nvfp4_w4a4_tma.cuh: warp-specialized Hopper+/Blackwell code (TMA, mbarrier,
-// setmaxnreg), permanently out of scope for Volta. See the V100 performance summary.
+// setmaxnreg), permanently out of scope for Volta. See docs/v100.md.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     static_assert(Geometry::kOutputRows == 34816);
     static_assert(Geometry::kInputRows == 5120);

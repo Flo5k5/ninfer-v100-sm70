@@ -25,7 +25,7 @@ struct W8PairRouteSpec {
 // DualMmaR32C128 needs Ampere+ mma/ldmatrix, trap-stubbed on sm_70. launch_tiled (below) already
 // wraps every schedule -- TwoSimtR8C8 included -- in for_each_token_slice, tiling over any T in
 // 8-column chunks, so the {57,kAnyCols} split above is a routing choice, not a kernel limit.
-// See the V100 performance summary.
+// See docs/v100.md.
 constexpr std::array<W8PairRouteSpec, 2> kK5120Routes{{
     {1, 4, W8PairScheduleId::TwoSimtR8C4},
     {5, kAnyCols, W8PairScheduleId::TwoSimtR8C8},

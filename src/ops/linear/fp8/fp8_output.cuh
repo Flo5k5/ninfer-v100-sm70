@@ -30,13 +30,8 @@ struct Fp8ContiguousOutput {
     }
 };
 
-// Writes the epilogue's already-row-scaled value straight through, no BF16 round. Exists for
-// split-projection SwiGLU (fp8_linear_swiglu_qpn_split.cuh), the FP8 sibling of
-// Nvfp4Fp32ContiguousOutput: two independent QPN8 launches -- one per weight half, unmodified --
-// write gate and up into fp32 scratch, and a small combine kernel applies silu(gate) * up in fp32
-// before the single BF16 round. See nvfp4_output.cuh for why fp32 scratch rather than composing
-// linear() + silu_mul(), and nvfp4_linear_swiglu_qpn_split.cuh for why splitting rather than
-// fusing -- both apply unchanged to the FP8 case.
+// Split-projection SwiGLU keeps both projection results in FP32 until the fused
+// SiLU/multiply epilogue performs the single observable BF16 rounding.
 struct Fp8Fp32ContiguousOutput {
     float* data;
     std::int32_t rows;

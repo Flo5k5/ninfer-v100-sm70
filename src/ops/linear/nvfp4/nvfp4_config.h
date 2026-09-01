@@ -10,7 +10,7 @@ namespace ninfer::ops::detail {
 // Several NVFP4 plans drive a sub-projection internally and choose the policy themselves rather
 // than taking the caller's, so a target that asks for A16 cannot reach them. On Volta the A4
 // route is a __trap() -- cvt.e2m1x2 is Blackwell hardware and always will be -- so those internal
-// choices have to collapse to A16 here. See the V100 performance summary.
+// choices have to collapse to A16 here. See docs/v100.md.
 #ifdef NINFER_VOLTA_BUILD
 inline constexpr LinearPolicy kNvfp4InternalPolicy = LinearPolicy::A16Only;
 #else
@@ -183,11 +183,8 @@ inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
 inline constexpr std::int32_t kNvfp4LastSmallT  = 32;
 
 #ifdef NINFER_VOLTA_BUILD
-// Volta (sm_70) cold winners, measured on all five registered geometries with a private
-// schedule sweep -- the reference card's schedules collapse here: 17.8 GB/s at T=16 against
-// 93.7 for the entry below, and 7.1 against 48.7 at T=24. One schedule covers every geometry
-// because all five agreed on the same envelope within a few percent, so there is nothing for
-// per-geometry specializations to say.
+// Qualified Volta schedule shared by all five registered geometries. Their common performance
+// envelope does not justify per-geometry specializations.
 //
 // The whole envelope is per-thread register footprint. Values-per-lane 8 rather than 16 is
 // worth 2.1x at T=13 and 4.3x at T=32; with 16 values a 16-warp CTA cannot be resident at all

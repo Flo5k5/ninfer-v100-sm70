@@ -714,16 +714,6 @@ void print_header() {
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     std::printf("# actual_gpu=%s sm=%d%d reference_gpu=RTX_5090\n", properties.name,
                 properties.major, properties.minor);
-    // The dram_spec/sustained_read percentages below are deliberately against a fixed RTX 5090
-    // reference so runs stay comparable across machines (bench/README.md). That makes them
-    // misleading to read as a roofline on any other card -- on a V100-SXM2-32GB every reported
-    // percentage is ~2x lower than the fraction of *this* device's bandwidth actually achieved.
-    // Print the running device's own theoretical bandwidth so the local figure is recoverable
-    // without changing any existing column.
-    const double device_dram_gbs = 2.0 * static_cast<double>(properties.memoryClockRate) * 1e3 *
-                                   (static_cast<double>(properties.memoryBusWidth) / 8.0) / 1e9;
-    std::printf("# device_dram_spec_gbs=%.1f (scale dram_spec_pct by %.2fx for this device)\n",
-                device_dram_gbs, kRtx5090DramGBs / device_dram_gbs);
     std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f cache=cold\n", kRtx5090DramGBs,
                 kRtx5090SustainedReadGBs);
     std::printf("# dense_fp8_tensor_tflops fp16_acc=%.1f fp32_acc=%.1f\n",

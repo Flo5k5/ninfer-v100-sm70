@@ -50,7 +50,7 @@ struct RouteSpec {
 // applied. SIMT still wins at T<=32, so this does not affect decode concurrency (C8 with MTP3
 // is T=32); it recovers up to 1.33x in the T=40..63 band. Contrast gdn_input_proj, whose larger
 // SIMT work (16384 vs 7168 parent rows) against a similar fixed dequant cost puts its crossover
-// at 28. See the V100 performance summary.
+// at 28. See docs/v100.md.
 // Band for the fused tensor-core route (ops/linear/q{4,5}/q{4,5}_volta_mma_gemm.cuh), the same
 // change gdn_input_proj took. Both stored parents are [7168,5120] with rows 0..6143 feeding
 // q/gate and 6144..7167 feeding k/v, and both fused launchers take a weight_row_offset, so this

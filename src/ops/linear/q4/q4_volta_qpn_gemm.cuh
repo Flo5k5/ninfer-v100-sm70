@@ -22,10 +22,9 @@
 // and activation traffic per weight byte drops 4x, because one A fragment feeds four MMAs
 // instead of one.
 //
-// The design is not derived here. It is v100-skinny's QPN kernel (kernels/research/qpn_race.cu,
-// docs/qpn_race_notes.md), which ships in production there and reached 647 GB/s at M=8 -- the
-// SIMT M=1 streaming floor, with tensor-core MACs. The fragment maps below are its
-// operand-position-derived ones, byte-verified on real V100 hardware; do not re-derive them.
+// The design follows the production QPN mapping: fragment positions determine the operand layout.
+// The maps below are byte-verified against an independent host oracle; do not re-derive them from
+// an assumed row-major interpretation.
 //
 // Three things follow from the mapping and are load-bearing:
 //
@@ -45,7 +44,7 @@
 // The one cost v100-skinny does not pay: its activations are already FP16, while ninfer's are
 // BF16, so every lane converts the 64 activations of its row per group. Quadpair siblings convert
 // the same values, so that work is 4x redundant -- the price of keeping activations out of shared
-// memory. See the V100 performance summary for the measurement.
+// memory.
 
 #include "ops/common/volta_mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"

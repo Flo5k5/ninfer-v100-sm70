@@ -63,7 +63,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 // ldmatrix (sm_75+) + mma.m16n8k16 (sm_80+), same as every other tensor-core kernel this
 // port has hit. Unlike rowsplit_grouped_mma.cuh / bf16_gdn_gating_proj_gemm_mma.cuh, this
 // one genuinely IS on the decode-critical path (vocabulary/gate-up/down/attention-in-out
-// projections — see the V100 performance summary), so it doesn't just get trapped and forgotten:
+// projections — see docs/v100.md), so it doesn't just get trapped and forgotten:
 // launch_w8_small_t (w8_small_t.cu) routes to the already-Volta-validated warp-per-row
 // SIMT kernel (w8_rowsplit_gemm_simt.cuh) instead below sm_80, via the NINFER_VOLTA_BUILD
 // host-side signal (CMakeLists.txt) — __CUDA_ARCH__ isn't visible in that host function,

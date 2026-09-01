@@ -23,14 +23,11 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
                                  WorkspaceArena& workspace, cudaStream_t stream);
 
 #ifdef NINFER_VOLTA_BUILD
-void fp8_linear_swiglu_volta_qpn_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                        cudaStream_t stream);
-[[nodiscard]] bool fp8_linear_swiglu_volta_qpn_supported(std::int32_t k, std::int32_t t) noexcept;
-
 void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         float* gate_scratch, float* up_scratch,
                                         cudaStream_t stream);
-[[nodiscard]] bool fp8_linear_swiglu_qpn_split_supported(std::int32_t k, std::int32_t t) noexcept;
+[[nodiscard]] bool fp8_linear_swiglu_qpn_split_supported(std::int32_t k,
+                                                          std::int32_t t) noexcept;
 #endif
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,

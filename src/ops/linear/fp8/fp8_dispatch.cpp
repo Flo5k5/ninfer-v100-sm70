@@ -12,12 +12,6 @@
 namespace ninfer::ops::detail {
 namespace {
 
-#ifdef NINFER_VOLTA_BUILD
-inline constexpr bool kVoltaBuild = true;
-#else
-inline constexpr bool kVoltaBuild = false;
-#endif
-
 enum class Fp8LinearRoute : std::uint8_t {
     A16,
     A8,
@@ -58,18 +52,16 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const Fp8Problem problem = resolve_fp8_problem(weight.n, weight.k);
-#ifdef NINFER_VOLTA_BUILD
-    // The vocabulary head's A16 MMA kernel is ldmatrix-based and traps below sm_75, so on Volta it
-    // takes the SIMT decode/small-T families like every other problem (registered in fp8_config.h).
-    //
-    // Where the quadpair route is available the chunk drops to its 8-row tile, which is a real
-    // choice rather than a fallback: two QPN passes over the weights beat one wider SIMT pass,
-    // because SIMT throughput halves again every four tokens while QPN's is flat across the tile.
+#ifndef NINFER_VOLTA_BUILD
+    if (problem == Fp8Problem::Vocabulary && x.ne[1] >= kFp8VocabularyFirstA16GemmT) {
+        launch_fp8_vocabulary_a16_gemm(x, weight, out, stream);
+        return;
+    }
+    const std::int32_t chunk = problem == Fp8Problem::Vocabulary ? kFp8VocabularyLastA16SmallTMmaT
+                                                                 : fp8_linear_small_t_max(problem);
+#else
     const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
     const std::int32_t chunk = qpn ? kFp8VoltaQpnMaxTokens : fp8_linear_small_t_max(problem);
-#else
-    const std::int32_t chunk = problem == Fp8Problem::Vocabulary ? kFp8VocabularyLastA16MmaT
-                                                                 : fp8_linear_small_t_max(problem);
 #endif
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += chunk) {
         const std::int32_t active = std::min(chunk, x.ne[1] - token_begin);
@@ -79,19 +71,23 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
-#ifdef NINFER_VOLTA_BUILD
+        #ifdef NINFER_VOLTA_BUILD
         if (fp8_volta_qpn_supported(weight.n, weight.k, active)) {
             launch_fp8_volta_qpn(input_chunk, weight, output_chunk, stream);
-            continue;
-        }
-#endif
-        if (problem == Fp8Problem::Vocabulary && !kVoltaBuild) {
-            launch_fp8_vocabulary_a16_mma(input_chunk, weight, output_chunk, stream);
         } else if (active == 1) {
             launch_fp8_decode(input_chunk, weight, output_chunk, stream);
         } else {
             launch_fp8_small_t(input_chunk, weight, output_chunk, stream);
         }
+        #else
+        if (problem == Fp8Problem::Vocabulary) {
+            launch_fp8_vocabulary_a16_small_t(input_chunk, weight, output_chunk, stream);
+        } else if (active == 1) {
+            launch_fp8_decode(input_chunk, weight, output_chunk, stream);
+        } else {
+            launch_fp8_small_t(input_chunk, weight, output_chunk, stream);
+        }
+        #endif
     }
 }
 

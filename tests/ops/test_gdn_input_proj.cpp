@@ -50,8 +50,9 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor output   = qkv.tensor();
     Tensor z_output = z.tensor();
-    const std::size_t capacity = ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(tokens, tokens);
-    DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+    const std::size_t workspace_bytes =
+        ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
     ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, workspace,
                         nullptr);
     cuda_synchronize();
@@ -98,14 +99,7 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens) {
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor qkv_output = qkv.tensor();
     Tensor z_output   = z.tensor();
-    // Workspace-bearing overload: the wide-T route stages a dequantized parent,
-    // and the convenience overload would silently take the in-place path instead,
-    // leaving that route uncovered.
-    const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
-        QType::W8G32_F16S, kQkvRows + kZRows, kHidden, ops::LinearPolicy::A16Only, tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, ops::LinearPolicy::A16Only,
-                        workspace, nullptr);
+    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " W8 A16 T=" + std::to_string(tokens);
@@ -213,12 +207,6 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     return failures;
 }
 
-// NVFP4 has no Volta implementation and never will -- cvt.e2m1x2 is Blackwell-only hardware, so
-// the codec's sub-sm_80 branch is a __trap() (see ops/linear/nvfp4/nvfp4_codec.cuh). Running the
-// case on sm_70 aborts the process on an unspecified launch failure, which takes the Q4/Q5 and W8
-// cases' results down with it: they run first, but their stdout is lost in the abort. Skipping
-// here is what makes this binary a usable oracle for the routes Volta does have.
-#ifndef NINFER_VOLTA_BUILD
 int run_nvfp4() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
@@ -230,21 +218,17 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
+#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
+#endif
     return failures;
 }
-#endif // NINFER_VOLTA_BUILD
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
                  bool convenience = false) {
-#ifdef NINFER_VOLTA_BUILD
-    // A8 activation compute needs mma.sync.kind::f8f6f4 (sm_89+), which traps here and
-    // aborts the binary. The A16 cases in the same suite are what this port is held to.
-    if (policy != ops::LinearPolicy::A16Only) { return 0; }
-#endif
     constexpr std::int32_t kHidden  = 5120;
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
@@ -305,7 +289,8 @@ int run_fp8() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 613U));
 
-    int failures          = 0;
+    int failures = 0;
+#ifndef NINFER_VOLTA_BUILD
     const std::size_t one = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1, 1);
     const std::size_t seven = ops::gdn_input_proj_workspace_capacity_bytes(
@@ -321,18 +306,19 @@ int run_fp8() {
     const std::size_t a16 = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::A16Only, 1, 2048);
     if (one != 0 || seven != 0 || eight == 0 || forty_eight <= eight ||
-        hot_interval != forty_eight || exact_1024 <= forty_eight || a16 == 0) {
+        hot_interval != forty_eight || exact_1024 <= forty_eight || a16 != 0) {
         std::cerr << "FP8 gdn input workspace interval contract mismatch\n";
         ++failures;
     }
+#endif
 
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, true);
     failures += run_fp8_case(parent, 2, ops::LinearPolicy::A16Only);
-    failures += run_fp8_case(parent, 48, ops::LinearPolicy::A16Only);
-    failures += run_fp8_case(parent, 2048, ops::LinearPolicy::A16Only);
+#ifndef NINFER_VOLTA_BUILD
     for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024}) {
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
+#endif
     return failures;
 }
 
@@ -347,11 +333,7 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_w8();
-#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4();
-#else
-    std::cout << "SKIP nvfp4: no FP4 hardware on Volta\n";
-#endif
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;

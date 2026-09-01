@@ -4,9 +4,6 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
-#ifdef NINFER_VOLTA_BUILD
-#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
-#endif
 
 #include <cuda_runtime.h>
 
@@ -242,7 +239,7 @@ void validate_profile(const Profile& profile) {
 } // namespace
 
 int run_profile(std::string_view label, const Profile& profile,
-                std::span<const std::int32_t> token_cases, bool prepack_nvfp4) {
+                std::span<const std::int32_t> token_cases) {
     validate_profile(profile);
     if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
     if (!cuda_available()) {
@@ -272,19 +269,7 @@ int run_profile(std::string_view label, const Profile& profile,
 
     test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    Weight weight = host_weight.device_weight(device_weight.data());
-#ifdef NINFER_VOLTA_BUILD
-    if (prepack_nvfp4) {
-        if (profile.qtype != QType::NVFP4) {
-            throw std::invalid_argument("linear_swiglu test: QPN prepack requires NVFP4");
-        }
-        ops::detail::nvfp4_prepack_qpn_sm70(weight);
-    }
-#else
-    if (prepack_nvfp4) {
-        throw std::invalid_argument("linear_swiglu test: QPN prepack requires Volta build");
-    }
-#endif
+    const Weight weight = host_weight.device_weight(device_weight.data());
 
     test::GuardedDeviceBuffer device_activation(host_activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(host_activation.data(),
@@ -335,10 +320,8 @@ int run_profile(std::string_view label, const Profile& profile,
     failures +=
         verify_unchanged(std::string(label) + " activation", device_activation,
                          host_activation.data(), host_activation.size() * sizeof(std::uint16_t));
-    if (!prepack_nvfp4) {
-        failures += verify_unchanged(std::string(label) + " weight", device_weight,
-                                     host_weight.payload.data(), host_weight.payload.size());
-    }
+    failures += verify_unchanged(std::string(label) + " weight", device_weight,
+                                 host_weight.payload.data(), host_weight.payload.size());
     return failures;
 }
 

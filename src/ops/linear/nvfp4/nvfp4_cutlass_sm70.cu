@@ -38,6 +38,15 @@ __device__ __forceinline__ void decode_e2m1_word_shift(std::uint32_t packed, hal
     out[3] = __hmul2(*reinterpret_cast<half2*>(&v3), rebias);
 }
 
+__device__ __forceinline__ void unshuffle_e2m1_word(const half2 (&in)[4], half2 (&out)[4]) {
+    const auto* source = reinterpret_cast<const std::uint32_t*>(in);
+    auto* destination  = reinterpret_cast<std::uint32_t*>(out);
+    destination[0] = (source[0] & 0x0000ffffu) | (source[1] << 16);
+    destination[1] = (source[2] & 0x0000ffffu) | (source[3] << 16);
+    destination[2] = (source[0] >> 16) | (source[1] & 0xffff0000u);
+    destination[3] = (source[2] >> 16) | (source[3] & 0xffff0000u);
+}
+
 // The artifact stores adjacent E2M1 values in each code byte and one E4M3 scale per K16 group.
 // Scales use the BlockScaleK16M128x4 swizzle. Materializing once is intentionally a wide-T
 // strategy: CUTLASS can reuse the resulting FP16 matrix across every token tile instead of
@@ -46,13 +55,19 @@ __global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes
                                            const std::uint8_t* __restrict__ scales, int n, int k,
                                            float inverse_weight_divisor,
                                            cutlass::half_t* __restrict__ out) {
-    const int row      = static_cast<int>(blockIdx.y);
-    const int byte_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int bytes_per_row = k / 2;
-    if (row >= n || byte_idx >= bytes_per_row) { return; }
-
-    const int k0            = byte_idx * 2;
-    const int group         = byte_idx / 8;
+    // A thread owns half of one K16 scale group. The former byte-per-thread,
+    // two-dimensional launch created hundreds of thousands of tiny blocks for
+    // gate_up; this preserves the exact native artifact decode while matching
+    // the prepacked decoder's eight-output work granularity.
+    const std::int64_t segment = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int segments_per_row = k / 8;
+    const std::int64_t count   = static_cast<std::int64_t>(n) * segments_per_row;
+    if (segment >= count) { return; }
+    const int row        = static_cast<int>(segment / segments_per_row);
+    const int row_segment = static_cast<int>(segment -
+        static_cast<std::int64_t>(row) * segments_per_row);
+    const int group      = row_segment / 2;
+    const int group_half = row_segment & 1;
     const int scale_tile    = group / 4;
     const int scale_lane    = group & 3;
     const int row_inner     = row & 127;
@@ -60,13 +75,21 @@ __global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes
     const std::int64_t scale_offset =
         static_cast<std::int64_t>((row / 128) * scales_per_m128 + scale_tile) * 512 +
         (row_inner & 31) * 16 + (row_inner >> 5) * 4 + scale_lane;
-
-    const float coefficient = decode_nvfp4_e4m3(scales[scale_offset]) * inverse_weight_divisor;
-    const float2 value = decode_nvfp4_e2m1x2(
-        codes[static_cast<std::int64_t>(row) * bytes_per_row + byte_idx]);
-    cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
-    out_row[k0]     = cutlass::half_t(value.x * coefficient);
-    out_row[k0 + 1] = cutlass::half_t(value.y * coefficient);
+    const int byte_begin = group * 8 + group_half * 4;
+    const std::uint8_t* source = codes + static_cast<std::int64_t>(row) * (k / 2) + byte_begin;
+    const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(source);
+    const half2 rebias = __float2half2_rn(16384.0f);
+    const half2 divisor = __float2half2_rn(inverse_weight_divisor * 256.0f);
+    const half2 coefficient = __hmul2(decode_e4m3_scale_shift(scales[scale_offset]), divisor);
+    half2 interleaved[4];
+    decode_e2m1_word_shift(packed, rebias, interleaved);
+    half2 adjacent[4];
+    unshuffle_e2m1_word(interleaved, adjacent);
+#pragma unroll
+    for (half2& value : adjacent) { value = __hmul2(value, coefficient); }
+    auto* destination = reinterpret_cast<uint4*>(
+        out + static_cast<std::int64_t>(row) * k + byte_begin * 2);
+    *destination = *reinterpret_cast<const uint4*>(adjacent);
 }
 
 __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes,
@@ -106,8 +129,6 @@ __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
 }
-
-int div_up_i(int a, int b) { return (a + b - 1) / b; }
 
 using ElementAccumulator     = float;
 using ElementComputeEpilogue = ElementAccumulator;
@@ -181,19 +202,21 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
     auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
     auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
 
-    const dim3 block(256);
+    constexpr int kThreads = 256;
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-        const dim3 grid(static_cast<unsigned>(div_up_i(k / 8, 256)), static_cast<unsigned>(n), 1u);
-        dequant_nvfp4_qpn_to_fp16<<<grid, block, 0, stream>>>(
+        const dim3 grid(static_cast<unsigned>((k / 8 + kThreads - 1) / kThreads),
+                        static_cast<unsigned>(n), 1u);
+        dequant_nvfp4_qpn_to_fp16<<<grid, kThreads, 0, stream>>>(
             static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), n, k, 1.0F / w.weight_scale_divisor,
-            w_fp16);
+            static_cast<const std::uint8_t*>(w.scales), n, k,
+            1.0F / w.weight_scale_divisor, w_fp16);
     } else {
-        const dim3 grid(static_cast<unsigned>(div_up_i(k / 2, 256)), static_cast<unsigned>(n), 1u);
-        dequant_nvfp4_row_to_fp16<<<grid, block, 0, stream>>>(
+        const std::int64_t segments = static_cast<std::int64_t>(n) * (k / 8);
+        const int blocks = static_cast<int>((segments + kThreads - 1) / kThreads);
+        dequant_nvfp4_row_to_fp16<<<blocks, kThreads, 0, stream>>>(
             static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), n, k, 1.0F / w.weight_scale_divisor,
-            w_fp16);
+            static_cast<const std::uint8_t*>(w.scales), n, k,
+            1.0F / w.weight_scale_divisor, w_fp16);
     }
     CUDA_CHECK(cudaGetLastError());
 

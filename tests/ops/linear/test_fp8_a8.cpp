@@ -109,12 +109,6 @@ int run_fp8_a8() {
 } // namespace
 
 int main() {
-#ifdef NINFER_VOLTA_BUILD
-    // This binary exists to test FP8_A8 activation compute, which needs mma.sync.kind::f8f6f4 (sm_89+).
-    // There is no Volta route to test, so it skips rather than trapping.
-    std::cout << "SKIP: FP8_A8 has no Volta route\n";
-    return 77;
-#else
     if (!ninfer::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -127,5 +121,4 @@ int main() {
         std::cerr << "FP8 A8 Linear: " << error.what() << '\n';
         return 1;
     }
-#endif
 }

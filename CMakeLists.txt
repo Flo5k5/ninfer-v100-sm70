@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
-# Upstream ninfer is compiled only for sm_120a. This fork adds sm_70 (Volta /
-# Tesla V100) as a second accepted target for the in-progress Volta port; see
-# the V100 implementation. Validate before CUDA compiler detection so CMake never
+# Upstream NInfer is compiled only for sm_120a. This port adds sm_70 (Volta /
+# Tesla V100) as a peer compile-time target. Validate before CUDA compiler detection so CMake never
 # injects a generic host-toolchain default or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
@@ -16,7 +15,7 @@ endif()
 # __CUDA_ARCH__ is only ever defined during device-code compilation, so it can't guide
 # host-side dispatch decisions (e.g. "call the SIMT kernel instead of the mma one on
 # Volta") — those live in plain .cpp/.cu host functions. This is the equivalent signal
-# for host code; see the V100 performance summary.
+# for host code.
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   add_compile_definitions(NINFER_VOLTA_BUILD=1)
 endif()
@@ -26,7 +25,7 @@ project(ninfer LANGUAGES C CXX CUDA)
 # CUTLASS: Volta (sm_70) has real FP16 tensor cores (mma.sync.m8n8k4) but no bf16/int
 # tensor-core support and no equivalent to the mma.cuh helpers this codebase's Ampere+
 # kernels use. Rather than hand-writing raw Volta mma.sync PTX (a large, error-prone
-# undertaking -- see the V100 performance summary), the Volta build vendors NVIDIA's own CUTLASS
+# undertaking), the Volta build vendors NVIDIA's own CUTLASS
 # GEMM template library, which has first-class, NVIDIA-maintained Sm70 support via its
 # legacy ("2.x-style") template API. Header-only; fetched only for the Volta build since
 # sm_120a already has its own tensor-core kernels. Pinned to the same v4.4.2 tag
@@ -77,6 +76,12 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70" AND CMAKE_CUDA_COMPILER_VERSION VERSIO
   message(FATAL_ERROR
     "The sm_70 Volta port requires CUDA 12.8 or newer; found CUDA compiler "
     "${CMAKE_CUDA_COMPILER_VERSION}")
+endif()
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70" AND
+   CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+  message(FATAL_ERROR
+    "sm_70 requires CUDA 12.8; CUDA 13.x no longer assembles Volta device code (found "
+    "${CMAKE_CUDA_COMPILER_VERSION})")
 endif()
 
 set(NINFER_BUILD_MEDIA_ACQUIRE OFF)

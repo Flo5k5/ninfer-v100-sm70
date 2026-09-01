@@ -55,7 +55,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
     // 64-chunk QPN2 path at T=2048 on the gate_up shape: 45.5ms -> 31.3ms, 1.45x. Needs a real
     // workspace only when split-K applies (rare at production shapes -- both registered NVFP4
     // shapes measured splits=1 at prefill width); fall back to the chunked route rather than
-    // fault if a caller genuinely has none. See the V100 performance summary.
+    // fault if a caller genuinely has none. See docs/v100.md.
     if (workspace != nullptr && total_t > kNvfp4VoltaQpnMaxTokens &&
         nvfp4_volta_mma_supported(weight.n, weight.k, total_t)) {
         const std::size_t need = nvfp4_volta_mma_workspace_bytes(weight.n, weight.k, total_t);

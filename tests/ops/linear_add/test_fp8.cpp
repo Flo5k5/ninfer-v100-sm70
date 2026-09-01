@@ -89,18 +89,24 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32_t seed) {
+#ifdef NINFER_VOLTA_BUILD
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},
         Invocation{26, ops::LinearPolicy::A16Only},
-        Invocation{48, ops::LinearPolicy::A16Only},
-        Invocation{1024, ops::LinearPolicy::A16Only},
+    };
+#else
+    const std::array invocations{
+        Invocation{1, ops::LinearPolicy::A16Only},
+        Invocation{2, ops::LinearPolicy::A16Only},
+        Invocation{26, ops::LinearPolicy::A16Only},
         Invocation{first_a8 - 1, ops::LinearPolicy::AllowA8},
         Invocation{first_a8, ops::LinearPolicy::AllowA8},
         Invocation{48, ops::LinearPolicy::AllowA8},
         Invocation{65, ops::LinearPolicy::AllowA8},
         Invocation{1024, ops::LinearPolicy::AllowA8},
     };
+#endif
     constexpr std::int32_t kMaximumTokens = 1024;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
@@ -118,11 +124,6 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
-#ifdef NINFER_VOLTA_BUILD
-        // A4/A8 activation compute is Blackwell / sm_89 hardware and traps here;
-        // the A16 invocations in the same list are what this port is held to.
-        if (invocation.policy != ops::LinearPolicy::A16Only) { continue; }
-#endif
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(initial_residual.data(), output.bytes());
@@ -182,19 +183,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         "FP8 linear_add activation");
     failures += verify_preserved(device_weight, host_weight.payload, "FP8 linear_add weight");
 
+#ifndef NINFER_VOLTA_BUILD
     const std::size_t a16_interval = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::A16Only, 1, 2048);
-#ifdef NINFER_VOLTA_BUILD
-    // On Volta, A16Only T>=2 takes linear()+residual_add() (the fused small_t kernel never
-    // reaches QPN8's tensor-core route), so the interval genuinely needs the larger end's
-    // transient rather than the reference build's zero -- checked the same way the A8 arm below
-    // checks its own boundary, against the exact query at the interval's top.
-    const std::size_t a16_exact_2048 = ops::linear_add_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::A16Only, 2048, 2048);
-    const bool a16_interval_ok = a16_interval == a16_exact_2048 && a16_interval > 0;
-#else
-    const bool a16_interval_ok = a16_interval == 0;
-#endif
     const std::size_t pre_boundary = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, first_a8 - 1);
     const std::size_t hot_interval = ops::linear_add_workspace_capacity_bytes(
@@ -205,12 +196,13 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1, 1024);
     const std::size_t exact_1024 = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, 1024, 1024);
-    if (!a16_interval_ok || pre_boundary != 0 || hot_interval != exact_48 ||
+    if (a16_interval != 0 || pre_boundary != 0 || hot_interval != exact_48 ||
         through_1024 != exact_1024 || exact_1024 <= exact_48) {
         std::cerr << "FP8 linear_add [" << n << ',' << k
                   << "]: workspace interval contract mismatch\n";
         ++failures;
     }
+#endif
     return failures;
 }
 

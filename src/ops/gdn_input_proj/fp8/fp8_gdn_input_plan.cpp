@@ -1,8 +1,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 
-#include "ops/linear/fp8/fp8_launch.h"
-
 #include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_launch.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.h"
 #endif
@@ -61,7 +60,6 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
         fp8_gdn_input_cutlass_sm70_launch(x, weight, qkv, z, *workspace, stream);
         return;
     }
-    // See the attention sibling: the quadpair route covers T=2..32 in one weight pass.
     const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
     const std::int32_t kChunk =
         qpn ? kFp8VoltaQpnMaxTokens : kFp8LinearSmallTMax<Fp8GdnInputGeometry>;

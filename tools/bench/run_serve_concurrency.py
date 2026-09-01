@@ -44,7 +44,7 @@ SATURATION_SEEDS = (
 CORPUS_ORDER_SEED = 20260811
 POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
 SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,7 +55,6 @@ class Point:
     speculative_mode: str
     speculative_backend: str
     draft_tokens: int
-    proposal_head: str
     sampling_mode: str
     suite: str
     concurrency: int
@@ -63,7 +62,7 @@ class Point:
     @property
     def key(self) -> str:
         return (
-            f"{self.target}_{self.speculative_mode}_{self.proposal_head}_{self.sampling_mode}_"
+            f"{self.target}_{self.speculative_mode}_{self.sampling_mode}_"
             f"{self.suite.replace('-', '_')}_c{self.concurrency}"
         )
 
@@ -117,12 +116,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=corpus.SAMPLING_MODES,
         default="stochastic",
         help="sampling profile for all requests (default: stochastic)",
-    )
-    parser.add_argument(
-        "--proposal-head",
-        choices=("optimized", "full"),
-        default="optimized",
-        help="proposal LM head used by speculative modes (default: optimized)",
     )
     parser.add_argument(
         "--suite",
@@ -210,7 +203,6 @@ def build_points(
                             speculative_mode=mode_name,
                             speculative_backend=backend,
                             draft_tokens=draft_tokens,
-                            proposal_head=args.proposal_head if draft_tokens else "full",
                             sampling_mode=args.sampling,
                             suite=suite,
                             concurrency=concurrency,
@@ -319,10 +311,14 @@ def server_command(
     ]
     if point.speculative_backend != "none":
         command.extend(
-            ["--spec", point.speculative_backend, "--draft-tokens", str(point.draft_tokens)]
+            [
+                "--spec",
+                point.speculative_backend,
+                "--draft-tokens",
+                str(point.draft_tokens),
+                "--lm-head-draft",
+            ]
         )
-        if point.proposal_head == "optimized":
-            command.append("--lm-head-draft")
     if point.sampling_mode == "greedy":
         command.append("--greedy")
     else:
@@ -365,7 +361,7 @@ def validate_server_start(
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
         "speculative_draft_window": point.draft_tokens,
-        "proposal_head": point.proposal_head,
+        "proposal_head": "optimized" if point.draft_tokens else "full",
     }
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
@@ -733,7 +729,6 @@ def analyze_point(
         "speculative_mode": point.speculative_mode,
         "speculative_backend": point.speculative_backend,
         "draft_tokens": point.draft_tokens,
-        "proposal_head": point.proposal_head,
         "sampling_mode": point.sampling_mode,
         "suite": point.suite,
         "workload_order": workload_order(point),
@@ -808,13 +803,12 @@ def run_point(
 
 
 def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
-    baselines: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
+    baselines: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     for report in reports:
         key = (
             str(report["target"]),
             str(report["weights_id"]),
             str(report["speculative_mode"]),
-            str(report["proposal_head"]),
             str(report["sampling_mode"]),
             str(report["suite"]),
         )
@@ -826,7 +820,6 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
             str(report["target"]),
             str(report["weights_id"]),
             str(report["speculative_mode"]),
-            str(report["proposal_head"]),
             str(report["sampling_mode"]),
             str(report["suite"]),
         )
@@ -848,7 +841,6 @@ SUMMARY_FIELDS = (
     "target",
     "weights_id",
     "speculative_mode",
-    "proposal_head",
     "sampling_mode",
     "corpus_order_seed",
     "concurrency",
@@ -873,7 +865,6 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         "target": report["target"],
         "weights_id": report["weights_id"],
         "speculative_mode": report["speculative_mode"],
-        "proposal_head": report["proposal_head"],
         "sampling_mode": report["sampling_mode"],
         "corpus_order_seed": report.get("workload_order", {}).get("seed"),
         "concurrency": report["concurrency"],
@@ -948,21 +939,20 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
             {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows
         )
 
-    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     for row in rows:
         key = (
             str(row["target"]),
             str(row["weights_id"]),
             str(row["speculative_mode"]),
-            str(row["proposal_head"]),
             str(row["suite"]),
         )
         groups.setdefault(key, []).append(row)
 
     sections: list[str] = []
-    for (target, weights_id, mode, proposal_head, suite), group in groups.items():
+    for (target, weights_id, mode, suite), group in groups.items():
         group.sort(key=lambda row: int(row["concurrency"]))
-        title = f"## {target} / {weights_id} / {mode} / {proposal_head} head / {suite}"
+        title = f"## {target} / {weights_id} / {mode} / {suite}"
         if suite == "decode-saturation":
             table = markdown_table(
                 ("C", "Requests", "Steady s", "Avg batch", "Decode tok/s", "Speedup"),

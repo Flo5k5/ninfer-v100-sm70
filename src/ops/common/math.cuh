@@ -24,7 +24,7 @@ __device__ __forceinline__ float exp2_approx(float x) {
 }
 
 // cvt.rn.bf16x2.f32 is Ampere+ only (like cp.async, this was missing from the original
-// full-tree audit — see the V100 performance summary). Below sm_80, __floats2bfloat162_rn is the
+// full-tree audit — see docs/v100.md). Below sm_80, __floats2bfloat162_rn is the
 // portable equivalent: a standard cuda_bf16.h intrinsic (software round-to-nearest-even
 // on pre-Ampere, not a hardware instruction), already used elsewhere in this codebase
 // (e.g. Q4MmaDecodeAtom::decode_pair) for exactly this reason.

@@ -17,15 +17,10 @@ int main() {
             {QType::FP8_E4M3FN_ROW_BF16S, 34816, 5120, 17408, 1811U, ActivationCompute::A16},
             kA16Cases);
 #ifndef NINFER_VOLTA_BUILD
-        // A4 (cvt.e2m1x2) and A8 (mma.sync.kind::f8f6f4) are Blackwell / sm_89 hardware;
-        // the Volta build reaches a __trap() in both, which aborts the whole binary and
-        // takes the A16 results with it. See the V100 performance summary.
         failures += run_profile(
             "LinearSwiGLU FP8_A8",
             {QType::FP8_E4M3FN_ROW_BF16S, 34816, 5120, 17408, 1813U, ActivationCompute::A8},
             kA8Cases);
-#else
-        std::cout << "SKIP FP8_A8: no Volta route for A8 activation compute\n";
 #endif
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU FP8 correctness\n";
         return failures == 0 ? 0 : 1;

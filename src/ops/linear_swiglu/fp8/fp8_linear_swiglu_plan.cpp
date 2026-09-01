@@ -1,7 +1,7 @@
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 
-#include "ninfer/ops/silu_mul.h"
 #include "core/layout.h"
+#include "ninfer/ops/silu_mul.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #ifdef NINFER_VOLTA_BUILD
@@ -42,10 +42,7 @@ struct Fp8QpnSplitWorkspace {
 template <class Allocator>
 Fp8QpnSplitWorkspace allocate_qpn_split_workspace(Allocator& allocator, std::int32_t tokens) {
     const std::size_t bytes = static_cast<std::size_t>(kOutputRows) * tokens * sizeof(float);
-    Fp8QpnSplitWorkspace out;
-    out.gate = allocator.alloc_bytes(bytes, 256);
-    out.up   = allocator.alloc_bytes(bytes, 256);
-    return out;
+    return {allocator.alloc_bytes(bytes, 256), allocator.alloc_bytes(bytes, 256)};
 }
 
 std::size_t qpn_split_workspace_bytes(std::int32_t tokens) {
@@ -54,15 +51,11 @@ std::size_t qpn_split_workspace_bytes(std::int32_t tokens) {
     return layout.peak_bytes(1);
 }
 
-// Below this width groupwise's own crossover (the V100 implementation, Q4's CutlassSm70TensorCore
-// route) puts the fused-dequant SIMT/QPN path ahead of paying CUTLASS's fixed T-independent
-// dequant cost; above it the dequant-once-then-CUTLASS-Sm70-tensor-core route wins by not
-// re-decoding the weight per chunk the way the QPN split route (still used below this width)
-// does. Same threshold Q4's sibling route uses -- not independently re-measured for FP8 yet.
 constexpr std::int32_t kVoltaCutlassMinT = 33;
 
 template <class Allocator>
-Tensor allocate_materialized_workspace(Allocator& allocator, std::int32_t rows, std::int32_t cols) {
+Tensor allocate_materialized_workspace(Allocator& allocator, std::int32_t rows,
+                                       std::int32_t cols) {
     return allocator.alloc(DType::BF16, {rows, cols});
 }
 
@@ -71,17 +64,17 @@ std::size_t materialized_workspace_bytes(std::int32_t rows, std::int32_t cols) {
     (void)allocate_materialized_workspace(layout, rows, cols);
     return layout.peak_bytes(1);
 }
-#endif // NINFER_VOLTA_BUILD
+#endif
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
                 cudaStream_t stream) {
 #ifdef NINFER_VOLTA_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT) {
-        auto scratch_scope = workspace.scope();
+        auto scope    = workspace.scope();
         Tensor gate_up = allocate_materialized_workspace(workspace, weight.n, x.ne[1]);
         fp8_linear_swiglu_cutlass_sm70_launch(x, weight, gate_up, workspace, stream);
-        silu_mul(gate_up.slice(0, 0, kOutputRows), gate_up.slice(0, kOutputRows, kOutputRows), out,
-                stream);
+        silu_mul(gate_up.slice(0, 0, kOutputRows),
+                 gate_up.slice(0, kOutputRows, kOutputRows), out, stream);
         return;
     }
 #endif
@@ -97,18 +90,11 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceAre
             fp8_linear_swiglu_decode_launch(input_chunk, weight, output_chunk, stream);
 #ifdef NINFER_VOLTA_BUILD
         } else if (fp8_linear_swiglu_qpn_split_supported(weight.k, active)) {
-            // Two independent QPN8 launches (one per weight half) into fp32 scratch, then a small
-            // combine kernel -- not the fused single-kernel route (fp8_linear_swiglu_volta_qpn,
-            // still built and correct, now unused in production) and not the unfused
-            // linear()+silu_mul() composition, which fails this op's correctness test the same
-            // way the NVFP4 sibling's did. Mirrors nvfp4_linear_swiglu_qpn_split.cuh exactly: the
-            // fused kernel's doubled accumulator/decode registers cost more than sharing the
-            // activation load saves. See the NVFP4 decode sweep.
-            auto scope                 = workspace.scope();
+            auto scope                    = workspace.scope();
             Fp8QpnSplitWorkspace scratch = allocate_qpn_split_workspace(workspace, active);
-            fp8_linear_swiglu_qpn_split_launch(input_chunk, weight, output_chunk,
-                                               reinterpret_cast<float*>(scratch.gate.data),
-                                               reinterpret_cast<float*>(scratch.up.data), stream);
+            fp8_linear_swiglu_qpn_split_launch(
+                input_chunk, weight, output_chunk, reinterpret_cast<float*>(scratch.gate.data),
+                reinterpret_cast<float*>(scratch.up.data), stream);
 #endif
         } else {
             fp8_linear_swiglu_small_t_launch(input_chunk, weight, output_chunk, stream);
@@ -131,19 +117,14 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
         return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8MlpGateUpGeometry::kInputRows);
     }
 #ifdef NINFER_VOLTA_BUILD
-    // The split route is reused per chunk inside launch_a16's loop, so it never needs more than
-    // one chunk's worth of scratch regardless of the overall T being dispatched. Above
-    // kVoltaCutlassMinT, launch_a16 instead takes the single-shot CUTLASS route sized to the
-    // interval's widest T; an interval straddling the threshold can reach either branch depending
-    // on the actual call's T, so the capacity is the max of both, not either alone.
     if (policy == LinearPolicy::A16Only && max_tokens >= 2) {
         std::size_t need = qpn_split_workspace_bytes(std::min(max_tokens, kChunk));
         if (max_tokens >= kVoltaCutlassMinT) {
             need = std::max(
                 need, materialized_workspace_bytes(Fp8MlpGateUpGeometry::kOutputRows, max_tokens) +
                           fp8_linear_swiglu_cutlass_workspace_bytes(
-                              Fp8MlpGateUpGeometry::kOutputRows, Fp8MlpGateUpGeometry::kInputRows,
-                              max_tokens));
+                              Fp8MlpGateUpGeometry::kOutputRows,
+                              Fp8MlpGateUpGeometry::kInputRows, max_tokens));
         }
         return need;
     }

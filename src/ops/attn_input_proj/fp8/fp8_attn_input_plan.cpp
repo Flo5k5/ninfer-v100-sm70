@@ -1,8 +1,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 
-#include "ops/linear/fp8/fp8_launch.h"
-
 #include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_launch.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.h"
 #endif
@@ -42,7 +41,6 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
         fp8_attn_input_cutlass_sm70_launch(x, weight, q, gate, k, v, *workspace, stream);
         return;
     }
-    // The quadpair route covers T=2..32 in one pass over the weights; see fp8_volta_qpn_gemm.cuh.
     const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
     const std::int32_t kChunk =
         qpn ? kFp8VoltaQpnMaxTokens : kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
