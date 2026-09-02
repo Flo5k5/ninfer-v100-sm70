@@ -1,7 +1,6 @@
 # NInfer
 
-> Selected checkpoints. Maximum single-GPU inference performance. Native NVFP4 on Blackwell;
-> software NVFP4 on Volta.
+> Selected checkpoints. Maximum single-GPU inference performance. Software NVFP4 on Volta.
 
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
 single NVIDIA GeForce RTX 5090 or Tesla V100. It runs text, image, and video prompts through a local
@@ -45,9 +44,21 @@ repetitions.
 | Qwen3.8-27B `nvfp4` | 5 | 1,160.1 | 86.78 |
 | Qwen3.6-35B-A3B `groupwise-int` | 5 | 763.4 | 211.41 |
 
+MTP automatically extends verification from five to fifteen draft tokens when the generated
+suffix exactly matches an earlier 16-token span and the learned five-token proposal agrees with
+the lookup continuation. On a 171-token verbatim-copy prompt, Qwen3.8-27B NVFP4 produced the exact
+143-token continuation at **140.06 tok/s**, against 77.88 tok/s with the lookup path disabled. It
+averaged 12.91 output tokens per round. This is a context-reproduction fast path; ordinary
+generation continues to use the normal MTP window and the general decode results above.
+
+Context-lookup MTP was inspired by
+[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090).
+
 On Volta, NVFP4 is decoded and executed in software using tuned FP16 tensor-core and SIMT kernels.
 Dense MLP gate/up payloads are prepacked in place during model load for the QPN decode layout; the
-artifact on disk is unchanged and inference does not perform runtime weight repacking.
+artifact on disk is unchanged and inference does not perform runtime weight repacking. The Volta
+QPN prepacking work was inspired by
+[dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny).
 
 The 35B-A3B production DFlash round at a 2,048-token context uses K=3: **134.33 tok/s**, 93.3%
 draft acceptance, and 3.8 mean output tokens per round over ten measured rounds after two warmups.

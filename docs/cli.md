@@ -177,6 +177,13 @@ use MTP with three draft tokens and DFlash with seven draft tokens (block length
 the optimized proposal head. DFlash accepts one to fifteen draft tokens; seven forms the measured
 block length eight, while fifteen uses the full native block.
 
+MTP also performs lossless context lookup automatically. When the latest 16 generated/prompt
+tokens exactly match an earlier occurrence, the runtime proposes that occurrence's continuation.
+It verifies up to fifteen tokens only when the lookup's first five tokens agree with the learned
+MTP proposal; otherwise it stays on the configured one-to-five-token MTP window. A concurrent
+decode batch uses the longer topology only when every active row qualifies. There is no separate
+CLI option, artifact, or sampling behavior for this path.
+
 ## Common options
 
 The table lists executable defaults. The examples above select FP8 KV and MTP3.
