@@ -14,6 +14,8 @@ namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
 inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
+inline constexpr std::uint32_t kMtpLookupMaximumDrafts    = 15;
+inline constexpr std::uint32_t kMtpLookupMaximumWidth     = kMtpLookupMaximumDrafts + 1;
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
@@ -43,15 +45,16 @@ struct OrdinaryDecodeEgress {
 };
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
-// product domain; RoundState binds only the configured [K,C] and [K+1,C] prefixes.
+// product domain; each decode frame binds its exact verification width and the configured
+// five-token-or-smaller learned proposal width.
 struct MtpDecodeIngress {
     std::array<TokenId, kMaximumConcurrency> anchors{};
     std::array<std::int32_t, kMaximumConcurrency> base_frontiers{};
     std::array<std::int32_t, kMaximumConcurrency> remaining_budgets{};
     std::array<std::int32_t, kMaximumConcurrency> current_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> current_drafts{};
-    std::array<std::int32_t, kMaximumConcurrency * kMtpDecodeMaximumWidth> target_rope_positions{};
+    std::array<TokenId, kMaximumConcurrency * kMtpLookupMaximumDrafts> current_drafts{};
+    std::array<std::int32_t, kMaximumConcurrency * kMtpLookupMaximumWidth> target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
@@ -61,7 +64,7 @@ struct MtpDecodeIngress {
 };
 
 struct MtpDecodeEgress {
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumWidth> licensed_tokens{};
+    std::array<TokenId, kMaximumConcurrency * kMtpLookupMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
@@ -157,6 +160,7 @@ struct RoundStateLayout {
     std::optional<MtpPrefillStateLayout> mtp;
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
+    std::optional<MtpDecodeStateLayout> mtp_lookup_decode;
     std::optional<DFlashDecodeStateLayout> dflash_decode;
     bool complete = false;
 };
@@ -243,7 +247,8 @@ struct MtpDecodeState {
 
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
-                   std::uint32_t batch_capacity, std::uint32_t draft_window);
+                   std::uint32_t batch_capacity, std::uint32_t verify_window,
+                   std::uint32_t proposal_window);
 };
 
 struct DFlashDecodeState {
@@ -291,6 +296,7 @@ struct RoundState {
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;
+    std::optional<MtpDecodeState> mtp_lookup_decode;
     std::optional<DFlashDecodeState> dflash_decode;
 
     RoundState() = default;

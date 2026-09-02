@@ -133,6 +133,10 @@ void test_round_layout() {
     expect(round.mtp_decode.has_value() && round.mtp_decode->alignment_ids.shape[0] == 6 &&
                round.mtp_decode->alignment_ids.shape[1] == 1,
            "MTP decode frame is explicit");
+    expect(round.mtp_lookup_decode.has_value() &&
+               round.mtp_lookup_decode->alignment_ids.shape[0] == 16 &&
+               round.mtp_lookup_decode->ar_positions.shape[1] == 4,
+           "MTP lookup frame verifies fifteen tokens but proposes five");
 
     ninfer::LayoutBuilder speculative_builder;
     q36::RoundStateLayout dflash = q36::begin_round_state_layout(
@@ -146,7 +150,8 @@ void test_round_layout() {
                dflash.dflash_decode.has_value() &&
                dflash.dflash_decode->draft_tokens.shape[0] == 15,
            "K=15 DFlash storage is backend-owned");
-    expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value(),
+    expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value() &&
+               !dflash.mtp_lookup_decode.has_value(),
            "DFlash layout does not allocate MTP storage");
 }
 
