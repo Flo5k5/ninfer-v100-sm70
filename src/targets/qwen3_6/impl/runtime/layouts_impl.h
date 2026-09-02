@@ -178,6 +178,19 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          .key_dim         = TextConfig::gdn_key_head_dim,
                          .value_dim       = TextConfig::gdn_value_head_dim,
                      });
+        if (plan.speculative_backend == SpeculativeBackend::Mtp) {
+            out.mtp_lookup_replay_records = plan_gdn_replay_records(
+                builder, GdnReplayRecordSpec{
+                             .layers          = TextConfig::gdn_layers(),
+                             .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+                             .width = static_cast<std::int32_t>(qwen3_6::kMtpLookupMaximumWidth),
+                             .conv_channels = TextConfig::convolution_dim,
+                             .qk_heads      = TextConfig::gdn_key_heads,
+                             .value_heads   = TextConfig::gdn_value_heads,
+                             .key_dim       = TextConfig::gdn_key_head_dim,
+                             .value_dim     = TextConfig::gdn_value_head_dim,
+                         });
+        }
     }
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
@@ -430,6 +443,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.mtp()) {
+        constexpr std::int32_t lookup_verify =
+            static_cast<std::int32_t>(qwen3_6::kMtpLookupMaximumWidth);
         WorkspaceLayoutBuilder mtp_prefill;
         text_common_root(mtp_prefill, chunk);
         target_body(mtp_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, GdnWorkspacePath::Prefill,
@@ -461,11 +476,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
         for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
              ++batch) {
-            const std::int32_t aggregate = batch * verify;
+            const std::int32_t aggregate = batch * lookup_verify;
             WorkspaceLayoutBuilder target;
             matrix(target, DType::BF16, TextConfig::hidden, aggregate);
             target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
-                        GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
+                        GdnWorkspacePath::ReplayRecord, batch, lookup_verify, lookup_verify,
+                        text_envelope);
 
             const auto mtp_decode_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t width) {
                 const std::int32_t tokens = batch * width;
@@ -484,14 +500,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             WorkspaceLayoutBuilder alignment;
-            mtp_decode_core(alignment, verify);
+            mtp_decode_core(alignment, lookup_verify);
             WorkspaceLayoutBuilder ar;
             mtp_decode_core(ar, 1);
             WorkspaceLayoutBuilder proposal;
             proposal_scratch(proposal, batch);
             const std::size_t batch_accept =
                 ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                    TextConfig::token_domain, drafts, drafts, batch, batch);
+                    TextConfig::token_domain, qwen3_6::kMtpLookupMaximumDrafts,
+                    qwen3_6::kMtpLookupMaximumDrafts, batch, batch);
             out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment), finish(ar),
                                       finish(proposal), batch_accept});
         }
@@ -692,17 +709,20 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
+            const auto profiles =
+                mtp_graph_profiles(impl->capacity, qwen3_6::kMtpLookupMaximumDrafts);
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
                 [&](GraphExecutionProfile profile) {
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
+                        static_cast<std::uint64_t>(profile.max) +
+                            2ULL * qwen3_6::kMtpLookupMaximumDrafts);
                     return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                 },
                 "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
+            impl->graph_allowance_bytes = checked_mul(2ULL * per_batch_allowance,
+                                                      impl->max_concurrency,
                                                       "MTP exact-b graph allowance");
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
