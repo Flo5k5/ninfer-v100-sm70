@@ -889,6 +889,82 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
     return 0;
 }
 
+int exercise_dynamic_response_replay(const char* artifact) {
+    ninfer::EngineOptions configured          = shared_replacement_engine_options(artifact);
+    configured.context_cache.host_state_slots = 8;
+    ninfer::Engine engine(std::move(configured));
+
+    const auto text_message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+    const auto assistant_message = [&](const ninfer::GenerationResult& result) {
+        ninfer::ChatMessage message = text_message(ninfer::ChatRole::Assistant, result.content);
+        message.reasoning_content   = result.reasoning;
+        return message;
+    };
+    const auto request_options = [] {
+        ninfer::RequestOptions options;
+        options.execution.requested_output_tokens = 8;
+        options.execution.sampling.temperature    = 0.0F;
+        options.execution.allow_prefix_reuse      = true;
+        options.stop.include_model_defaults       = false;
+        return options;
+    };
+
+    ninfer::PromptInput first_input;
+    first_input.messages.push_back(text_message(
+        ninfer::ChatRole::User, "Answer with a short description of a silver sphere."));
+    first_input.options.enable_thinking = false;
+    // The shared marker keeps a catalogue reference to the captured StateImage while the private
+    // continuation advances. A later private Fork borrows that source but must not charge it to
+    // the active sequence's one-slot Device entitlement.
+    first_input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .after_message_count = 1,
+        .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+    });
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(first_input), request_options());
+
+    ninfer::PromptInput second_input = first_input;
+    second_input.messages.push_back(assistant_message(first));
+    second_input.messages.push_back(
+        text_message(ninfer::ChatRole::User, "Now make the sphere blue."));
+    const ninfer::GenerationResult second =
+        engine.generate(engine.prepare(second_input), request_options());
+
+    ninfer::PromptInput third_input = second_input;
+    third_input.messages.push_back(assistant_message(second));
+    third_input.messages.push_back(
+        text_message(ninfer::ChatRole::User, "Finally, place it on a wooden table."));
+    const ninfer::GenerationResult third =
+        engine.generate(engine.prepare(third_input), request_options());
+
+    if (first.generated_token_ids.size() != 8 || second.generated_token_ids.size() != 8 ||
+        third.generated_token_ids.size() != 8 ||
+        (second.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
+         second.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure &&
+         second.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) ||
+        (third.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
+         third.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure &&
+         third.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) ||
+        second.reused_prompt_tokens == 0 ||
+        third.reused_prompt_tokens <= second.reused_prompt_tokens) {
+        std::cerr << "rolling generated response replay did not remain materializable: first="
+                  << first.generated_token_ids.size() << " second="
+                  << second.generated_token_ids.size() << '/' << second.reused_prompt_tokens << '/'
+                  << static_cast<int>(second.prefix_reuse_path) << " third="
+                  << third.generated_token_ids.size() << '/' << third.reused_prompt_tokens << '/'
+                  << static_cast<int>(third.prefix_reuse_path) << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_rewrite_branch(const char* artifact) {
     auto text_message = [](ninfer::ChatRole role, std::string text) {
         ninfer::ChatMessage message;
@@ -1648,6 +1724,9 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
         ninfer::Engine engine(shared_replacement_engine_options(artifact));
         if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
     }
+    if (const int result = exercise_dynamic_response_replay(artifact); result != 0) {
+        return result;
+    }
     if (const int result = exercise_shared_replacement_and_full_capacity_reuse(artifact);
         result != 0) {
         return result;
@@ -1717,6 +1796,18 @@ int main() {
         configured.context_cache.max_shared_prefixes = 0;
         ninfer::Engine engine(std::move(configured));
         const int result = exercise_rewrite_checkpoints(engine);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "dynamic-response-replay") {
+        const char* artifact = qwen38_nvfp4 != nullptr && *qwen38_nvfp4 != '\0'
+                                   ? qwen38_nvfp4
+                                   : nvfp4;
+        if (artifact == nullptr || *artifact == '\0') {
+            std::cerr << "dynamic-response-replay requires a 27B NVFP4 artifact\n";
+            return 1;
+        }
+        const int result = exercise_dynamic_response_replay(artifact);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }
