@@ -31,8 +31,8 @@ enum class ParsePurpose {
 }
 
 [[noreturn]] void invalid_thinking_signature() {
-    bad_request("assistant Thinking blocks must include the signature returned by NInfer and be "
-                "passed back unmodified",
+    bad_request("assistant Thinking blocks must include the signature returned by the current "
+                "NInfer server process and be passed back unmodified",
                 "messages", "invalid_thinking_signature");
 }
 

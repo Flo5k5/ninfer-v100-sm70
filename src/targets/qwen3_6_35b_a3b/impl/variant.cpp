@@ -106,7 +106,18 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_profiles_through(capacity - 1, ends);
+    std::vector<GraphExecutionProfile> profiles = graph_profiles_through(capacity - 1, ends);
+#ifdef NINFER_VOLTA_BUILD
+    // The K=15 lookup verifier crosses Volta leaf-kernel topology boundaries that are not
+    // compatible with cudaGraphExecUpdate. Keep a resident executable for each frontier profile;
+    // the sequence plan accounts for these target-owned topology classes in its graph allowance.
+    if (draft_window > 5) {
+        for (std::size_t i = 0; i < profiles.size(); ++i) {
+            profiles[i].topology_class = static_cast<std::uint32_t>(i);
+        }
+    }
+#endif
+    return profiles;
 }
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
@@ -213,9 +224,10 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const GdnProjectionWeights& weights,
                                           Tensor& hidden, Tensor& g, Tensor& beta,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
+                                          WorkspaceArena& workspace,
+                                          DeviceExecutionView execution) {
     ops::gdn_norm_gating_proj(residual, norm_weight, eps, weights.a_b_projection, weights.a_log,
-                              weights.dt_bias, workspace, hidden, g, beta, stream);
+                              weights.dt_bias, workspace, hidden, g, beta, execution);
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,

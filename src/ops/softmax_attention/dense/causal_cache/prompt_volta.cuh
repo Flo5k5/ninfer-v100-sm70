@@ -74,7 +74,7 @@ causal_attention_prompt_volta_kernel(
                                     q[causal_prompt_q_index<Geometry>(q_head, d, token)]);
 
     const auto* cache_k_bf16 = static_cast<const __nv_bfloat16*>(cache_k_raw);
-    const auto* cache_v_bf16 = static_cast<const __nv_bfloat16*>(cache_v_raw);
+    const auto* cache_v_f16  = static_cast<const __half*>(cache_v_raw);
     const auto* cache_k_i8    = static_cast<const std::int8_t*>(cache_k_raw);
     const auto* cache_v_i8    = static_cast<const std::int8_t*>(cache_v_raw);
 
@@ -99,7 +99,7 @@ causal_attention_prompt_volta_kernel(
                     __half2float(cache_v_scale[scale_index]);
         } else {
             key_value = __bfloat162float(cache_k_bf16[cache_index]);
-            value     = __bfloat162float(cache_v_bf16[cache_index]);
+            value     = __half2float(cache_v_f16[cache_index]);
         }
 
         const float dot = block_reduce_sum<kCausalPromptVoltaThreads>(q_value * key_value,

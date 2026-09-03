@@ -74,8 +74,7 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
 void causal_attention_prompt_fp8_attention_launch(const Tensor& q, const Tensor& positions,
                                                   float scale, const PagedKVLayerView& cache,
                                                   Tensor& out, cudaStream_t stream) {
-    const CausalPromptDirectMetadata metadata{
-        static_cast<const std::int32_t*>(cache.block_table.data)};
+    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
     causal_attention_prompt_fp8_attention_dispatch(q, positions, scale, cache, metadata, out,
                                                    stream);
 }
@@ -85,13 +84,14 @@ void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const 
                                         const Tensor& table_rows, float scale,
                                         PagedKVBatchLayerView cache, Tensor& out,
                                         cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
     const auto launch_row = [&]<bool Masked>(const Tensor& q_row, const Tensor& k_row,
                                             const Tensor& v_row, const Tensor& positions_row,
                                             const Tensor& valid_row, const Tensor& table_row,
                                             Tensor& out_row) {
         kv_cache_append_batch_launch(k_row, v_row, positions_row, valid_row, table_row, cache,
                                      stream);
-        const CausalPromptBatchMetadata<Masked> metadata{
+        const PagedKVBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
             .valid_columns =
                 Masked ? static_cast<const std::int32_t*>(valid_row.data) : nullptr,
@@ -117,6 +117,25 @@ void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const 
                                                  table_row, out_row);
         }
     }
+#else
+    kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
+    const auto launch = [&]<bool Masked>() {
+        const PagedKVBatchMetadata<Masked> metadata{
+            .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
+            .valid_columns =
+                Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+            .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
+            .table_stride = cache.block_tables.ne[0],
+        };
+        causal_attention_prompt_fp8_attention_dispatch(q, positions, scale, cache, metadata, out,
+                                                       stream);
+    };
+    if (valid_columns.data == nullptr) {
+        launch.template operator()<false>();
+    } else {
+        launch.template operator()<true>();
+    }
+#endif
 }
 
 } // namespace ninfer::ops::detail
