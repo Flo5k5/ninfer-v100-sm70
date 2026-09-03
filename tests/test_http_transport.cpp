@@ -83,6 +83,20 @@ int test_sse_transport() {
     failures += check(failed_heartbeat.poll(start + 5s) && heartbeat_cancelled,
                       "failed SSE heartbeat did not cancel its request");
 
+    constexpr std::string_view ping = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+    std::vector<std::string> ping_writes;
+    httplib::DataSink ping_sink;
+    ping_sink.write = [&](const char* data, std::size_t size) {
+        ping_writes.emplace_back(data, size);
+        return true;
+    };
+    ping_sink.is_writable = [] { return true; };
+    std::atomic<bool> ping_cancelled{false};
+    SseTransport ping_transport(ping_sink, ping_cancelled, 5s, start, ping);
+    failures += check(!ping_transport.poll(start + 5s) &&
+                          ping_writes == std::vector<std::string>{std::string(ping)},
+                      "SSE transport did not emit its protocol-specific heartbeat");
+
     write_ok = false;
     writable = true;
     std::atomic<bool> event_cancelled{false};

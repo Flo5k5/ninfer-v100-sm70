@@ -20,6 +20,7 @@ public:
     [[nodiscard]] std::string sign(std::string_view thinking, std::size_t block_index) const;
     [[nodiscard]] bool verify(std::string_view thinking, std::size_t block_index,
                               std::string_view signature) const;
+    [[nodiscard]] static bool is_ninfer_signature(std::string_view signature);
 
 private:
     Key key_{};

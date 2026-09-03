@@ -464,31 +464,35 @@ int test_thinking_history_integrity() {
                   accepted.messages[1].content[0].text == "answer",
               "valid signed Thinking history was not lowered");
 
-    const ApiError restarted_process_error = api_error([&] {
-        (void)parse_anthropic_messages_request(body, limits(), other_process);
-    });
-    failures +=
-        check(restarted_process_error.status == 400 &&
-                  restarted_process_error.param == "messages" &&
-                  restarted_process_error.code == "invalid_thinking_signature" &&
-                  restarted_process_error.message ==
-                      "assistant Thinking blocks must include the signature returned by the "
-                      "current NInfer server process and be passed back unmodified",
-              "OMP continuation signed by a prior server process did not return the Thinking "
-              "signature contract error");
+    const GenerationRequest resumed =
+        parse_anthropic_messages_request(body, limits(), other_process).generation;
+    failures += check(resumed.messages.size() == 3 &&
+                          resumed.messages[1].reasoning_content.empty() &&
+                          resumed.messages[1].content[0].text == "answer",
+                      "OMP continuation signed by a prior NInfer process did not discard only "
+                      "its stale Thinking block");
+    const GenerationRequest resumed_count =
+        parse_anthropic_count_tokens_request(body, other_process).generation;
+    failures += check(resumed_count.messages.size() == 3 &&
+                          resumed_count.messages[1].reasoning_content.empty() &&
+                          resumed_count.messages[1].content[0].text == "answer",
+                      "Count Tokens did not share stale NInfer Thinking omission");
 
     Json changed_text                                     = body;
     changed_text["messages"][1]["content"][0]["thinking"] = "changed";
-    failures += check(api_code([&] { (void)parse(changed_text); }) == "invalid_thinking_signature",
-                      "Thinking text changed under an existing signature was accepted");
+    const GenerationRequest changed_text_request = parse(changed_text).generation;
+    failures += check(changed_text_request.messages[1].reasoning_content.empty() &&
+                          changed_text_request.messages[1].content[0].text == "answer",
+                      "Thinking text changed under a NInfer signature was not discarded");
 
     Json changed_signature                                      = body;
     std::string invalid                                         = signature;
     invalid.back()                                              = invalid.back() == '0' ? '1' : '0';
     changed_signature["messages"][1]["content"][0]["signature"] = invalid;
-    failures +=
-        check(api_code([&] { (void)parse(changed_signature); }) == "invalid_thinking_signature",
-              "changed Thinking signature was accepted");
+    const GenerationRequest changed_signature_request = parse(changed_signature).generation;
+    failures += check(changed_signature_request.messages[1].reasoning_content.empty() &&
+                          changed_signature_request.messages[1].content[0].text == "answer",
+                      "invalidated NInfer Thinking signature was not discarded");
 
     Json missing_signature = body;
     missing_signature["messages"][1]["content"][0].erase("signature");
@@ -501,11 +505,25 @@ int test_thinking_history_integrity() {
     failures += check(api_code([&] { (void)parse(wrong_type); }) == "invalid_thinking_signature",
                       "non-string Thinking signature was accepted");
 
+    Json malformed_signature                                      = body;
+    malformed_signature["messages"][1]["content"][0]["signature"] = changed_encoding;
+    failures += check(api_code([&] { (void)parse(malformed_signature); }) ==
+                          "invalid_thinking_signature",
+                      "malformed NInfer Thinking signature was treated as a stale signature");
+
+    Json foreign_signature                                      = body;
+    foreign_signature["messages"][1]["content"][0]["signature"] = "sig_foreign_v1_opaque";
+    failures += check(api_code([&] { (void)parse(foreign_signature); }) ==
+                          "invalid_thinking_signature",
+                      "foreign Thinking signature was treated as a stale NInfer signature");
+
     Json reordered = body;
     reordered["messages"][1]["content"].insert(reordered["messages"][1]["content"].begin(),
                                                Json{{"type", "text"}, {"text", "first"}});
-    failures += check(api_code([&] { (void)parse(reordered); }) == "invalid_thinking_signature",
-                      "signed Thinking block was accepted at a changed content position");
+    const GenerationRequest reordered_request = parse(reordered).generation;
+    failures += check(reordered_request.messages[1].reasoning_content.empty() &&
+                          reordered_request.messages[1].content.size() == 2,
+                      "NInfer Thinking block moved to another position was not discarded");
     failures +=
         check(api_code([&] {
                   (void)parse_anthropic_count_tokens_request(missing_signature, thinking_signer());
