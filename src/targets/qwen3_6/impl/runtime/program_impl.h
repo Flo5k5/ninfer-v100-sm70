@@ -10376,7 +10376,11 @@ std::uint32_t ProgramImplCore::state_footprint(const SequenceState& sequence) co
     std::array<StateImageHandle, 4> unique{};
     std::uint32_t count = 0;
     const auto add      = [&](StateImageHandle handle) {
-        if (!state_store->valid(handle)) { return; }
+        // A Fork may read a checkpoint retained by another catalogue owner. The active
+        // entitlement covers only the sequence-owned destination and optional checkpoints.
+        if (!state_store->valid(handle) || !state_exclusive_to_sequence(sequence, handle)) {
+            return;
+        }
         const StateReplicaResidency residency = state_store->residency(handle);
         if (residency != StateReplicaResidency::DeviceOnly &&
             residency != StateReplicaResidency::Both) {
