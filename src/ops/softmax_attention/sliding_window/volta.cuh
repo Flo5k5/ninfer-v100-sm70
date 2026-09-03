@@ -5,6 +5,7 @@
 #include "ops/softmax_attention/common/context_query.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 namespace ninfer::ops {
@@ -17,7 +18,7 @@ sliding_window_attention_volta_kernel(
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
     const __nv_bfloat16* __restrict__ context_k,
-    const __nv_bfloat16* __restrict__ context_v, int padded_context, int tokens, float scale,
+    const __half* __restrict__ context_v, int padded_context, int tokens, float scale,
     __nv_bfloat16* __restrict__ out) {
     constexpr int D       = kContextQueryHeadDim;
     constexpr int QHeads  = kContextQueryQHeads;
@@ -59,7 +60,7 @@ sliding_window_attention_volta_kernel(
         const std::int64_t index = lane_base + d + static_cast<std::int64_t>(D) *
                                                        (slot + padded_context * kv_head);
         const float key_value = __bfloat162float(context_k[index]);
-        const float value     = __bfloat162float(context_v[index]);
+        const float value     = __half2float(context_v[index]);
         const float dot = block_reduce_sum<kSlidingWindowVoltaThreads>(q_value * key_value,
                                                                        warp_sums);
         if (d == 0) { score_s = dot * scale; }

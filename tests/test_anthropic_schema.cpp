@@ -71,6 +71,15 @@ std::string api_param(const std::function<void()>& action) {
     return {};
 }
 
+ApiError api_error(const std::function<void()>& action) {
+    try {
+        action();
+    } catch (const ApiException& error) { return error.error(); } catch (...) {
+        return ApiError{.status = 500, .type = "wrong_exception"};
+    }
+    return ApiError{.status = 200, .type = "missing_exception"};
+}
+
 ninfer::PromptCapabilities capabilities() {
     ninfer::PromptCapabilities result;
     result.enable_thinking                 = true;
@@ -334,12 +343,20 @@ int test_tools() {
                              rendered["function"]["input_examples"].is_array(),
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
 
-    body["tools"] = Json::array({ordinary_tool(true)});
-    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported",
-                      "active strict tool was accepted without constrained decoding");
+    Json strict_tool     = ordinary_tool(true);
+    strict_tool["name"] = "edit_file";
+    body["tools"]       = Json::array({ordinary_tool(), std::move(strict_tool)});
+    const ApiError strict_error = api_error([&] { (void)parse(body); });
+    failures +=
+        check(strict_error.status == 400 && strict_error.param == "tools" &&
+                  strict_error.code == "strict_tools_not_supported" &&
+                  strict_error.message ==
+                      "strict=true requires generated tool input to satisfy the declared JSON "
+                      "Schema, which NInfer cannot guarantee",
+              "OMP-style mixed tool list did not return the strict-tool contract error");
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
-    body["tools"][0]["defer_loading"] = true;
-    body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
+    body["tools"][1]["defer_loading"] = true;
+    body["tools"][1]["allowed_callers"] = Json::array({"code_execution"});
     const GenerationRequest disabled    = parse(body).generation;
     failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.empty(),
                       "tool_choice:none did not neutralize inactive tool guarantees");
@@ -446,6 +463,19 @@ int test_thinking_history_integrity() {
         check(accepted.messages.size() == 3 && accepted.messages[1].reasoning_content == thought &&
                   accepted.messages[1].content[0].text == "answer",
               "valid signed Thinking history was not lowered");
+
+    const ApiError restarted_process_error = api_error([&] {
+        (void)parse_anthropic_messages_request(body, limits(), other_process);
+    });
+    failures +=
+        check(restarted_process_error.status == 400 &&
+                  restarted_process_error.param == "messages" &&
+                  restarted_process_error.code == "invalid_thinking_signature" &&
+                  restarted_process_error.message ==
+                      "assistant Thinking blocks must include the signature returned by the "
+                      "current NInfer server process and be passed back unmodified",
+              "OMP continuation signed by a prior server process did not return the Thinking "
+              "signature contract error");
 
     Json changed_text                                     = body;
     changed_text["messages"][1]["content"][0]["thinking"] = "changed";

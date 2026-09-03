@@ -6,6 +6,7 @@
 #include "ops/softmax_attention/common/context_query.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 namespace ninfer::ops {
@@ -20,7 +21,7 @@ context_attention_volta_kernel(
     const std::int32_t* __restrict__ valid_columns,
     const std::int32_t* __restrict__ table_rows,
     const __nv_bfloat16* __restrict__ context_k,
-    const __nv_bfloat16* __restrict__ context_v,
+    const __half* __restrict__ context_v,
     const std::int32_t* __restrict__ block_tables, int physical_pages, int logical_pages,
     int tokens, float scale,
     __nv_bfloat16* __restrict__ out) {
@@ -60,7 +61,7 @@ context_attention_volta_kernel(
             ((key & kPagedKVPageMask) + kPagedKVPageSize *
                 (physical_page + static_cast<std::int64_t>(physical_pages) * kv_head));
         const float key_value = __bfloat162float(context_k[index]);
-        const float value     = __bfloat162float(context_v[index]);
+        const float value     = __half2float(context_v[index]);
         const float dot = block_reduce_sum<kContextAttentionVoltaThreads>(q_value * key_value,
                                                                           warp_sums);
         if (d == 0) { score_s = dot * scale; }

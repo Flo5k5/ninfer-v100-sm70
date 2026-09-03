@@ -106,7 +106,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
         static_cast<const std::int32_t*>(valid_columns.data),
         static_cast<const std::int32_t*>(lanes.data),
         static_cast<const __nv_bfloat16*>(context.k.data),
-        static_cast<const __nv_bfloat16*>(context.v.data),
+        static_cast<const __half*>(context.v.data),
         static_cast<int>(context.padded_capacity), q.ne[2], scale,
         static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
@@ -133,7 +133,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(lanes.data),
                     static_cast<const __nv_bfloat16*>(context.k.data),
-                    static_cast<const __nv_bfloat16*>(context.v.data),
+                    static_cast<const __half*>(context.v.data),
                     static_cast<int>(context.padded_capacity), plan.max_context, 1, scale,
                     static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
@@ -152,7 +152,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                 static_cast<const std::int32_t*>(valid_columns.data),
                 static_cast<const std::int32_t*>(lanes.data),
                 static_cast<const __nv_bfloat16*>(context.k.data),
-                static_cast<const __nv_bfloat16*>(context.v.data),
+                static_cast<const __half*>(context.v.data),
                 static_cast<int>(context.padded_capacity), plan.max_context, plan.split_capacity,
                 scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),

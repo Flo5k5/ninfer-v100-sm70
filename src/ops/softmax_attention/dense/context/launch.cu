@@ -112,7 +112,7 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
         static_cast<const std::int32_t*>(valid_columns.data),
         static_cast<const std::int32_t*>(table_rows.data),
         static_cast<const __nv_bfloat16*>(context.k_pages.data),
-        static_cast<const __nv_bfloat16*>(context.v_pages.data),
+        static_cast<const __half*>(context.v_pages.data),
         static_cast<const std::int32_t*>(context.block_tables.data), context.k_pages.ne[2],
         context.block_tables.ne[0], q.ne[2], scale, static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
@@ -141,7 +141,7 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(table_rows.data),
                     static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __nv_bfloat16*>(context.v_pages.data),
+                    static_cast<const __half*>(context.v_pages.data),
                     static_cast<const std::int32_t*>(context.block_tables.data),
                     context.k_pages.ne[2], context.block_tables.ne[0],
                     context.block_tables.ne[0] * kPagedKVPageSize, 1, scale,
@@ -169,7 +169,7 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(table_rows.data),
                     static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __nv_bfloat16*>(context.v_pages.data),
+                    static_cast<const __half*>(context.v_pages.data),
                     static_cast<const std::int32_t*>(context.block_tables.data),
                     context.k_pages.ne[2], context.block_tables.ne[0],
                     context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity, scale,
