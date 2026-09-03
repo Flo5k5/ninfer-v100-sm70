@@ -58,12 +58,10 @@
 //
 //   3. Row capacity. Fixing Br=32 means a single tile can't cover every (TokenTile x
 //      GroupSize) row count this op needs (up to 6*8=48 for the widest GQA geometry this
-//      codebase instantiates). Rather than scale Br back up (reintroducing the shared-memory
-//      wall), the kernel loops over row-tile "passes": each pass restages Q for a different
-//      32-row slice and re-walks the whole key range. At most 2 passes are ever needed for
-//      any geometry this codebase instantiates. This trades some redundant K/V global/cache
-//      reads across passes for a fixed, small, well-understood resource footprint --
-//      consistent with this kernel's stated correctness-first phase 1 priority.
+//      codebase instantiates). The general route therefore loops over 32-row passes. The hot
+//      27B width-six shape is exactly 36 rows, so its long-context route instead gives the
+//      four-row tail to a fifth warp. That warp uses the four independent mma quadpairs as
+//      D slices for PV, sharing the first tile's K/V walk rather than starting a second pass.
 
 #include "ops/common/volta_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
@@ -93,7 +91,8 @@ __device__ __forceinline__ int4 causal_kv_dequant_i8x8_f16_from(
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput>
-__launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_partial_i8_kernel(
+__launch_bounds__(WarpsPerCta * 32, 2) __global__
+    void causal_attention_small_t_tc_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
     std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
@@ -101,14 +100,15 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
-    static_assert(WarpsPerCta == 4, "this kernel always splits the head dim 4 ways -- see file comment");
+    static_assert(WarpsPerCta == 4 || WarpsPerCta == 5);
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
-    constexpr int DimSplit      = WarpsPerCta; // warps split the head dim, not the row range
+    constexpr int DimSplit      = 4;
+    constexpr bool CompactTail  = WarpsPerCta == 5;
     constexpr int Br            = 32;          // one Volta tile's worth of rows per pass
     constexpr int Bc            = 16;          // keys per shared-memory tile
     constexpr int D             = kCausalHeadDim;
-    constexpr int Threads       = DimSplit * 32;
+    constexpr int Threads       = WarpsPerCta * 32;
     constexpr int DChunks       = D / 8;           // QK^T: full head-dim contraction, unsplit
     constexpr int PVChunks      = Bc / 8;          // key sub-groups per Bc tile
     constexpr int DSlice        = D / DimSplit;    // this warp's PV output width
@@ -138,6 +138,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
     constexpr int SmemStride = D + SmemPad;
     static_assert(SmemPad % 8 == 0, "pad must preserve 16-byte alignment of the staging stores");
     __shared__ __align__(16) half q_s[Br * SmemStride];
+    __shared__ __align__(16) half q_tail_s[4 * SmemStride];
+    __shared__ __align__(16) half p_tail_s[8 * 8];
     __shared__ __align__(16) half k_s[Bc * SmemStride];
     __shared__ __align__(16) half v_s[Bc * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
@@ -149,7 +151,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
     const int lane        = tid & 31;
-    const int dim_warp    = warp; // DimSplit == WarpsPerCta: every warp is a dim-slice of the one row-tile
+    const int dim_warp    = warp < DimSplit ? warp : 0;
     int valid_tokens       = tokens;
     if constexpr (Masked) {
         const int remaining = valid_columns[batch] - column_begin;
@@ -295,20 +297,46 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
         __syncthreads();
     }
 
-    // One row-tile "pass" per Br=32 slice of this token tile's rows (at most 2 for any
-    // geometry this codebase instantiates -- see file comment #3). Each pass restages Q
-    // and re-walks the whole key range for its own 32-row slice.
-    for (int row_base = 0; row_base < row_count; row_base += Br) {
-        const int rows_here = (row_count - row_base < Br) ? (row_count - row_base) : Br;
+    // The width-six 27B specialization keeps the first 32 rows on the established four-warp
+    // tensor-core mapping and assigns the four-row tail to one compact quadpair-split-D warp.
+    // Both consume each staged K/V tile before it is replaced.
+    const int main_row_count = CompactTail ? Br : row_count;
+    for (int row_base = 0; row_base < main_row_count; row_base += Br) {
+        const int rows_here =
+            (main_row_count - row_base < Br) ? main_row_count - row_base : Br;
 
-        for (int row = warp; row < Br; row += WarpsPerCta) {
-            int q_head     = 0;
-            int token      = 0;
-            float values[8] = {};
-            if (row < rows_here) {
-                causal_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head,
-                                                      token);
-                if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
+        if (!CompactTail || warp < DimSplit) {
+            for (int row = dim_warp; row < Br; row += DimSplit) {
+                int q_head      = 0;
+                int token       = 0;
+                float values[8] = {};
+                if (row < rows_here) {
+                    causal_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head,
+                                                          token);
+                    if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
+#pragma unroll
+                        for (int part = 0; part < 8; ++part) {
+                            const int d = lane + 32 * part;
+                            values[part] =
+                                __bfloat162float(q[causal_q_index<Geometry>(q_head, d, token)]);
+                        }
+                        normalized_hadamard_d256_inplace(values, lane);
+                    }
+                }
+#pragma unroll
+                for (int part = 0; part < 8; ++part) {
+                    q_s[row * SmemStride + lane + 32 * part] = __float2half(values[part]);
+                }
+            }
+        }
+        if constexpr (CompactTail) {
+            if (warp == DimSplit) {
+                for (int row = 0; row < 4; ++row) {
+                    int q_head = 0;
+                    int token  = 0;
+                    causal_small_t_tc_row_to_qt<Geometry>(Br + row, tokens, kv_head, q_head,
+                                                          token);
+                    float values[8];
 #pragma unroll
                     for (int part = 0; part < 8; ++part) {
                         const int d = lane + 32 * part;
@@ -316,11 +344,12 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
                             __bfloat162float(q[causal_q_index<Geometry>(q_head, d, token)]);
                     }
                     normalized_hadamard_d256_inplace(values, lane);
-                }
-            }
 #pragma unroll
-            for (int part = 0; part < 8; ++part) {
-                q_s[row * SmemStride + lane + 32 * part] = __float2half(values[part]);
+                    for (int part = 0; part < 8; ++part) {
+                        q_tail_s[row * SmemStride + lane + 32 * part] =
+                            __float2half(values[part]);
+                    }
+                }
             }
         }
         __syncthreads();
@@ -401,7 +430,24 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
 #pragma unroll
                 for (int c = 0; c < DChunks; ++c) {
                     half2 qf[4];
-                    volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]), SmemStride / 2);
+                    if constexpr (CompactTail) {
+                        if (warp == DimSplit) {
+                            const int qrow = volta_qp_get_i();
+#pragma unroll
+                            for (int l = 0; l < 4; ++l) {
+                                qf[l] = qrow < 4
+                                            ? reinterpret_cast<const half2*>(
+                                                  &q_tail_s[qrow * SmemStride + c * 8])[l]
+                                            : __half2half2(__ushort_as_half(0));
+                            }
+                        } else {
+                            volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]),
+                                          SmemStride / 2);
+                        }
+                    } else {
+                        volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]),
+                                      SmemStride / 2);
+                    }
                     half2 kf[4];
                     volta_load_k(
                         kf, reinterpret_cast<const half2*>(&k_s[sub * 8 * SmemStride + c * 8]),
@@ -415,13 +461,16 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
                 // cover this thread's own rows. ---
                 const int r_lo = volta_d_get_i(0) & ~2;
                 const int r_hi = volta_d_get_i(0) | 2;
+                const int worker_row_base = CompactTail && warp == DimSplit ? Br : row_base;
+                const int worker_rows     = CompactTail && warp == DimSplit ? row_count - Br
+                                                                            : rows_here;
                 int q_head_lo = 0, tok_lo = 0, q_head_hi = 0, tok_hi = 0;
-                causal_small_t_tc_row_to_qt<Geometry>(row_base + r_lo, tokens, kv_head, q_head_lo,
-                                                   tok_lo);
-                causal_small_t_tc_row_to_qt<Geometry>(row_base + r_hi, tokens, kv_head, q_head_hi,
-                                                   tok_hi);
-                const int qabs_lo = (r_lo < rows_here) ? pos[tok_lo] : -1;
-                const int qabs_hi = (r_hi < rows_here) ? pos[tok_hi] : -1;
+                causal_small_t_tc_row_to_qt<Geometry>(worker_row_base + r_lo, tokens, kv_head,
+                                                      q_head_lo, tok_lo);
+                causal_small_t_tc_row_to_qt<Geometry>(worker_row_base + r_hi, tokens, kv_head,
+                                                      q_head_hi, tok_hi);
+                const int qabs_lo = (r_lo < worker_rows) ? pos[tok_lo] : -1;
+                const int qabs_hi = (r_hi < worker_rows) ? pos[tok_hi] : -1;
 #pragma unroll
                 for (int l = 0; l < 8; ++l) {
                     const int row   = volta_d_get_i(l);
@@ -430,7 +479,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
                     const bool lo   = (l & 2) == 0;
                     const int qabs  = lo ? qabs_lo : qabs_hi;
                     const bool ok =
-                        row < rows_here && key >= split_start && key < split_end && key <= qabs;
+                        row < worker_rows && key >= split_start && key < split_end && key <= qabs;
                     d_score[l] = ok ? d_score[l] * scale : -CUDART_INF_F;
                 }
 
@@ -470,23 +519,82 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
                 // see volta_mma.cuh's I_MAJOR addressing for the Q/P/PV-output tile.
                 const float alpha = ((lane & 2) == 0) ? alpha_lo : alpha_hi;
 
-                half2 p[4];
-                volta_softmax_to_half2(p, d_score);
+                if (!CompactTail || warp < DimSplit) {
+                    half2 p[4];
+                    volta_softmax_to_half2(p, d_score);
+#pragma unroll
+                    for (int c = 0; c < DChunksLocal; ++c) {
+                        half2 vf[4];
+                        volta_load_v(vf,
+                                     reinterpret_cast<const half2*>(
+                                         &v_s[sub * 8 * SmemStride + dim_warp * DSlice + c * 8]),
+                                     SmemStride / 2);
+                        half2 pv[4] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+                        volta_mma_pv(pv, p, vf);
+#pragma unroll
+                        for (int n = 0; n < 4; ++n) {
+                            const float2 contrib = __half22float2(pv[n]);
+                            acc_f[c][2 * n + 0]   = acc_f[c][2 * n + 0] * alpha + contrib.x;
+                            acc_f[c][2 * n + 1]   = acc_f[c][2 * n + 1] * alpha + contrib.y;
+                        }
+                    }
+                }
+                if constexpr (CompactTail) {
+                    if (warp == DimSplit) {
+#pragma unroll
+                        for (int l = 0; l < 8; ++l) {
+                            const int prow = volta_d_get_i(l);
+                            if (prow < 4) {
+                                p_tail_s[prow * 8 + volta_d_get_j(l)] =
+                                    __float2half(d_score[l]);
+                            }
+                        }
+                        __syncwarp();
+
+                        // The fifth warp flips the usual attention MMA mapping: its four
+                        // independent quadpairs own four 8-column D slices. Rows 4..7 are
+                        // zero padding, leaving one warp to cover all four real tail rows and
+                        // the full D=256 output in eight iterations.
+                        const int qp        = (lane >> 2) & 3;
+                        const int input_row = (lane & 3) + ((lane & 16) != 0 ? 4 : 0);
+                        half2 p[4];
+#pragma unroll
+                        for (int l = 0; l < 4; ++l) {
+                            p[l] = input_row < 4
+                                       ? __halves2half2(p_tail_s[input_row * 8 + 2 * l],
+                                                       p_tail_s[input_row * 8 + 2 * l + 1])
+                                       : __half2half2(__ushort_as_half(0));
+                        }
+                        const unsigned* P = reinterpret_cast<const unsigned*>(p);
+                        float alpha_rows[4];
+#pragma unroll
+                        for (int tail_row = 0; tail_row < 4; ++tail_row) {
+                            alpha_rows[tail_row] =
+                                __shfl_sync(FullMask, alpha, tail_row, 32);
+                        }
 
 #pragma unroll
-                for (int c = 0; c < DChunksLocal; ++c) {
-                    half2 vf[4];
-                    volta_load_v(vf,
-                                 reinterpret_cast<const half2*>(
-                                     &v_s[sub * 8 * SmemStride + dim_warp * DSlice + c * 8]),
-                                 SmemStride / 2);
-                    half2 pv[4] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
-                    volta_mma_pv(pv, p, vf);
+                        for (int c = 0; c < DChunksLocal; ++c) {
 #pragma unroll
-                    for (int n = 0; n < 4; ++n) {
-                        const float2 contrib = __half22float2(pv[n]);
-                        acc_f[c][2 * n + 0]   = acc_f[c][2 * n + 0] * alpha + contrib.x;
-                        acc_f[c][2 * n + 1]   = acc_f[c][2 * n + 1] * alpha + contrib.y;
+                            for (int i = 0; i < 8; ++i) {
+                                const int accumulator_row =
+                                    (i & 2) | ((lane & 16) != 0 ? 4 : 0) | (lane & 1);
+                                acc_f[c][i] *= accumulator_row < 4
+                                                   ? alpha_rows[accumulator_row]
+                                                   : 0.0f;
+                            }
+                            const int d = c * 32 + qp * 8 + input_row;
+                            half2 vf[4];
+#pragma unroll
+                            for (int l = 0; l < 4; ++l) {
+                                vf[l] = __halves2half2(
+                                    v_s[(sub * 8 + 2 * l) * SmemStride + d],
+                                    v_s[(sub * 8 + 2 * l + 1) * SmemStride + d]);
+                            }
+                            const unsigned* V = reinterpret_cast<const unsigned*>(vf);
+                            volta_mma_qp_n(acc_f[c], P[0], P[1], V[0], V[1]);
+                            volta_mma_qp_n(acc_f[c], P[2], P[3], V[2], V[3]);
+                        }
                     }
                 }
             }
@@ -499,29 +607,71 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
         const int row      = lane;
         const float own_m = ((lane & 2) == 0) ? m_lo : m_hi;
         const float own_l = ((lane & 2) == 0) ? l_lo : l_hi;
-        if (dim_warp == 0 && row < rows_here) {
-            int q_head = 0;
-            int token  = 0;
-            causal_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = own_m;
-                partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = own_l;
+        if (!CompactTail || warp < DimSplit) {
+            if (dim_warp == 0 && row < rows_here) {
+                int q_head = 0;
+                int token  = 0;
+                causal_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head,
+                                                      token);
+                if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
+                    partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
+                        own_m;
+                    partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
+                        own_l;
+                }
+            }
+            if (row < rows_here) {
+                int q_head = 0;
+                int token  = 0;
+                causal_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head,
+                                                      token);
+                if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
+#pragma unroll
+                    for (int c = 0; c < DChunksLocal; ++c) {
+                        const int d = dim_warp * DSlice + c * 8;
+                        __nv_bfloat16 out8[8];
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            out8[i] = __float2bfloat16(acc_f[c][i]);
+                        }
+                        const std::int64_t dst = causal_partial_acc_index<Geometry>(
+                            q_head, d, token, split, tokens);
+                        store_vec(&partial_acc[dst], *reinterpret_cast<const int4*>(out8));
+                    }
+                }
             }
         }
-        if (row < rows_here) {
-            int q_head = 0;
-            int token  = 0;
-            causal_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head, token);
-            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
+        if constexpr (CompactTail) {
+            if (warp == DimSplit) {
+                if (lane < 4) {
+                    int q_head = 0;
+                    int token  = 0;
+                    causal_small_t_tc_row_to_qt<Geometry>(Br + lane, tokens, kv_head, q_head,
+                                                          token);
+                    partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
+                        own_m;
+                    partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
+                        own_l;
+                }
 #pragma unroll
                 for (int c = 0; c < DChunksLocal; ++c) {
-                    const int d = dim_warp * DSlice + c * 8;
-                    __nv_bfloat16 out8[8];
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) { out8[i] = __float2bfloat16(acc_f[c][i]); }
-                    const std::int64_t dst =
-                        causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
-                    store_vec(&partial_acc[dst], *reinterpret_cast<const int4*>(out8));
+                    for (int i = 0; i < 8; ++i) {
+                        const int accumulator_row =
+                            (i & 2) | ((lane & 16) != 0 ? 4 : 0) | (lane & 1);
+                        if (accumulator_row < 4) {
+                            const int qp = (lane >> 2) & 3;
+                            const int cl = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+                            const int d  = c * 32 + qp * 8 + cl;
+                            int q_head   = 0;
+                            int token    = 0;
+                            causal_small_t_tc_row_to_qt<Geometry>(Br + accumulator_row, tokens,
+                                                                  kv_head, q_head, token);
+                            const std::int64_t dst = causal_partial_acc_index<Geometry>(
+                                q_head, d, token, split, tokens);
+                            partial_acc[dst] = __float2bfloat16(acc_f[c][i]);
+                        }
+                    }
                 }
             }
         }
