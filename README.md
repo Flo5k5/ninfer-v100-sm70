@@ -108,6 +108,7 @@ checkpoint retention:
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --max-context 240000 \
+  --prefill-chunk 2048 \
   --kv-capacity auto \
   --max-concurrency 1 \
   --kv-dtype int8 \
