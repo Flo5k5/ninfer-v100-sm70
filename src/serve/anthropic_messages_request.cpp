@@ -31,8 +31,7 @@ enum class ParsePurpose {
 }
 
 [[noreturn]] void invalid_thinking_signature() {
-    bad_request("assistant Thinking blocks must include the signature returned by the current "
-                "NInfer server process and be passed back unmodified",
+    bad_request("assistant Thinking blocks must include a valid NInfer signature",
                 "messages", "invalid_thinking_signature");
 }
 
@@ -326,7 +325,13 @@ ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSign
                 invalid_thinking_signature();
             }
             const std::string signature = block.at("signature").get<std::string>();
-            if (signature.empty() || !signer.verify(thinking, index, signature)) {
+            if (signature.empty()) { invalid_thinking_signature(); }
+            if (!signer.verify(thinking, index, signature)) {
+                // NInfer's process-local key deliberately cannot authenticate a resumed block
+                // after restart. Drop that optional hidden reasoning while retaining the
+                // assistant's visible text and tool calls. Foreign and malformed tokens remain
+                // invalid rather than becoming a path for injecting unauthenticated reasoning.
+                if (AnthropicThinkingSigner::is_ninfer_signature(signature)) { continue; }
                 invalid_thinking_signature();
             }
             assistant.reasoning_content += thinking;

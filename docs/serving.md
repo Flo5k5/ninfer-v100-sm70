@@ -67,14 +67,16 @@ saturation does not make the Engine unavailable. The endpoint remains unauthenti
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
 
-All three generation SSE endpoints emit the standard `: keep-alive` comment after five seconds
-without a protocol event. The comment is transport-only: SSE clients ignore it, and it does not
-change generated text, event ordering, usage, stored Responses, or request logs. On Linux, accepted
-connections also use TCP keepalive and a 15-second `TCP_USER_TIMEOUT`; together with the heartbeat,
-a dead or unacknowledging peer is normally cancelled within about 20 seconds, including while the
-request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
-cannot be distinguished from a reading application; proxies must close their upstream NInfer
-connection when the downstream client disappears.
+After five seconds without a protocol event, OpenAI SSE endpoints emit the standard `: keep-alive`
+comment and Anthropic Messages emits `event: ping` with `{"type":"ping"}`. The heartbeat is
+transport-only and does not change generated text, semantic event ordering, usage, stored
+Responses, or request logs. The Anthropic protocol event also keeps event-aware clients live while
+NInfer buffers an incomplete structured tool call. On Linux, accepted connections use TCP keepalive
+and a 15-second `TCP_USER_TIMEOUT`; together with the heartbeat, a dead or unacknowledging peer is
+normally cancelled within about 20 seconds, including while the request is waiting or prefilling.
+A peer whose TCP stack remains connected and acknowledges data cannot be distinguished from a
+reading application; proxies must close their upstream NInfer connection when the downstream
+client disappears.
 
 ## OpenAI Chat Completions
 
@@ -595,8 +597,10 @@ completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, 
 Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking requires
 `budget_tokens >= 1024` and less than `max_tokens`, and that budget is passed to Engine. Visible
 Thinking is returned with an opaque local signature; SSE emits its `signature_delta` before
-closing the block. Assistant Thinking blocks must be passed back unmodified with that signature;
-signatures belong to the current serve process and are invalid after it restarts.
+closing the block. A signature valid for the current process restores that Thinking text. After a
+server restart, a well-formed but stale NInfer signature causes only its optional Thinking block to
+be discarded; visible assistant text and tool calls remain available, so clients such as OMP can
+resume saved conversations. Missing, malformed, or foreign signatures remain invalid.
 `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
 closed-turn Qwen reasoning history. `output_config.effort` is checked against the loaded template's

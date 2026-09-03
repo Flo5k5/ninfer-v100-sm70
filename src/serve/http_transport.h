@@ -44,14 +44,16 @@ public:
 
     explicit SseTransport(httplib::DataSink& sink, std::atomic<bool>& cancelled,
                           Clock::duration heartbeat_interval = kHeartbeatInterval,
-                          Clock::time_point now              = Clock::now());
+                          Clock::time_point now              = Clock::now(),
+                          std::string_view heartbeat          = kHeartbeatComment);
 
     void write(std::string_view item, Clock::time_point now = Clock::now());
     void write(const std::vector<std::string>& items, Clock::time_point now = Clock::now());
 
     // Called by the Engine wait loop. Besides observing an already-closed socket, a quiet stream
-    // periodically writes an SSE comment so TCP_USER_TIMEOUT has traffic with which to detect an
-    // unacknowledged peer. A failed probe marks the request for cancellation.
+    // periodically writes its protocol-selected SSE heartbeat so TCP_USER_TIMEOUT has traffic
+    // with which to detect an unacknowledged peer. A failed probe marks the request for
+    // cancellation.
     [[nodiscard]] bool poll(Clock::time_point now = Clock::now());
 
 private:
@@ -60,6 +62,7 @@ private:
     httplib::DataSink& sink_;
     std::atomic<bool>& cancelled_;
     Clock::duration heartbeat_interval_;
+    std::string heartbeat_;
     Clock::time_point last_write_;
 };
 

@@ -227,4 +227,10 @@ bool AnthropicThinkingSigner::verify(std::string_view thinking, std::size_t bloc
     return difference == 0;
 }
 
+bool AnthropicThinkingSigner::is_ninfer_signature(std::string_view signature) {
+    if (!signature.starts_with(kSignaturePrefix)) { return false; }
+    Digest decoded{};
+    return decode_digest(signature.substr(kSignaturePrefix.size()), decoded);
+}
+
 } // namespace ninfer::serve

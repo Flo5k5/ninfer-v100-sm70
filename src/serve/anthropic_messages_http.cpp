@@ -13,6 +13,11 @@
 #include <vector>
 
 namespace ninfer::serve {
+namespace {
+
+constexpr std::string_view kAnthropicPing = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+
+} // namespace
 
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
     const std::string request_id = new_anthropic_request_id();
@@ -147,7 +152,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     sink.done();
                     return true;
                 }
-                SseTransport transport(sink, stream->cancelled);
+                SseTransport transport(sink, stream->cancelled,
+                                       SseTransport::kHeartbeatInterval,
+                                       SseTransport::Clock::now(), kAnthropicPing);
                 const auto send_error = [&](const ApiError& error) {
                     try {
                         if (!encoder->started()) {
