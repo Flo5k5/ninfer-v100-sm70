@@ -2244,6 +2244,12 @@ int run_geometry(const Geometry& geometry) {
                 run_a3_case(geometry, storage, {16, 17, 1025, 404u}, MappingPattern::Identity);
         }
     }
+#ifdef NINFER_VOLTA_BUILD
+    failures += run_a1_case(geometry, KvCacheStorage::Int8Group64, {8, 17, 512, 405u},
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(geometry, KvCacheStorage::Int8Group64, {8, 17, 512, 406u},
+                            MappingPattern::Fragmented);
+#endif
     return failures;
 }
 

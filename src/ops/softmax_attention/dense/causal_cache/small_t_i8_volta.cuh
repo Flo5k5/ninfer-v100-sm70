@@ -99,7 +99,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
-    static_assert(TokenTile >= 1 && TokenTile <= 6);
+    static_assert(TokenTile >= 1 && TokenTile <= 7);
     static_assert(WarpsPerCta == 4 || WarpsPerCta == 5);
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700

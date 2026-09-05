@@ -57,8 +57,8 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     if (T < 2 || T > 16) {
         throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,16]");
     }
-    if (proposal_window < 1 || proposal_window > 5 || proposal_window >= T) {
-        throw std::invalid_argument("mtp_prepare_next_round: proposal window must be in [1,5]");
+    if (proposal_window < 1 || proposal_window > 7 || proposal_window >= T) {
+        throw std::invalid_argument("mtp_prepare_next_round: proposal window must be in [1,7]");
     }
     if (batch < 1) { throw std::invalid_argument("mtp_prepare_next_round: B must be positive"); }
     if (max_context <= 0) {

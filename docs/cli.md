@@ -152,7 +152,7 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
+Speculative decoding is disabled by default. Select MTP with one to seven draft positions, or the
 35B-A3B text-only DFlash backend with one to fifteen. `--lm-head-draft` selects the optimized
 proposal head and requires a selected backend:
 
@@ -184,7 +184,7 @@ block length eight, while fifteen uses the full native block.
 MTP also performs lossless context lookup automatically. When the latest 16 generated/prompt
 tokens exactly match an earlier occurrence, the runtime proposes that occurrence's continuation.
 It verifies up to fifteen tokens only when the lookup's first five tokens agree with the learned
-MTP proposal; otherwise it stays on the configured one-to-five-token MTP window. A concurrent
+MTP proposal; otherwise it stays on the configured one-to-seven-token MTP window. A concurrent
 decode batch uses the longer topology only when every active row qualifies. There is no separate
 CLI option, artifact, or sampling behavior for this path.
 
@@ -201,7 +201,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--draft-tokens N` | MTP `1..7`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

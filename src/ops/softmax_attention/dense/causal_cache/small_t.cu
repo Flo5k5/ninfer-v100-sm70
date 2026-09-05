@@ -258,7 +258,13 @@ bool causal_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                              KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || envelope.min_visible_keys == 0 ||
+    const bool native_volta_i8 =
+#ifdef NINFER_VOLTA_BUILD
+        cache_storage == KvCacheStorage::Int8Group64 && tokens <= 7;
+#else
+        false;
+#endif
+    if (tokens < 1 || (tokens > 6 && !native_volta_i8) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
     }
@@ -290,7 +296,15 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
 #define NINFER_CAUSAL_SMALL_T_DISPATCH(TOKENS, WARPS)                                              \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if (cache.storage == KvCacheStorage::Int8Group64) {                                    \
+            if constexpr ((TOKENS) > 6) {                                                          \
+                if (cache.storage != KvCacheStorage::Int8Group64) {                                \
+                    throw std::invalid_argument("causal_attention_small_t_launch: width 7 "        \
+                                                "requires Volta INT8 KV");                        \
+                }                                                                                  \
+                launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
+                    q, input, pos, scale, cache, invocation, logical_capacity,                     \
+                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+            } else if (cache.storage == KvCacheStorage::Int8Group64) {                             \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
@@ -333,6 +347,11 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     case 6:
         NINFER_CAUSAL_SMALL_T_DISPATCH(6, 4);
         break;
+#ifdef NINFER_VOLTA_BUILD
+    case 7:
+        NINFER_CAUSAL_SMALL_T_DISPATCH(7, 4);
+        break;
+#endif
     default:
         throw std::invalid_argument("causal_attention_small_t_launch: unsupported T");
     }

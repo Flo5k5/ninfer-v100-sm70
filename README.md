@@ -85,10 +85,11 @@ cmake --build build-v100 -j
 The same five `.ninfer` artifacts use the public Engine/CLI/serving routes. See the
 [V100 port notes](docs/v100.md) for qualification and the preferred-GPU launcher.
 
-On Volta, loading an NVFP4 artifact repacks each dense MLP gate/up payload in place on the GPU into
-the QPN fragment order used by the decode kernels. The `.ninfer` file and host-side artifact bytes
+On Volta, loading an NVFP4 artifact repacks each dense MLP gate/up and down payload in place on the
+GPU into the QPN fragment order used by the decode kernels. Row-scaled FP8 payloads are likewise
+permuted into their native Volta QPN stream. The `.ninfer` file and host-side artifact bytes
 are unchanged, the device allocation remains the same size, and temporary repack storage is
-released before inference. Device-resident gate/up weights are therefore deliberately mutated at
+released before inference. These device-resident weights are therefore deliberately mutated at
 load; the V100 path does not retain checkpoint-native immutable layout for those payloads.
 
 Tests, benchmarks, and maintainer tools are excluded from the default build. There is no install
@@ -231,7 +232,7 @@ All registered model IDs support:
 - text generation with thinking and non-thinking prompt modes;
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
-- MTP speculative decoding with draft windows from one to five;
+- MTP speculative decoding with draft windows from one to seven;
 - BF16, INT8, and FP8 KV storage;
 - offline causal-perplexity scoring;
 - private and shared exact-prefix reuse with Device/Host State and KV retention;

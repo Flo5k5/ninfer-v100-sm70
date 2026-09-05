@@ -12,7 +12,7 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
+inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 7;
 inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
 inline constexpr std::uint32_t kMtpLookupMaximumDrafts    = 15;
 inline constexpr std::uint32_t kMtpLookupMaximumWidth     = kMtpLookupMaximumDrafts + 1;
@@ -46,7 +46,7 @@ struct OrdinaryDecodeEgress {
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
 // product domain; each decode frame binds its exact verification width and the configured
-// five-token-or-smaller learned proposal width.
+// seven-token-or-smaller learned proposal width.
 struct MtpDecodeIngress {
     std::array<TokenId, kMaximumConcurrency> anchors{};
     std::array<std::int32_t, kMaximumConcurrency> base_frontiers{};
