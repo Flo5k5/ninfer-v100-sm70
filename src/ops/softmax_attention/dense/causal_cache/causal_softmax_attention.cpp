@@ -382,8 +382,16 @@ namespace detail {
 
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                                     std::int32_t batch_size,
+                                                    KvCacheStorage cache_storage,
                                                     CausalAttentionExecutionEnvelope envelope) {
     if (width >= 1 && width <= kSmallTChunkTokens) { return CausalAttentionRoute::SmallT; }
+#ifdef NINFER_VOLTA_BUILD
+    if (width <= 7 && cache_storage == KvCacheStorage::Int8Group64) {
+        return CausalAttentionRoute::SmallT;
+    }
+#else
+    (void)cache_storage;
+#endif
     if (batch_size > 1) { return CausalAttentionRoute::ChunkedSmallT; }
     const std::uint32_t prompt_visible_keys =
         width <= 2 * kSmallTChunkTokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
@@ -436,7 +444,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     };
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::CausalAttentionRoute route =
-            detail::causal_attention_resolve_route(q_heads, width, batch_size, envelope);
+            detail::causal_attention_resolve_route(q_heads, width, batch_size, cache_storage,
+                                                   envelope);
         if (route == detail::CausalAttentionRoute::Prompt) {
 #ifdef NINFER_VOLTA_BUILD
             if (volta_flash_route_possible(q_heads, width, batch_size, cache_storage)) {
@@ -504,7 +513,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
-        detail::causal_attention_resolve_route(q.ne[1], width, batch, envelope);
+        detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
 #ifdef NINFER_VOLTA_BUILD
     if (route == detail::CausalAttentionRoute::Prompt && valid_columns.data == nullptr &&
         volta_flash_route_possible(q.ne[1], width, batch, cache.storage)) {
@@ -551,7 +560,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
-        detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope);
+        detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, cache.storage, envelope);
 #ifdef NINFER_VOLTA_BUILD
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
@@ -562,7 +571,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;
     }
-    if (detail::causal_attention_uses_small_t(q.ne[2])) {
+    if (route == detail::CausalAttentionRoute::SmallT) {
         const std::int32_t splits =
             detail::causal_attention_split_capacity(q.ne[1], q.ne[2], cache.storage, envelope);
         SmallTWorkspace partial =

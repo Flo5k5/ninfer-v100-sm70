@@ -31,6 +31,7 @@ bool causal_attention_uses_small_t(std::int32_t tokens);
 
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                                     std::int32_t batch_size,
+                                                    KvCacheStorage cache_storage,
                                                     CausalAttentionExecutionEnvelope envelope);
 
 const char* causal_attention_route_name(CausalAttentionRoute route);
