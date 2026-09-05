@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -44,6 +45,15 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
     const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
     const std::int32_t kChunk =
         qpn ? kFp8VoltaQpnMaxTokens : kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
+    if (!qpn) { throw std::logic_error("fp8 Volta attention problem has no QPN route"); }
+    std::optional<WorkspaceArena::Scope> scope;
+    DeviceSpan activation;
+    if (workspace != nullptr) {
+        scope.emplace(workspace->scope());
+        activation = workspace->alloc_bytes(
+            static_cast<std::size_t>(weight.k) * std::min(x.ne[1], kChunk) * sizeof(std::uint16_t),
+            256);
+    }
 #else
     constexpr std::int32_t kChunk  = kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
 #endif
@@ -66,8 +76,11 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
         Tensor value_chunk(value, DType::BF16, {kKvRows, active});
 #ifdef NINFER_VOLTA_BUILD
         if (fp8_volta_qpn_supported(weight.n, weight.k, active)) {
-            launch_fp8_attn_input_volta_qpn(input_chunk, weight, query_chunk, gate_chunk, key_chunk,
-                                            value_chunk, stream);
+            if (activation.data != nullptr) {
+                fp8_stage_bf16_activation_sm70(input_chunk, activation.data, stream);
+            }
+            launch_fp8_attn_input_volta_qpn(input_chunk, weight, query_chunk, activation.data,
+                                            gate_chunk, key_chunk, value_chunk, stream);
             continue;
         }
 #endif
@@ -89,15 +102,19 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
         throw std::invalid_argument("fp8 attn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    if (resolve_route(policy, max_tokens) == Fp8AttnInputRoute::A8) {
-        return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8AttnInputGeometry::kInputRows);
-    }
+    std::size_t capacity = resolve_route(policy, max_tokens) == Fp8AttnInputRoute::A8
+                               ? fp8_a8_workspace_capacity_bytes(
+                                     max_tokens, Fp8AttnInputGeometry::kInputRows)
+                               : 0;
 #ifdef NINFER_VOLTA_BUILD
     if (max_tokens >= kVoltaCutlassMinT) {
-        return fp8_attn_input_cutlass_workspace_bytes(max_tokens);
+        capacity = std::max(capacity, fp8_attn_input_cutlass_workspace_bytes(max_tokens));
     }
+    capacity = std::max(capacity, static_cast<std::size_t>(Fp8AttnInputGeometry::kInputRows) *
+                                      std::min(max_tokens, kFp8VoltaQpnMaxTokens) *
+                                      sizeof(std::uint16_t));
 #endif
-    return 0;
+    return capacity;
 }
 
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,

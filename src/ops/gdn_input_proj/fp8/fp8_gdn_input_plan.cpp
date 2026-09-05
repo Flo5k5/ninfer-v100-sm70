@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -37,15 +38,19 @@ std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int
         throw std::invalid_argument("fp8 gdn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    if (resolve_route(policy, max_tokens) == Fp8GdnInputRoute::A8) {
-        return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8GdnInputGeometry::kInputRows);
-    }
+    std::size_t capacity = resolve_route(policy, max_tokens) == Fp8GdnInputRoute::A8
+                               ? fp8_a8_workspace_capacity_bytes(max_tokens,
+                                                                 Fp8GdnInputGeometry::kInputRows)
+                               : 0;
 #ifdef NINFER_VOLTA_BUILD
     if (max_tokens >= kVoltaCutlassMinT) {
-        return fp8_gdn_input_cutlass_workspace_bytes(max_tokens);
+        capacity = std::max(capacity, fp8_gdn_input_cutlass_workspace_bytes(max_tokens));
     }
+    capacity = std::max(capacity, static_cast<std::size_t>(Fp8GdnInputGeometry::kInputRows) *
+                                      std::min(max_tokens, kFp8VoltaQpnMaxTokens) *
+                                      sizeof(std::uint16_t));
 #endif
-    return 0;
+    return capacity;
 }
 
 void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -63,6 +68,15 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
     const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
     const std::int32_t kChunk =
         qpn ? kFp8VoltaQpnMaxTokens : kFp8LinearSmallTMax<Fp8GdnInputGeometry>;
+    if (!qpn) { throw std::logic_error("fp8 Volta GDN problem has no QPN route"); }
+    std::optional<WorkspaceArena::Scope> scope;
+    DeviceSpan activation;
+    if (workspace != nullptr) {
+        scope.emplace(workspace->scope());
+        activation = workspace->alloc_bytes(
+            static_cast<std::size_t>(weight.k) * std::min(x.ne[1], kChunk) * sizeof(std::uint16_t),
+            256);
+    }
 #else
     constexpr std::int32_t kChunk   = kFp8LinearSmallTMax<Fp8GdnInputGeometry>;
 #endif
@@ -80,7 +94,11 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
         Tensor z_chunk(z_output, DType::BF16, {kZRows, active});
 #ifdef NINFER_VOLTA_BUILD
         if (fp8_volta_qpn_supported(weight.n, weight.k, active)) {
-            launch_fp8_gdn_input_volta_qpn(input_chunk, weight, qkv_chunk, z_chunk, stream);
+            if (activation.data != nullptr) {
+                fp8_stage_bf16_activation_sm70(input_chunk, activation.data, stream);
+            }
+            launch_fp8_gdn_input_volta_qpn(input_chunk, weight, qkv_chunk, z_chunk,
+                                           activation.data, stream);
             continue;
         }
 #endif

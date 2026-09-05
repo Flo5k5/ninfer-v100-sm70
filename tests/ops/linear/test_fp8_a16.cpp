@@ -74,8 +74,18 @@ int run_fp8_a16() {
         try {
             const std::size_t capacity = ops::linear_workspace_capacity_bytes(
                 QType::FP8_E4M3FN_ROW_BF16S, 248320, 5120, policy, 1, 2048);
-            if (capacity != 0) {
+            if (capacity
+#ifdef NINFER_VOLTA_BUILD
+                == 0
+#else
+                != 0
+#endif
+            ) {
+#ifdef NINFER_VOLTA_BUILD
+                std::cerr << "FP8 vocabulary A16 route omitted Volta activation workspace\n";
+#else
                 std::cerr << "FP8 vocabulary A16 route reported nonzero workspace\n";
+#endif
                 ++failures;
             }
         } catch (const std::exception& error) {

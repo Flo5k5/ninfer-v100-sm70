@@ -16,8 +16,11 @@ void launch_fp8_vocabulary_a16_gemm(const Tensor& x, const Weight& weight, Tenso
 #ifdef NINFER_VOLTA_BUILD
 inline constexpr std::int32_t kFp8VoltaQpnRowsPerTile = 8;
 inline constexpr std::int32_t kFp8VoltaQpnMaxTokens   = 32;
+void fp8_stage_bf16_activation_sm70(const Tensor& x, void* fp16_out, cudaStream_t stream);
 void launch_fp8_volta_qpn(const Tensor& x, const Weight& weight, Tensor& out,
                           cudaStream_t stream);
+void launch_fp8_volta_qpn_fp16(const Tensor& x, const Weight& weight, const void* x_fp16,
+                               Tensor& out, cudaStream_t stream);
 [[nodiscard]] bool fp8_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                            std::int32_t t) noexcept;
 #endif
