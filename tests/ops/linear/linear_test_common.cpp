@@ -1,6 +1,9 @@
 #include "ops/linear/linear_test_common.h"
 
 #include "core/arena.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
+#endif
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -312,7 +315,14 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
     DeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
-    const Weight weight = host_weight.device_weight(device_weight.p);
+    Weight weight = host_weight.device_weight(device_weight.p);
+#ifdef NINFER_VOLTA_BUILD
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        ops::detail::fp8_prepack_qpn_sm70(weight);
+    }
+#endif
+    std::vector<std::uint8_t> weight_before(host_weight.payload.size());
+    device_weight.copy_to_host(weight_before.data(), device_weight.bytes);
 
     std::vector<double> full_reference;
     if (shape.comparison == Comparison::Full) {
@@ -385,7 +395,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         }
         std::vector<std::uint8_t> weight_after(host_weight.payload.size());
         device_weight.copy_to_host(weight_after.data(), device_weight.bytes);
-        if (weight_after != host_weight.payload) {
+        if (weight_after != weight_before) {
             std::cerr << label << ": linear modified its persistent weight\n";
             ++failures;
         }

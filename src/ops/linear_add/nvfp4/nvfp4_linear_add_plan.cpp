@@ -31,11 +31,10 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     }
     if (policy == LinearPolicy::A16Only) {
 #ifdef NINFER_VOLTA_BUILD
-        // T==1 keeps the fused decode kernel; T>=2 takes linear()+residual_add() instead of the
-        // fused SmallTFusedA16 kernel, the same reasoning as linear_swiglu's Volta branch: linear()
-        // now reaches the QPN2 tensor-core route and this op's fused kernel never did. Profiling a
-        // real MTP round found this op's fused small_t kernel owning ~18% of round time.
-        return tokens == 1 ? Nvfp4LinearAddRoute::A16 : Nvfp4LinearAddRoute::LinearThenAdd;
+        // Prepacked down projections are consumed by QPN2 for every decode width. Materialize the
+        // projection and add the residual separately because the row-major fused kernels cannot
+        // read that load-time layout.
+        return Nvfp4LinearAddRoute::LinearThenAdd;
 #else
         return Nvfp4LinearAddRoute::A16;
 #endif
@@ -44,7 +43,12 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
         throw std::invalid_argument("nvfp4 linear_add: unsupported policy");
     }
     const std::int32_t first_w4a4 = input_rows == 6144 ? 7 : 8;
-    return tokens >= first_w4a4 ? Nvfp4LinearAddRoute::W4A4 : Nvfp4LinearAddRoute::A16;
+    if (tokens >= first_w4a4) { return Nvfp4LinearAddRoute::W4A4; }
+#ifdef NINFER_VOLTA_BUILD
+    return Nvfp4LinearAddRoute::LinearThenAdd;
+#else
+    return Nvfp4LinearAddRoute::A16;
+#endif
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {

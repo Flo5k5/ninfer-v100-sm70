@@ -30,6 +30,17 @@ struct Fp8ContiguousOutput {
     }
 };
 
+struct Fp8ResidualOutput {
+    __nv_bfloat16* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        const std::int64_t index = static_cast<std::int64_t>(token) * rows + parent_row;
+        data[index] = __float2bfloat16_rn(value + __bfloat162float(data[index]));
+    }
+};
+
 // Split-projection SwiGLU keeps both projection results in FP32 until the fused
 // SiLU/multiply epilogue performs the single observable BF16 rounding.
 struct Fp8Fp32ContiguousOutput {

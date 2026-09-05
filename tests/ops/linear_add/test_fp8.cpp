@@ -2,6 +2,7 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
 
 #include <cuda_runtime.h>
 
@@ -120,7 +121,12 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
     GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    const Weight weight = host_weight.device_weight(device_weight.data());
+    Weight weight = host_weight.device_weight(device_weight.data());
+    std::vector<std::uint8_t> expected_weight = host_weight.payload;
+#ifdef NINFER_VOLTA_BUILD
+    ops::detail::fp8_prepack_qpn_sm70(weight);
+    device_weight.copy_to_host(expected_weight.data(), expected_weight.size());
+#endif
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
@@ -181,7 +187,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(activation.data()),
                                       activation.size() * sizeof(std::uint16_t)),
         "FP8 linear_add activation");
-    failures += verify_preserved(device_weight, host_weight.payload, "FP8 linear_add weight");
+    failures += verify_preserved(device_weight, expected_weight, "FP8 linear_add weight");
 
 #ifndef NINFER_VOLTA_BUILD
     const std::size_t a16_interval = ops::linear_add_workspace_capacity_bytes(

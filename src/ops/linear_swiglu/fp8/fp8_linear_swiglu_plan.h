@@ -25,6 +25,7 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
 #ifdef NINFER_VOLTA_BUILD
 void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         float* gate_scratch, float* up_scratch,
+                                        void* activation_scratch,
                                         cudaStream_t stream);
 [[nodiscard]] bool fp8_linear_swiglu_qpn_split_supported(std::int32_t k,
                                                           std::int32_t t) noexcept;

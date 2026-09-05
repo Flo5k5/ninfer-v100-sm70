@@ -37,12 +37,16 @@ constexpr std::int32_t kChunk      = kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
 struct Fp8QpnSplitWorkspace {
     DeviceSpan gate;
     DeviceSpan up;
+    DeviceSpan activation;
 };
 
 template <class Allocator>
 Fp8QpnSplitWorkspace allocate_qpn_split_workspace(Allocator& allocator, std::int32_t tokens) {
     const std::size_t bytes = static_cast<std::size_t>(kOutputRows) * tokens * sizeof(float);
-    return {allocator.alloc_bytes(bytes, 256), allocator.alloc_bytes(bytes, 256)};
+    const std::size_t activation_bytes =
+        static_cast<std::size_t>(Fp8MlpGateUpGeometry::kInputRows) * tokens * sizeof(std::uint16_t);
+    return {allocator.alloc_bytes(bytes, 256), allocator.alloc_bytes(bytes, 256),
+            allocator.alloc_bytes(activation_bytes, 256)};
 }
 
 std::size_t qpn_split_workspace_bytes(std::int32_t tokens) {
@@ -86,19 +90,23 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceAre
                        static_cast<std::int64_t>(token_begin) * kOutputRows * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor output_chunk(output, DType::BF16, {kOutputRows, active});
-        if (active == 1) {
-            fp8_linear_swiglu_decode_launch(input_chunk, weight, output_chunk, stream);
 #ifdef NINFER_VOLTA_BUILD
-        } else if (fp8_linear_swiglu_qpn_split_supported(weight.k, active)) {
+        if (fp8_linear_swiglu_qpn_split_supported(weight.k, active)) {
             auto scope                    = workspace.scope();
             Fp8QpnSplitWorkspace scratch = allocate_qpn_split_workspace(workspace, active);
             fp8_linear_swiglu_qpn_split_launch(
                 input_chunk, weight, output_chunk, reinterpret_cast<float*>(scratch.gate.data),
-                reinterpret_cast<float*>(scratch.up.data), stream);
-#endif
+                reinterpret_cast<float*>(scratch.up.data), scratch.activation.data, stream);
         } else {
             fp8_linear_swiglu_small_t_launch(input_chunk, weight, output_chunk, stream);
         }
+#else
+        if (active == 1) {
+            fp8_linear_swiglu_decode_launch(input_chunk, weight, output_chunk, stream);
+        } else {
+            fp8_linear_swiglu_small_t_launch(input_chunk, weight, output_chunk, stream);
+        }
+#endif
     }
 }
 
@@ -117,7 +125,7 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
         return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8MlpGateUpGeometry::kInputRows);
     }
 #ifdef NINFER_VOLTA_BUILD
-    if (policy == LinearPolicy::A16Only && max_tokens >= 2) {
+    if (policy == LinearPolicy::A16Only) {
         std::size_t need = qpn_split_workspace_bytes(std::min(max_tokens, kChunk));
         if (max_tokens >= kVoltaCutlassMinT) {
             need = std::max(

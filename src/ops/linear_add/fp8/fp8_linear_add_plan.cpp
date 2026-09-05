@@ -20,7 +20,7 @@ namespace {
 enum class Fp8LinearAddRoute : std::uint8_t {
     A16,
 #ifdef NINFER_VOLTA_BUILD
-    LinearThenAdd,
+    QpnResidual,
 #endif
     A8,
 };
@@ -34,7 +34,7 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
     }
     if (policy == LinearPolicy::A16Only) {
 #ifdef NINFER_VOLTA_BUILD
-        return tokens == 1 ? Fp8LinearAddRoute::A16 : Fp8LinearAddRoute::LinearThenAdd;
+        return Fp8LinearAddRoute::QpnResidual;
 #else
         return Fp8LinearAddRoute::A16;
 #endif
@@ -43,7 +43,12 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
         throw std::invalid_argument("fp8 linear_add: unsupported policy");
     }
     const std::int32_t first_a8 = input_rows == Fp8Residual6144Geometry::kInputRows ? 22 : 25;
-    return tokens >= first_a8 ? Fp8LinearAddRoute::A8 : Fp8LinearAddRoute::A16;
+    if (tokens >= first_a8) { return Fp8LinearAddRoute::A8; }
+#ifdef NINFER_VOLTA_BUILD
+    return Fp8LinearAddRoute::QpnResidual;
+#else
+    return Fp8LinearAddRoute::A16;
+#endif
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
@@ -69,35 +74,25 @@ Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::i
     return allocator.alloc(DType::BF16, {output_rows, tokens}, 256);
 }
 
-void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& residual,
-                            WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope      = workspace.scope();
-    Tensor projected = allocate_projected(workspace, weight.n, x.ne[1]);
-    if (x.ne[1] >= 33) {
-        fp8_cutlass_sm70_launch(x, weight, projected, workspace, stream);
-    } else {
-        const std::size_t linear_bytes = std::max<std::size_t>(
-            linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S, weight.n, weight.k,
-                                            LinearPolicy::A16Only, x.ne[1], x.ne[1]),
-            256);
-        WorkspaceArena linear_workspace(workspace.alloc_bytes(linear_bytes, 256));
-        linear(x, weight, projected, LinearPolicy::A16Only, linear_workspace, stream);
+void launch_qpn_residual(const Tensor& x, const Weight& weight, Tensor& residual,
+                         WorkspaceArena& workspace, cudaStream_t stream) {
+    if (x.ne[1] <= 32) {
+        fp8_linear_add_qpn_launch(x, weight, residual, stream);
+        return;
     }
+    auto scope       = workspace.scope();
+    Tensor projected = allocate_projected(workspace, weight.n, x.ne[1]);
+    fp8_cutlass_sm70_launch(x, weight, projected, workspace, stream);
     residual_add(projected, residual, stream);
 }
 
-std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
-                                            std::int32_t tokens) {
+std::size_t qpn_residual_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
+                                         std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
+    if (tokens <= 32) { return 0; }
     (void)allocate_projected(layout, output_rows, tokens);
     const std::size_t linear_bytes =
-        tokens >= 33
-            ? fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens)
-            : std::max<std::size_t>(
-                  linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S, output_rows,
-                                                  input_rows, LinearPolicy::A16Only, tokens,
-                                                  tokens),
-                  256);
+        fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens);
     (void)layout.alloc_bytes(linear_bytes, 256);
     return layout.peak_bytes(1);
 }
@@ -118,8 +113,8 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
         return fp8_a8_workspace_capacity_bytes(max_tokens, input_rows);
     }
 #ifdef NINFER_VOLTA_BUILD
-    if (route == Fp8LinearAddRoute::LinearThenAdd) {
-        return linear_then_add_workspace_bytes(output_rows, input_rows, max_tokens);
+    if (route == Fp8LinearAddRoute::QpnResidual) {
+        return qpn_residual_workspace_bytes(output_rows, input_rows, max_tokens);
     }
 #endif
     return 0;
@@ -133,8 +128,8 @@ void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& resi
         return;
     }
 #ifdef NINFER_VOLTA_BUILD
-    if (route == Fp8LinearAddRoute::LinearThenAdd) {
-        launch_linear_then_add(x, weight, residual, workspace, stream);
+    if (route == Fp8LinearAddRoute::QpnResidual) {
+        launch_qpn_residual(x, weight, residual, workspace, stream);
         return;
     }
 #endif

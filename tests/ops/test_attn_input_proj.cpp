@@ -373,6 +373,9 @@ int run_fp8_target() {
     constexpr std::int32_t kRows   = 14336;
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 349U));
+#ifdef NINFER_VOLTA_BUILD
+    parent.prepack_fp8();
+#endif
 
     int failures = 0;
 #ifndef NINFER_VOLTA_BUILD

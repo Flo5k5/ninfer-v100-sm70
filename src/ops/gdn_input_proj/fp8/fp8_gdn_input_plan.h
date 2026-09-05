@@ -38,7 +38,7 @@ void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, 
 
 #ifdef NINFER_VOLTA_BUILD
 void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                    cudaStream_t stream);
+                                    const void* x_fp16, cudaStream_t stream);
 #endif
 
 } // namespace ninfer::ops::detail

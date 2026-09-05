@@ -2,6 +2,7 @@
 
 #include "artifact/typed_binding.h"
 #ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 #endif
 
@@ -104,7 +105,14 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
                            const WeightPlan& plan, std::int32_t rows, std::int32_t columns) {
     if (plan.format != NumericFormat::NVFP4) {
-        return artifact::materialized_weight(materialized, plan.object, plan.format, rows, columns);
+        Weight out = artifact::materialized_weight(materialized, plan.object, plan.format, rows,
+                                                   columns);
+#ifdef NINFER_VOLTA_BUILD
+        if (out.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+            ::ninfer::ops::detail::fp8_prepack_qpn_sm70(out);
+        }
+#endif
+        return out;
     }
 
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
@@ -170,6 +178,7 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
 #ifdef NINFER_VOLTA_BUILD
     if (out.gate_up.qtype == QType::NVFP4) {
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
     }
 #endif
     return out;

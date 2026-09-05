@@ -5,6 +5,9 @@
 #include "ops/linear/fp8/fp8_gemv.cuh"
 #include "ops/linear/fp8/fp8_output.cuh"
 #include "ops/linear_add/fp8/fp8_linear_add_epilogue.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh"
+#endif
 
 #include <cuda_bf16.h>
 
@@ -47,5 +50,14 @@ void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor&
     }
     throw std::invalid_argument("fp8 linear_add: unsupported problem");
 }
+
+#ifdef NINFER_VOLTA_BUILD
+void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                               cudaStream_t stream) {
+    launch_fp8_volta_qpn_with_output(
+        x, weight,
+        Fp8ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n, stream);
+}
+#endif
 
 } // namespace ninfer::ops::detail
