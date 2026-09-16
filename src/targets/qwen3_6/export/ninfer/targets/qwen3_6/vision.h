@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/binder.h"
+#include "artifact/typed_binding.h"
 #include "core/tensor.h"
 
 #include <array>

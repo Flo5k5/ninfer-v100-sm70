@@ -75,16 +75,18 @@ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericF
         throw std::logic_error("NVFP4 weight requires a paired input divisor");
     }
     return WeightPlan{.object = artifact::bind_tensor(binder, name, format, shape, placement),
-                      .format = format};
+                      .format = format,
+                      .weight_scale_divisor_bits = 0,
+                      .input_scale_divisor_bits  = 0};
 }
 
 WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, std::int32_t rows,
                              std::int32_t columns, std::string_view input_divisor_name) {
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
                                                 static_cast<std::uint64_t>(columns)};
-    const artifact::ObjectHandle parent      = binder.require_tensor(
+    const artifact::ObjectHandle parent      = Binder_require_tensor_compat(binder, 
         name, NumericFormat::NVFP4, artifact::StorageLayout::BlockScaleK16M128x4V1, shape);
-    binder.materialize_on_device(parent);
+    Binder_materialize_on_device_compat(binder, parent);
 
     const artifact::ObjectHandle input_divisor =
         artifact::bind_tensor(binder, input_divisor_name, NumericFormat::FP32, {},
@@ -92,9 +94,9 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
     const artifact::BlockScaleGeometry geometry =
         artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
     const std::uint32_t weight_bits =
-        read_u32_le(binder.payload(parent).data, geometry.weight_divisor_offset, name);
+        read_u32_le(binder_payload_v2(binder, parent).data, geometry.weight_divisor_offset, name);
     const std::uint32_t input_bits =
-        read_u32_le(binder.payload(input_divisor).data, 0, input_divisor_name);
+        read_u32_le(binder_payload_v2(binder, input_divisor).data, 0, input_divisor_name);
     require_positive_finite(weight_bits, name);
     require_positive_finite(input_bits, input_divisor_name);
     return WeightPlan{.object                    = parent,
@@ -127,7 +129,7 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
                                                 static_cast<std::uint64_t>(columns)};
     const artifact::BlockScaleGeometry geometry =
         artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
-    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(plan.object));
+    const auto* bytes = static_cast<const std::byte*>(materialized_device_data_v2(materialized, plan.object));
 
     Weight out{};
     out.payload              = bytes;
@@ -463,10 +465,10 @@ DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement pla
     return out;
 }
 
-void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle) {
+void validate_draft_ids(artifact::Binder& binder, artifact::ObjectHandle handle) {
     constexpr std::size_t kDraftVocab     = 131072;
     constexpr std::size_t kTokenizerVocab = 248077;
-    const auto bytes                      = binder.payload(handle).data;
+    const auto bytes                      = binder_payload_v2(const_cast<artifact::Binder&>(binder), handle).data;
     std::vector<bool> seen(kTokenizerVocab, false);
     for (std::size_t i = 0; i < kDraftVocab; ++i) {
         const std::byte* value = bytes.data() + i * sizeof(std::uint32_t);
@@ -541,11 +543,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {5120});
     out.mtp.mlp.gate_up = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {34816, 5120}),
-        .format = NumericFormat::W8G32_F16S};
+        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {34816ULL, 5120ULL}),
+        .format = NumericFormat::W8G32_F16S,
+        .weight_scale_divisor_bits = 0,
+        .input_scale_divisor_bits  = 0};
     out.mtp.mlp.down = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {5120, 17408}),
-        .format = NumericFormat::W8G32_F16S};
+        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {5120ULL, 17408ULL}),
+        .format = NumericFormat::W8G32_F16S,
+        .weight_scale_divisor_bits = 0,
+        .input_scale_divisor_bits  = 0};
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 
     const artifact::TensorPlacement vision_placement =
@@ -559,7 +565,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
     out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
 
-    const bool has_dflash2 = binder.contains("dflash2/feature_projection");
+    const bool has_dflash2 = const_cast<artifact::Binder&>(binder).contains("dflash2/feature_projection");
     if (features.dflash2() && !has_dflash2) {
         throw artifact::ArtifactError(
             "DFlash2 was selected but the artifact has no DFlash2 weight bundle");
@@ -571,7 +577,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         out.dflash2                               = bind_dflash2(binder, placement);
     }
 
-    load_plan.materialization = binder.finish();
+    load_plan.materialization = std::move(binder).finish();
     return load_plan;
 }
 
@@ -579,7 +585,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     : backing(std::move(materialized)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
-    runtime.weights_arena = &backing.device_arena();
+    // v3: arena gérée par MaterializedArtifact
+    runtime.weights_arena = nullptr;
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
