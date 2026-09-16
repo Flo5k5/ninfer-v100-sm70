@@ -1,6 +1,6 @@
 #include "targets/registry.h"
 
-#include "artifact/binder.h"
+#include "artifact/binder.h"\n#include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
@@ -110,7 +110,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
     target_plan_phase.complete();
 
-    auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
+    auto mat_copy = load_plan.materialization();
+    auto materialized = artifact::materialize(reader, std::move(mat_copy), device,
                                               &options.startup_observer);
     const artifact::MaterializationStats stats = materialized.stats();
 
@@ -147,8 +148,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.artifact_bytes_read  = stats.file_bytes;
     summary.host_to_device_bytes = stats.h2d_bytes;
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
-    summary.tensor_count         = stats.tensor_count;
-    summary.resource_count       = stats.resource_count;
+    summary.tensor_count         = stats.device_object_count;
+    summary.resource_count       = stats.host_object_count;
     summary.context_cost         = context_cost.summary;
     return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
                              .load              = std::move(summary),

@@ -1,7 +1,7 @@
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 
 #include "artifact/materializer.h"
-#include "artifact/typed_binding.h"
+#include "artifact/binder.h"\n#include "artifact/typed_binding.h"
 
 #include <cstddef>
 #include <string>
@@ -11,7 +11,7 @@ namespace {
 
 std::string take_string(artifact::MaterializedArtifact& materialized,
                         artifact::ObjectHandle handle) {
-    const auto bytes = materialized.take_resource_bytes(handle);
+    const auto bytes = materialized.host_bytes(handle);
     return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
