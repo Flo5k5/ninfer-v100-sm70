@@ -121,6 +121,11 @@ std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle)
     return objects_[handle.index].host_data;
 }
 
+DeviceArena& MaterializedArtifact::device_arena() {
+    if (!arena_) { throw ArtifactError("artifact has no device weight backing"); }
+    return *arena_;
+}
+
 bool MaterializedArtifact::has_device(ObjectHandle handle) const noexcept {
     return handle.index < objects_.size() && objects_[handle.index].device.has_value();
 }

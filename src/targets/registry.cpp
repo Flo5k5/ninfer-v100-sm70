@@ -1,6 +1,7 @@
 #include "targets/registry.h"
 
-#include "artifact/binder.h"\n#include "artifact/typed_binding.h"
+#include "artifact/binder.h"
+#include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"

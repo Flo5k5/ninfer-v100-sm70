@@ -1,7 +1,8 @@
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 
 #include "artifact/materializer.h"
-#include "artifact/binder.h"\n#include "artifact/typed_binding.h"
+#include "artifact/binder.h"
+#include "artifact/typed_binding.h"
 
 #include <cstddef>
 #include <string>
