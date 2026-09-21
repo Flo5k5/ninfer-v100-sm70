@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        cmake \
+        git \
+        python3 \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libcurl4-openssl-dev \
+        libswscale-dev \
+        ninja-build \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*

@@ -82,21 +82,19 @@ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericF
 
 WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, std::int32_t rows,
                              std::int32_t columns, std::string_view input_divisor_name) {
-    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
-                                                static_cast<std::uint64_t>(columns)};
-    const artifact::ObjectHandle parent      = Binder_require_tensor_compat(binder, 
-        name, NumericFormat::NVFP4, artifact::StorageLayout::BlockScaleK16M128x4V1, shape);
-    Binder_materialize_on_device_compat(binder, parent);
+    const artifact::ObjectHandle parent = artifact::bind_tensor(
+        binder, name, NumericFormat::NVFP4,
+        {static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns)},
+        artifact::TensorPlacement::Device);
 
+    // v3 : le diviseur de poids est le mot FP32 en queue d'objet (lu seul, sans rapatrier les
+    // 100 Mo du poids côté hôte) ; le diviseur d'entrée est l'auxiliaire du Use v3.
     const artifact::ObjectHandle input_divisor =
         artifact::bind_tensor(binder, input_divisor_name, NumericFormat::FP32, {},
-                              artifact::TensorPlacement::ValidateOnly);
-    const artifact::BlockScaleGeometry geometry =
-        artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
-    const std::uint32_t weight_bits =
-        read_u32_le(binder_payload_v2(binder, parent).data, geometry.weight_divisor_offset, name);
+                              artifact::TensorPlacement::Host);
+    const std::uint32_t weight_bits = artifact::nvfp4_weight_divisor_bits(binder, parent);
     const std::uint32_t input_bits =
-        read_u32_le(binder_payload_v2(binder, input_divisor).data, 0, input_divisor_name);
+        read_u32_le(artifact::host_bytes(binder, input_divisor), 0, input_divisor_name);
     require_positive_finite(weight_bits, name);
     require_positive_finite(input_bits, input_divisor_name);
     return WeightPlan{.object                    = parent,
@@ -125,31 +123,14 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
     }
     (void)prepack_for_qpn;
 
-    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
-                                                static_cast<std::uint64_t>(columns)};
-    const artifact::BlockScaleGeometry geometry =
-        artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
-    const auto* bytes = static_cast<const std::byte*>(materialized_device_data_v2(materialized, plan.object));
-
-    Weight out{};
-    out.payload              = bytes;
-    out.payload_bytes        = geometry.encoded_bytes;
-    out.qtype                = QType::NVFP4;
-    out.group_size           = 16;
-    out.ndim                 = 2;
-    out.qdata                = bytes;
-    out.scales               = bytes + geometry.scale_plane_offset;
-    out.n                    = rows;
-    out.k                    = columns;
-    out.group                = 16;
-    out.layout               = QuantLayout::BlockScaleK16M128x4;
-    out.scale_dtype          = DType::FP8_E4M3FN;
-    out.shape[0]             = rows;
-    out.shape[1]             = columns;
-    out.padded_shape[0]      = rows;
-    out.padded_shape[1]      = columns;
-    out.weight_scale_divisor = std::bit_cast<float>(plan.weight_scale_divisor_bits);
-    out.input_scale_divisor  = std::bit_cast<float>(plan.input_scale_divisor_bits);
+    // v3 : le parent device porte déjà le diviseur de poids lu par le matérialiseur ; on
+    // vérifie qu'il est celui validé au binding avant de le laisser sortir vers le kernel.
+    Weight out = artifact::materialized_nvfp4_weight(
+        materialized, plan.object, rows, columns,
+        std::bit_cast<float>(plan.input_scale_divisor_bits));
+    if (std::bit_cast<std::uint32_t>(out.weight_scale_divisor) != plan.weight_scale_divisor_bits) {
+        throw artifact::ArtifactError("NVFP4 weight divisor differs between binding and backing");
+    }
     return out;
 }
 
@@ -468,7 +449,7 @@ DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement pla
 void validate_draft_ids(artifact::Binder& binder, artifact::ObjectHandle handle) {
     constexpr std::size_t kDraftVocab     = 131072;
     constexpr std::size_t kTokenizerVocab = 248077;
-    const auto bytes                      = binder_payload_v2(const_cast<artifact::Binder&>(binder), handle).data;
+    const auto bytes                      = artifact::host_bytes(binder, handle);
     std::vector<bool> seen(kTokenizerVocab, false);
     for (std::size_t i = 0; i < kDraftVocab; ++i) {
         const std::byte* value = bytes.data() + i * sizeof(std::uint32_t);
@@ -585,8 +566,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     : backing(std::move(materialized)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
-    // v3: arena gérée par MaterializedArtifact
-    runtime.weights_arena = nullptr;
+    runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
