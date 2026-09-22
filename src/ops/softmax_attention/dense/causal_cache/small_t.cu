@@ -74,7 +74,10 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
         const std::int32_t clamped  = (splits > kMin) ? splits : kMin;
         return (clamped < kMax) ? clamped : kMax;
     }
-    return causal_small_t_split_upper_bound<Geometry>(window);
+    // Same wave alignment as the device active-split policy, so the launch capacity always
+    // covers the aligned device count.
+    return causal_small_t_wave_aligned_splits<Geometry>(
+        causal_small_t_split_upper_bound<Geometry>(window));
 }
 
 template <typename Geometry>

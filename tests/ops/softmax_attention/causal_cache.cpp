@@ -2256,6 +2256,16 @@ int run_batch_cases() {
                             {6, 61, 16391, 506u, false, true}, MappingPattern::Fragmented);
     failures += run_a1_case(kGeometries[0], KvCacheStorage::BFloat16,
                             {4, 13092, 32768, 507u, false, true}, MappingPattern::Fragmented);
+    // Long-context Volta int8 routes with several wave-aligned splits: the width-six verify
+    // (compact-tail five-warp kernel) and the width-one MTP draft, eager and graph replay.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {6, 25994, 32768, 508u, false, false}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {6, 25994, 32768, 509u, false, true}, MappingPattern::Identity);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {1, 25999, 32768, 510u, false, true}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {6, 12000, 16384, 511u, false, true}, MappingPattern::Fragmented);
     return failures;
 }
 
