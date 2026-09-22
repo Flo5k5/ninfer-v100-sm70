@@ -10,6 +10,7 @@
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16_volta.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta.cuh"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta_kt.cuh"
 #endif
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/softmax_attention.h"
@@ -187,6 +188,30 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
                 static_cast<float*>(partial_l.data));
     };
+    if constexpr (kKtSupported<Geometry, TokenTile>) {
+        // Up to five 8-row tiles (widths 1-6 on the 27B group of six): the key-major kernel
+        // replaces the query-major one at every window, see small_t_i8_volta_kt.cuh.
+        causal_attention_small_t_volta_kt_partial_i8_kernel<Geometry, TokenTile, MultiBatch, Masked,
+                                                            CacheInput>
+            <<<volta_grid, kKtWarps * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data), input,
+                static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
+                static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
+                static_cast<__half*>(cache_v_scale.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data),
+                invocation.valid_columns == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                invocation.table_rows == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                cache.block_tables.ne[0], invocation.width, invocation.full_width,
+                invocation.column_begin, logical_capacity, scale,
+                static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
+                static_cast<float*>(partial_l.data));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if constexpr (TokenTile == 6 && Geometry::GroupSize == 6) {
         // Below the 16K graph envelope the fifth-warp setup costs more than the tail pass it
         // replaces; the next envelope up is where sharing the K/V walk wins.

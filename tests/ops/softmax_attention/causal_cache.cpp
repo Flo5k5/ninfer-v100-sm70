@@ -126,6 +126,10 @@ struct AttentionCase {
     std::uint32_t seed;
     bool zero_q       = false;
     bool graph_replay = false;
+    // Half-width of the uniform Q draw. The default keeps logits within ~0.02 of each other,
+    // i.e. near-uniform attention; a large amplitude makes the softmax peaky, so that errors in
+    // individual scores (not just in the V average) reach the output.
+    float q_amplitude = 0.25f;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -1728,7 +1732,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) *
                                     static_cast<std::size_t>(geometry.kv_heads) *
                                     static_cast<std::size_t>(test_case.tokens);
-    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -test_case.q_amplitude,
+                                           test_case.q_amplitude);
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
@@ -1824,7 +1829,8 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
                                    static_cast<std::size_t>(geometry.q_heads) *
                                    static_cast<std::size_t>(test_case.tokens);
-    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -test_case.q_amplitude,
+                                           test_case.q_amplitude);
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
@@ -2266,6 +2272,32 @@ int run_batch_cases() {
                             {1, 25999, 32768, 510u, false, true}, MappingPattern::Fragmented);
     failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
                             {6, 12000, 16384, 511u, false, true}, MappingPattern::Fragmented);
+    // Key-major Volta int8 route at long context for the remaining verify widths: split starts
+    // that are not 32-key aligned, one to five 8-row N tiles, eager and graph replay.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {5, 25995, 32768, 512u, false, true}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {4, 25996, 32768, 513u, false, false}, MappingPattern::Identity);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {3, 9001, 16384, 514u, false, true}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {2, 4097, 8192, 515u, false, false}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[1], KvCacheStorage::Int8Group64,
+                            {5, 20000, 32768, 516u, false, true}, MappingPattern::Fragmented);
+    // Peaky attention (logit spread ~3): the default near-uniform draws cannot see a wrong
+    // per-key score or scale, only a wrong V average.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {1, 25999, 32768, 520u, false, true, 36.0f}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {5, 25995, 32768, 521u, false, false, 36.0f}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {6, 25994, 32768, 522u, false, true, 36.0f}, MappingPattern::Identity);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {4, 4093, 8192, 523u, false, true, 36.0f}, MappingPattern::Fragmented);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {5, 3000, 4096, 524u, false, false, 36.0f}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[1], KvCacheStorage::Int8Group64,
+                            {2, 9000, 16384, 525u, false, true, 36.0f}, MappingPattern::Fragmented);
     return failures;
 }
 
