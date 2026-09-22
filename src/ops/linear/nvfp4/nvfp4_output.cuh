@@ -47,4 +47,20 @@ struct Nvfp4Fp32ContiguousOutput {
     }
 };
 
+// One launch over a fused [gate; up] weight whose halves land in two separate FP32 planes, so the
+// SwiGLU combine still sees the per-half layout Nvfp4Fp32ContiguousOutput gives it.
+struct Nvfp4Fp32SplitContiguousOutput {
+    float* lower;
+    float* upper;
+    std::int32_t half_rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        const bool is_upper = parent_row >= half_rows;
+        float* data         = is_upper ? upper : lower;
+        const std::int32_t row = is_upper ? parent_row - half_rows : parent_row;
+        data[static_cast<std::int64_t>(token) * half_rows + row] = value;
+    }
+};
+
 } // namespace ninfer::ops::detail

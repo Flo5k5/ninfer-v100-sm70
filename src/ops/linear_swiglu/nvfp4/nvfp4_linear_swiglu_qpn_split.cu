@@ -14,7 +14,6 @@ namespace ninfer::ops::detail {
 
 namespace {
 constexpr std::int32_t kIntermediate = 17408; // Nvfp4MlpGateUpGeometry::kOutputRows / 2
-constexpr std::int32_t kMTileOffset  = kIntermediate / 128; // 136, exact
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ input,
                                     half* __restrict__ output, std::int64_t count) {
@@ -39,22 +38,13 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     bf16_to_fp16_kernel<<<static_cast<int>((activation_count + 255) / 256), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), x_fp16, activation_count);
 
-    Weight gate_weight = weight;
-    gate_weight.n      = kIntermediate;
-
-    Weight up_weight = weight;
-    up_weight.n       = kIntermediate;
-    up_weight.qdata   = static_cast<const std::uint8_t*>(weight.qdata) +
-                       static_cast<std::int64_t>(kIntermediate) * (k / 2);
-    up_weight.scales = static_cast<const std::uint8_t*>(weight.scales) +
-                       static_cast<std::int64_t>(kMTileOffset) * (k / 64) * 512;
-
+    // Gate and up are one contiguous weight in the QPN-prepacked layout (32-row tiles, up starting
+    // at tile kIntermediate/32 in both the code and the scale plane), so a single launch covers
+    // both halves: 1088 CTAs = 6.8 Volta waves instead of two 544-CTA launches of 3.4 waves each.
     launch_nvfp4_volta_qpn_with_fp16_activation(
-        x, gate_weight, x_fp16, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
-        kIntermediate, inverse_weight_divisor, stream);
-    launch_nvfp4_volta_qpn_with_fp16_activation(
-        x, up_weight, x_fp16, Nvfp4Fp32ContiguousOutput{up_scratch, kIntermediate},
-        kIntermediate, inverse_weight_divisor, stream);
+        x, weight, x_fp16,
+        Nvfp4Fp32SplitContiguousOutput{gate_scratch, up_scratch, kIntermediate},
+        2 * kIntermediate, inverse_weight_divisor, stream);
 
     const std::int64_t elements = static_cast<std::int64_t>(kIntermediate) * t;
     const int threads           = 256;
