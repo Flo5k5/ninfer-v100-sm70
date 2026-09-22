@@ -22,6 +22,7 @@
 // one.
 
 #include "core/device.h"
+#include "ops/common/fp16_activation.cuh"
 #include "ops/common/math.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"
@@ -37,14 +38,15 @@ namespace ninfer::ops::detail {
 // Reads two fp32 [kIntermediate, T] planes (token-major, matching Nvfp4Fp32ContiguousOutput's
 // store layout) and writes silu(gate) * up as BF16. Grid-stride over the whole [kIntermediate, T]
 // extent; this is output-sized traffic, not weight-sized, so a simple 1D launch is enough.
+// `Out` is BF16, or FP16 carrying the BF16-rounded value (the fp16 activation domain).
+template <class Out>
 __global__ void nvfp4_swiglu_fp32_combine_kernel(const float* __restrict__ gate,
                                                   const float* __restrict__ up,
-                                                  __nv_bfloat16* __restrict__ out,
-                                                  std::int64_t n) {
+                                                  Out* __restrict__ out, std::int64_t n) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
-        out[i] = __float2bfloat16_rn(silu(gate[i]) * up[i]);
+        out[i] = round_activation<Out>(silu(gate[i]) * up[i]);
     }
 }
 

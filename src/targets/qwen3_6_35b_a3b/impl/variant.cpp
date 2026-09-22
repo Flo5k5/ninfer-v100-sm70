@@ -231,6 +231,8 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               weights.dt_bias, workspace, hidden, g, beta, execution);
 }
 
+bool Variant::post_mixer_takes_fp16(const PostMixerWeights&, std::int32_t) { return false; }
+
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints& hints,
                          WorkspaceArena& workspace, cudaStream_t stream) {

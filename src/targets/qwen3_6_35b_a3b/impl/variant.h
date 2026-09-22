@@ -99,6 +99,10 @@ struct Variant {
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, const ::ninfer::ops::SparseMoeHints& hints,
                            WorkspaceArena& workspace, cudaStream_t stream);
+    // True when post_mixer takes an FP16 `hidden` at this width: the Volta fp16 activation domain,
+    // in which the caller's RMSNorm writes the copy the QPN GEMVs would otherwise stage.
+    [[nodiscard]] static bool post_mixer_takes_fp16(const PostMixerWeights& weights,
+                                                    std::int32_t tokens);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 

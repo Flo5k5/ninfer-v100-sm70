@@ -92,6 +92,10 @@ bool workspace_fits(const WorkspaceArena& workspace, std::size_t bytes) {
 void launch_qpn_residual(const Tensor& x, const Weight& weight, Tensor& residual,
                          WorkspaceArena& workspace, cudaStream_t stream) {
     if (x.ne[1] <= kFp8VoltaQpnMaxTokens) {
+        if (x.dtype == DType::FP16) {
+            fp8_linear_add_qpn_launch(x, weight, x.data, residual, stream);
+            return;
+        }
         const std::size_t activation_bytes = qpn_activation_bytes(weight.k, x.ne[1]);
         if (!workspace_fits(workspace, activation_bytes)) {
             fp8_linear_add_qpn_launch(x, weight, nullptr, residual, stream);
@@ -157,6 +161,14 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 #endif
     return capacity;
 }
+
+#ifdef NINFER_VOLTA_BUILD
+bool fp8_linear_add_fp16_activation_supported(const Weight& weight, LinearPolicy policy,
+                                              std::int32_t tokens) {
+    return resolve_route(weight.n, weight.k, policy, tokens) == Fp8LinearAddRoute::QpnResidual &&
+           tokens <= kFp8VoltaQpnMaxTokens;
+}
+#endif
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {

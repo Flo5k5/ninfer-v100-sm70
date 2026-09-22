@@ -103,8 +103,8 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceAre
                       static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
         auto* output = static_cast<std::uint8_t*>(out.data) +
                        static_cast<std::int64_t>(token_begin) * kOutputRows * sizeof(std::uint16_t);
-        Tensor input_chunk(input, DType::BF16, {weight.k, active});
-        Tensor output_chunk(output, DType::BF16, {kOutputRows, active});
+        Tensor input_chunk(input, x.dtype, {weight.k, active});
+        Tensor output_chunk(output, out.dtype, {kOutputRows, active});
 #ifdef NINFER_VOLTA_BUILD
         if (fp8_linear_swiglu_qpn_split_supported(weight.k, active)) {
             auto scope                    = workspace.scope();
@@ -155,6 +155,16 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 #endif
     return 0;
 }
+
+#ifdef NINFER_VOLTA_BUILD
+// FP16 activations are taken only where one QPN split launch covers the whole call.
+bool fp8_linear_swiglu_fp16_activation_supported(const Weight& weight, LinearPolicy policy,
+                                                 std::int32_t tokens) {
+    return resolve_route(policy, tokens) == Fp8LinearSwiGluRoute::A16 &&
+           tokens < kVoltaCutlassMinT && tokens <= volta_chunk(weight.k) &&
+           fp8_linear_swiglu_qpn_split_supported(weight.k, tokens);
+}
+#endif
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,

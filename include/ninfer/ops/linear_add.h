@@ -71,4 +71,13 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
 
+/**
+ * Volta fp16 activation domain. True when linear_add(x, w, residual, policy, ...) at `tokens`
+ * columns also accepts an FP16 x holding BF16-rounded values -- the fp16 copy its QPN route would
+ * otherwise stage from a BF16 x -- and then skips that staging pass; the result is bit-identical
+ * to passing the BF16 tensor. False on every other route and on non-Volta builds.
+ */
+[[nodiscard]] bool linear_add_fp16_activation_supported(const Weight& w, LinearPolicy policy,
+                                                        std::int32_t tokens) noexcept;
+
 } // namespace ninfer::ops
