@@ -52,11 +52,15 @@ void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor&
 }
 
 #ifdef NINFER_VOLTA_BUILD
-void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                               cudaStream_t stream) {
-    launch_fp8_volta_qpn_with_output(
-        x, weight,
-        Fp8ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n, stream);
+void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, const void* x_fp16,
+                               Tensor& residual, cudaStream_t stream) {
+    const Fp8ResidualOutput output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
+    if (x_fp16 != nullptr) {
+        launch_fp8_volta_qpn_with_fp16_activation(x, weight, static_cast<const half*>(x_fp16),
+                                                  output, weight.n, stream);
+    } else {
+        launch_fp8_volta_qpn_with_output(x, weight, output, weight.n, stream);
+    }
 }
 #endif
 

@@ -1,12 +1,18 @@
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 
+#include "core/layout.h"
+
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_launch.h"
+#endif
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -41,6 +47,20 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     throw std::logic_error("unreachable NVFP4 linear problem");
 }
 
+#ifdef NINFER_VOLTA_BUILD
+// fp16 staging buffer for the QPN route's activations (see launch_nvfp4_volta_qpn_fp16).
+std::size_t qpn_activation_bytes(std::int32_t input_rows, std::int32_t tokens) {
+    return static_cast<std::size_t>(input_rows) *
+           std::min(tokens, kNvfp4VoltaQpnMaxTokens) * sizeof(std::uint16_t);
+}
+
+bool workspace_fits(const WorkspaceArena& workspace, std::size_t bytes) {
+    constexpr std::size_t kAlign = 256;
+    const std::size_t start      = (workspace.used() + kAlign - 1) / kAlign * kAlign;
+    return start + bytes <= workspace.capacity();
+}
+#endif
+
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
 #ifdef NINFER_VOLTA_BUILD
                 WorkspaceArena* workspace,
@@ -69,6 +89,15 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
     // SIMT throughput decays with T while QPN's is flat across the tile.
     const bool qpn            = nvfp4_volta_qpn_supported(weight.n, weight.k, kNvfp4VoltaQpnMaxTokens);
     const std::int32_t kChunk = qpn ? kNvfp4VoltaQpnMaxTokens : kNvfp4LastSmallT;
+    // Stage the fp16 activation once per chunk when the caller's workspace has room; without it
+    // the QPN kernel converts in its inner loop (correct, slower).
+    std::optional<WorkspaceArena::Scope> scope;
+    DeviceSpan activation;
+    const std::size_t activation_bytes = qpn_activation_bytes(weight.k, total_t);
+    if (qpn && workspace != nullptr && workspace_fits(*workspace, activation_bytes)) {
+        scope.emplace(workspace->scope());
+        activation = workspace->alloc_bytes(activation_bytes, 256);
+    }
 #else
     constexpr std::int32_t kChunk = kNvfp4LastSmallT;
 #endif
@@ -82,7 +111,13 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
 #ifdef NINFER_VOLTA_BUILD
         if (nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
-            launch_nvfp4_volta_qpn(input_chunk, weight, output_chunk, stream);
+            if (activation.data != nullptr) {
+                fp8_stage_bf16_activation_sm70(input_chunk, activation.data, stream);
+                launch_nvfp4_volta_qpn_fp16(input_chunk, weight, activation.data, output_chunk,
+                                            stream);
+            } else {
+                launch_nvfp4_volta_qpn(input_chunk, weight, output_chunk, stream);
+            }
             continue;
         }
 #endif
@@ -103,8 +138,9 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
         throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
+    std::size_t capacity = 0;
     if (resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearRoute::W4A4) {
-        return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
+        capacity = nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
     }
 #ifdef NINFER_VOLTA_BUILD
     // The wide-T MMA route in launch_a16 only needs workspace when split-K applies; report that
@@ -113,10 +149,19 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
     // chunked route rather than fault.
     if (policy == LinearPolicy::A16Only && max_tokens > kNvfp4VoltaQpnMaxTokens &&
         nvfp4_volta_mma_supported(output_rows, input_rows, max_tokens)) {
-        return nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens);
+        capacity = std::max(capacity,
+                            nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens));
+    }
+    // Every A16 call stages its activation for the QPN route. Under AllowA4 the narrow end of the
+    // interval can be A16 while the wide end is W4A4, so size for both.
+    if (resolve_route(output_rows, input_rows, policy, min_tokens) == Nvfp4LinearRoute::A16 &&
+        nvfp4_volta_qpn_supported(output_rows, input_rows, kNvfp4VoltaQpnMaxTokens)) {
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc_bytes(qpn_activation_bytes(input_rows, max_tokens), 256);
+        capacity = std::max(capacity, layout.peak_bytes(1));
     }
 #endif
-    return 0;
+    return capacity;
 }
 
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
