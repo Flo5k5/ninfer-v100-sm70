@@ -93,6 +93,10 @@ void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& resid
                             WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope         = workspace.scope();
     if (qpn_residual(weight, x.ne[1])) {
+        if (x.dtype == DType::FP16) {
+            launch_nvfp4_volta_qpn_residual(x, weight, x.data, residual, stream);
+            return;
+        }
         constexpr std::size_t kAlign = 256;
         const std::size_t bytes      = qpn_activation_bytes(weight.k, x.ne[1]);
         const std::size_t start      = (workspace.used() + kAlign - 1) / kAlign * kAlign;
@@ -160,6 +164,15 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 #endif
     return 0;
 }
+
+#ifdef NINFER_VOLTA_BUILD
+bool nvfp4_linear_add_fp16_activation_supported(const Weight& weight, LinearPolicy policy,
+                                                std::int32_t tokens) {
+    return resolve_route(weight.n, weight.k, policy, tokens) ==
+               Nvfp4LinearAddRoute::LinearThenAdd &&
+           qpn_residual(weight, tokens);
+}
+#endif
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,

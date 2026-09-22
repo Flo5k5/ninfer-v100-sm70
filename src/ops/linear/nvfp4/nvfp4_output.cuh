@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/fp16_activation.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 
@@ -51,17 +52,20 @@ struct Nvfp4ResidualOutput {
 // QuantLayout::VoltaQpnPrepackedSwiGlu: every CTA's 32 columns are 16 gate features and the same
 // 16 up features, so the kernel hands both halves of a feature to store_pair and the fp32
 // SiLU(gate) * up gets its single BF16 round here -- no fp32 scratch planes, no combine launch.
-struct Nvfp4SwiGluPairOutput {
+// `Out` is BF16, or FP16 carrying the BF16-rounded value (the fp16 activation domain).
+template <class Out>
+struct Nvfp4SwiGluPairOutputT {
     static constexpr bool kSwiGluPairs = true;
-    __nv_bfloat16* data;
+    Out* data;
     std::int32_t features;
 
     __device__ __forceinline__ void store_pair(std::int32_t feature, std::int32_t token, float gate,
                                                float up) const {
         data[static_cast<std::int64_t>(token) * features + feature] =
-            __float2bfloat16_rn(silu(gate) * up);
+            round_activation<Out>(silu(gate) * up);
     }
 };
+using Nvfp4SwiGluPairOutput = Nvfp4SwiGluPairOutputT<__nv_bfloat16>;
 
 template <class Policy, class = void>
 struct nvfp4_swiglu_pairs : std::false_type {};

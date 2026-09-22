@@ -362,6 +362,9 @@ ninfer_add_op_test(ninfer_linear_add_nvfp4_test
 ninfer_add_op_test(ninfer_linear_add_fp8_test
   SOURCES ops/linear_add/test_fp8.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_fp16_activation_test
+  SOURCES ops/test_fp16_activation.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp

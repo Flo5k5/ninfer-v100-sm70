@@ -33,18 +33,31 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     const std::int32_t k = x.ne[0];
     const std::int32_t t = x.ne[1];
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
-    auto* x_fp16 = static_cast<half*>(activation_scratch);
-    const std::int64_t activation_count = static_cast<std::int64_t>(k) * t;
-    bf16_to_fp16_kernel<<<static_cast<int>((activation_count + 255) / 256), 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), x_fp16, activation_count);
+    // An FP16 x is already the staged copy (the fp16 activation domain).
+    const half* x_fp16 = static_cast<const half*>(x.data);
+    if (x.dtype != DType::FP16) {
+        auto* staged = static_cast<half*>(activation_scratch);
+        const std::int64_t activation_count = static_cast<std::int64_t>(k) * t;
+        bf16_to_fp16_kernel<<<static_cast<int>((activation_count + 255) / 256), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), staged, activation_count);
+        x_fp16 = staged;
+    }
+    const bool fp16_out = out.dtype == DType::FP16;
 
     if (weight.layout == QuantLayout::VoltaQpnPrepackedSwiGlu) {
         // Gate and up of each feature share a CTA, so the kernel applies SwiGLU itself and the
         // fp32 scratch planes stay unused.
-        launch_nvfp4_volta_qpn_with_fp16_activation(
-            x, weight, x_fp16,
-            Nvfp4SwiGluPairOutput{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
-            2 * kIntermediate, inverse_weight_divisor, stream);
+        if (fp16_out) {
+            launch_nvfp4_volta_qpn_with_fp16_activation(
+                x, weight, x_fp16, Nvfp4SwiGluPairOutputT<half>{static_cast<half*>(out.data),
+                                                                kIntermediate},
+                2 * kIntermediate, inverse_weight_divisor, stream);
+        } else {
+            launch_nvfp4_volta_qpn_with_fp16_activation(
+                x, weight, x_fp16,
+                Nvfp4SwiGluPairOutput{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
+                2 * kIntermediate, inverse_weight_divisor, stream);
+        }
         return;
     }
 
@@ -59,8 +72,13 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     const std::int64_t elements = static_cast<std::int64_t>(kIntermediate) * t;
     const int threads           = 256;
     const int blocks = static_cast<int>(std::min<std::int64_t>((elements + threads - 1) / threads, 4096));
-    nvfp4_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
-        gate_scratch, up_scratch, static_cast<__nv_bfloat16*>(out.data), elements);
+    if (fp16_out) {
+        nvfp4_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
+            gate_scratch, up_scratch, static_cast<half*>(out.data), elements);
+    } else {
+        nvfp4_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
+            gate_scratch, up_scratch, static_cast<__nv_bfloat16*>(out.data), elements);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
