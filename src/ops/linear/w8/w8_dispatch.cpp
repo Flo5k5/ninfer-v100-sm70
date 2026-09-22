@@ -227,13 +227,28 @@ constexpr std::int32_t kVoltaQpnMinCols = 3;
 constexpr std::int32_t kVoltaQpnMaxCols = 8;
 constexpr std::int32_t kVoltaQpnMinRows = 4096;
 
-// T=1 on the MTP layer's five projections goes to the register-streamed GEMV
-// (w8_volta_gemv.cu): 829.5 -> 685.7 us summed over one drafted token on V100-PCIE. Other shapes
-// keep their measured incumbents (the 27B W8 output head's SIMT GEMV already reads at 752 GB/s).
-bool w8_uses_volta_gemv_t1(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
-    if (t != 1) { return false; }
+// The MTP layer's five projections go to the register-streamed GEMVs (w8_volta_gemv.cu) at
+// T=1..7. Summed over the five shapes on V100-PCIE, cold cache, us:
+//
+//   T:              1      2      3      4      5      6      7
+//   incumbent   829.5 1192.8 1347.7 1360.9 1437.7 1443.7  ~1420
+//   GEMV        685.7  712.8  721.0  768.1  801.8  887.0 1071.2
+//
+// (incumbent: sliced SIMT at T=1..2, bf16 QPN from T=3; QPN is 1397.7 at T=8). The multi-token
+// form turns FP32-bound from T~5 and its register footprint tops out at T=7 (128 at two rows per
+// warp), so the band ends there. Other shapes keep their measured incumbents (the 27B
+// W8 output head's SIMT GEMV already reads at 752 GB/s at T=1).
+bool w8_is_mtp_layer_shape(std::int32_t n, std::int32_t k) noexcept {
     return (n == 5120 && (k == 10240 || k == 6144 || k == 17408)) ||
            (k == 5120 && (n == 14336 || n == 34816));
+}
+
+bool w8_uses_volta_gemv_t1(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
+    return t == 1 && w8_is_mtp_layer_shape(n, k);
+}
+
+bool w8_uses_volta_gemv_tn(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
+    return t >= 2 && t <= 7 && w8_is_mtp_layer_shape(n, k);
 }
 
 bool w8_uses_volta_qpn(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
@@ -264,6 +279,7 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
         // The fused tensor-core route displaces both of those inside its band; see
         // w8_volta_mma_gemm.cuh and the band constants above.
         if (w8_uses_volta_gemv_t1(n, k, t)) { return launch_w8_volta_gemv_t1; }
+        if (w8_uses_volta_gemv_tn(n, k, t)) { return launch_w8_volta_gemv_tn; }
         if (w8_uses_volta_qpn(n, k, t)) { return launch_w8_volta_qpn; }
         if (w8_uses_volta_mma(n, k, t)) { return launch_w8_volta_mma; }
         if (w8_launch_needs_volta_fallback(launch)) { return launch_w8_small_t; }
