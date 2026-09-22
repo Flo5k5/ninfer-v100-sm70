@@ -53,6 +53,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
 namespace ninfer::ops::detail {
@@ -468,16 +469,39 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     }
     __syncthreads();
 
-    constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
-    for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * 32) {
-        const int row  = e / S::kColsPerCta;
-        const int col  = e % S::kColsPerCta;
-        const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
-        if (row < t && ocol < n) {
-            float value = 0.0f;
+    if constexpr (nvfp4_swiglu_pairs_v<OutputPolicy>) {
+        // VoltaQpnPrepackedSwiGlu: columns [0, 16) of this CTA are gate features, [16, 32) the
+        // same up features.
+        constexpr int kHalf  = S::kColsPerCta / 2;
+        constexpr int kPairs = kTiles * S::kRowsPerTile * kHalf;
+        for (int e = static_cast<int>(threadIdx.x); e < kPairs; e += SPLITK * 32) {
+            const int row     = e / kHalf;
+            const int local   = e % kHalf;
+            const int feature = static_cast<int>(blockIdx.x) * kHalf + local;
+            if (row < t && feature < n / 2) {
+                const int gate_index = row * S::kColsPerCta + local;
+                float gate           = 0.0f;
+                float up             = 0.0f;
 #pragma unroll
-            for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
-            output.store(ocol, row, value * output_scale);
+                for (int w = 0; w < SPLITK; ++w) {
+                    gate += cs[w][gate_index];
+                    up += cs[w][gate_index + kHalf];
+                }
+                output.store_pair(feature, row, gate * output_scale, up * output_scale);
+            }
+        }
+    } else {
+        constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
+        for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * 32) {
+            const int row  = e / S::kColsPerCta;
+            const int col  = e % S::kColsPerCta;
+            const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
+            if (row < t && ocol < n) {
+                float value = 0.0f;
+#pragma unroll
+                for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
+                output.store(ocol, row, value * output_scale);
+            }
         }
     }
 }
@@ -510,10 +534,12 @@ void launch_nvfp4_qpn_schedule(bool prepacked, dim3 grid, const std::uint8_t* co
         nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC>
             <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t, scale.divisor,
                                                scale.output_scale, output);
-    } else {
+    } else if constexpr (!nvfp4_swiglu_pairs_v<OutputPolicy>) {
         nvfp4_volta_qpn_gemm_kernel<kTiles, SPLITK, NACC>
             <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
                                                inverse_weight_divisor, output);
+    } else {
+        throw std::logic_error("NVFP4 QPN2 SwiGLU pairs need the interleaved prepacked layout");
     }
 }
 
@@ -529,7 +555,8 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
     const auto* scales = static_cast<const std::uint8_t*>(w.scales);
-    const bool prepacked  = w.layout == QuantLayout::VoltaQpnPrepacked;
+    const bool prepacked  = w.layout == QuantLayout::VoltaQpnPrepacked ||
+                           w.layout == QuantLayout::VoltaQpnPrepackedSwiGlu;
     const bool gate_up    = (n == 34816 && k == 5120);
     const bool split_half = (n == 17408 && k == 5120);
     // The down projection's 160 CTAs leave SPLITK=8 at 2 CTAs/SM (16 warps) short of the

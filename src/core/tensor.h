@@ -53,6 +53,9 @@ enum class QuantLayout : std::uint16_t {
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
     VoltaQpnPrepacked   = 4,
+    // NVFP4 gate/up only: VoltaQpnPrepacked with each 32-row tile holding 16 gate rows followed
+    // by the 16 matching up rows, so one QPN2 CTA sees both halves of its SwiGLU features.
+    VoltaQpnPrepackedSwiGlu = 5,
 };
 
 struct Weight {

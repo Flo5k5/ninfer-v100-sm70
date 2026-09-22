@@ -168,7 +168,10 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
     out.down    = materialized_weight(materialized, plan.down, 5120, 17408);
 #ifdef NINFER_VOLTA_BUILD
     if (out.gate_up.qtype == QType::NVFP4) {
-        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
+        // gate_up is only ever consumed by linear_swiglu: pair each gate row with its up row so
+        // the QPN2 epilogue applies SwiGLU without fp32 scratch or a combine launch.
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up, nullptr,
+                                                      /*swiglu_interleave=*/true);
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
     }
 #endif

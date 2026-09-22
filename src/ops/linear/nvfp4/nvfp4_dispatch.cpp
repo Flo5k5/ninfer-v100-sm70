@@ -167,6 +167,9 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream) {
     validate_nvfp4_weight(weight, "nvfp4 linear");
+    if (weight.layout == QuantLayout::VoltaQpnPrepackedSwiGlu) {
+        throw std::invalid_argument("nvfp4 linear: SwiGLU-interleaved weights are linear_swiglu-only");
+    }
     if (!is_nvfp4_linear_problem(weight.n, weight.k) || x.ne[1] <= 0) {
         throw std::invalid_argument("nvfp4 linear: unsupported shape");
     }

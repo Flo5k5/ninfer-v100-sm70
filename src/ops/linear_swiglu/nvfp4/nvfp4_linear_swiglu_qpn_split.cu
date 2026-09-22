@@ -38,6 +38,16 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     bf16_to_fp16_kernel<<<static_cast<int>((activation_count + 255) / 256), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), x_fp16, activation_count);
 
+    if (weight.layout == QuantLayout::VoltaQpnPrepackedSwiGlu) {
+        // Gate and up of each feature share a CTA, so the kernel applies SwiGLU itself and the
+        // fp32 scratch planes stay unused.
+        launch_nvfp4_volta_qpn_with_fp16_activation(
+            x, weight, x_fp16,
+            Nvfp4SwiGluPairOutput{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
+            2 * kIntermediate, inverse_weight_divisor, stream);
+        return;
+    }
+
     // Gate and up are one contiguous weight in the QPN-prepacked layout (32-row tiles, up starting
     // at tile kIntermediate/32 in both the code and the scale plane), so a single launch covers
     // both halves: 1088 CTAs = 6.8 Volta waves instead of two 544-CTA launches of 3.4 waves each.

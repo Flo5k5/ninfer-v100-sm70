@@ -1,10 +1,12 @@
 #pragma once
 
+#include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -44,6 +46,30 @@ struct Nvfp4ResidualOutput {
         data[index]              = __float2bfloat16_rn(value + __bfloat162float(data[index]));
     }
 };
+
+// SwiGLU straight out of the QPN2 epilogue, for a gate/up weight prepacked with
+// QuantLayout::VoltaQpnPrepackedSwiGlu: every CTA's 32 columns are 16 gate features and the same
+// 16 up features, so the kernel hands both halves of a feature to store_pair and the fp32
+// SiLU(gate) * up gets its single BF16 round here -- no fp32 scratch planes, no combine launch.
+struct Nvfp4SwiGluPairOutput {
+    static constexpr bool kSwiGluPairs = true;
+    __nv_bfloat16* data;
+    std::int32_t features;
+
+    __device__ __forceinline__ void store_pair(std::int32_t feature, std::int32_t token, float gate,
+                                               float up) const {
+        data[static_cast<std::int64_t>(token) * features + feature] =
+            __float2bfloat16_rn(silu(gate) * up);
+    }
+};
+
+template <class Policy, class = void>
+struct nvfp4_swiglu_pairs : std::false_type {};
+template <class Policy>
+struct nvfp4_swiglu_pairs<Policy, std::void_t<decltype(Policy::kSwiGluPairs)>>
+    : std::bool_constant<Policy::kSwiGluPairs> {};
+template <class Policy>
+inline constexpr bool nvfp4_swiglu_pairs_v = nvfp4_swiglu_pairs<Policy>::value;
 
 // Writes the mma accumulator straight through, no BF16 round. Exists for split-projection SwiGLU
 // (see nvfp4_linear_swiglu_qpn_split.cuh): two independent QPN2 launches -- one per weight half,

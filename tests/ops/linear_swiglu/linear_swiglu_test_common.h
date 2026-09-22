@@ -23,8 +23,9 @@ struct Profile {
     ActivationCompute activation_compute;
     // NVFP4 only: prepack the weight into the Volta QPN layout the production loader uses, and
     // override the patterned weight's scale divisor (0 keeps the default).
-    bool nvfp4_prepack         = false;
-    float weight_scale_divisor = 0.0F;
+    bool nvfp4_prepack           = false;
+    float weight_scale_divisor   = 0.0F;
+    bool nvfp4_swiglu_interleave = true; // with nvfp4_prepack: the production gate/up layout
 };
 
 int run_profile(std::string_view label, const Profile& profile,
