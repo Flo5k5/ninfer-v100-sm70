@@ -3,6 +3,7 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 
 #include <cuda_runtime.h>
 
@@ -87,7 +88,7 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
     return 1;
 }
 
-int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool prepack) {
 #ifdef NINFER_VOLTA_BUILD
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
@@ -126,7 +127,16 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
     GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    const Weight weight = host_weight.device_weight(device_weight.data());
+    Weight weight = host_weight.device_weight(device_weight.data());
+    // Production loads prepack NVFP4 weights for the Volta QPN kernel (bindings.cpp), which then
+    // runs the prepacked kernel; the prepack rewrites the payload in place.
+    std::vector<std::uint8_t> expected_weight = host_weight.payload;
+#ifdef NINFER_VOLTA_BUILD
+    if (prepack) {
+        ops::detail::nvfp4_prepack_qpn_sm70(weight);
+        device_weight.copy_to_host(expected_weight.data(), expected_weight.size());
+    }
+#endif
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
@@ -205,7 +215,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(activation.data()),
                                       activation.size() * sizeof(std::uint16_t)),
         "NVFP4 linear_add activation");
-    failures += verify_preserved(device_weight, host_weight.payload, "NVFP4 linear_add weight");
+    failures += verify_preserved(device_weight, expected_weight, "NVFP4 linear_add weight");
     return failures;
 }
 
@@ -217,8 +227,12 @@ int main() {
         return 77;
     }
     int failures = 0;
-    failures += run_shape(5120, 6144, 811U);
-    failures += run_shape(5120, 17408, 821U);
+    failures += run_shape(5120, 6144, 811U, false);
+    failures += run_shape(5120, 17408, 821U, false);
+#ifdef NINFER_VOLTA_BUILD
+    failures += run_shape(5120, 6144, 812U, true);
+    failures += run_shape(5120, 17408, 822U, true);
+#endif
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

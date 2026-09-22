@@ -324,10 +324,13 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         }
     }
 
-    for (int group = g0; group < gend; ++group) {
-        const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(group) * 32;
-        const uint2 q2 = __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8));
-        const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scales[packed_index]), divisor2);
+    // One group is only 8 bytes of codes per lane, and each is consumed by a dependent
+    // decode + four mma before the next load issues, so a warp keeps a single 256-byte request
+    // in flight -- far below what HBM needs at 2 CTAs/SM (the 5120x17408 down projection ran at
+    // 37% of bandwidth). Issue kLoadBatch groups' code and scale loads together first.
+    constexpr int kLoadBatch = 4;
+    const auto consume_group = [&](int group, uint2 q2, std::uint8_t scale_byte) {
+        const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scale_byte), divisor2);
         half2 b[8];
         nvfp4_decode_e2m1_quad(q2.x, rebias, *reinterpret_cast<half2(*)[4]>(&b[0]));
         nvfp4_decode_e2m1_quad(q2.y, rebias, *reinterpret_cast<half2(*)[4]>(&b[4]));
@@ -371,6 +374,26 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
             volta_mma_qp_n(c[tile][2 % NACC], A[4], A[5], B[4], B[5]);
             volta_mma_qp_n(c[tile][3 % NACC], A[6], A[7], B[6], B[7]);
         }
+    };
+
+    int group = g0;
+    for (; group + kLoadBatch <= gend; group += kLoadBatch) {
+        uint2 q2[kLoadBatch];
+        std::uint8_t scale_bytes[kLoadBatch];
+#pragma unroll
+        for (int u = 0; u < kLoadBatch; ++u) {
+            const std::int64_t packed_index =
+                tile_base + static_cast<std::int64_t>(group + u) * 32;
+            q2[u]          = __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8));
+            scale_bytes[u] = __ldg(scales + packed_index);
+        }
+#pragma unroll
+        for (int u = 0; u < kLoadBatch; ++u) { consume_group(group + u, q2[u], scale_bytes[u]); }
+    }
+    for (; group < gend; ++group) {
+        const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(group) * 32;
+        consume_group(group, __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8)),
+                      __ldg(scales + packed_index));
     }
 
 #pragma unroll
@@ -419,7 +442,8 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
 //   - the split SwiGLU kernel's per-half shape (17408 rows, 544 CTAs): SPLITK=16 at *both*
 //     kTiles=1 and kTiles=2 (344.2 vs 279.8 GB/s at T=4; 214.4 vs 209.3 at T=16) --
 //     bench/ops/nvfp4_qpn2_split_shape_sweep.cu, deleted.
-//   - down (5120 rows, 160 CTAs): SPLITK=8 tops out, 16 is worse.
+//   - down (5120 rows, 160 CTAs): SPLITK=8 tops out, 16 is worse -- for the unbatched loop. The
+//     prepacked kernel's batched group loads flip that: SPLITK=16 there (see `down` below).
 // NACC barely moves any of them once SPLITK is right, so it only varies where it measured a real
 // (if small) edge. Geometries this dispatch doesn't name (attn/gdn input, the 6144-residual)
 // aren't reached by the mixed artifact's routing and fall to the SPLITK=8 default, which was never
@@ -455,8 +479,13 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     const bool prepacked  = w.layout == QuantLayout::VoltaQpnPrepacked;
     const bool gate_up    = (n == 34816 && k == 5120);
     const bool split_half = (n == 17408 && k == 5120);
+    // The down projection's 160 CTAs leave SPLITK=8 at 2 CTAs/SM (16 warps) short of the
+    // requests in flight HBM needs; with the batched group loads SPLITK=16 measured 157 -> 114 us
+    // at T=6 (322 -> 444 GB/s), where the unbatched kernel had SPLITK=8 on top.
+    // Only the prepacked kernel has the batched loads that make SPLITK=16 pay on this shape.
+    const bool down       = prepacked && n == 5120 && k == 17408;
     if (t <= S::kRowsPerTile) {
-        if (gate_up || split_half) {
+        if (gate_up || split_half || down) {
             launch_nvfp4_qpn_schedule<1, 16, 2>(prepacked, grid, codes, scales, xd, n, k, t,
                                                 inverse_weight_divisor, output, stream);
         } else {
