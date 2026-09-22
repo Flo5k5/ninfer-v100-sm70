@@ -81,17 +81,48 @@
 
 namespace ninfer::ops {
 
-__device__ __forceinline__ int4 causal_kv_dequant_i8x8_f16_from(
-    const std::int8_t* codes8, float scale) {
-    const int2 raw       = load_vec<int2>(codes8);
-    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
-    __half2 packed[4];
+// int8 -> fp16 without the quarter-rate conversion pipe: 0x64 over (code ^ 0x80) is the fp16
+// value 1024 + code + 128, so one byte permute and one subtraction of 1152 give the code exactly,
+// and one fp16 multiply applies the group scale. Bit-identical to converting through fp32: the
+// product of an int8 code and an fp16 scale is exact in fp32, so both paths round it to fp16 once.
+__device__ __forceinline__ int4 causal_kv_dequant_i8x8_f16_from(const std::int8_t* codes8,
+                                                                 half2 scale) {
+    constexpr std::uint32_t kExponent1024 = 0x64646464u;
+    const half2 bias1152                  = __half2half2(__ushort_as_half(0x6480));
+    const int2 raw                        = load_vec<int2>(codes8);
+    half2 packed[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        packed[i] = __floats2half2_rn(static_cast<float>(c[2 * i]) * scale,
-                                      static_cast<float>(c[2 * i + 1]) * scale);
+    for (int word = 0; word < 2; ++word) {
+        const std::uint32_t offset_codes = static_cast<std::uint32_t>((&raw.x)[word]) ^ 0x80808080u;
+        const std::uint32_t low  = __byte_perm(offset_codes, kExponent1024, 0x4140);
+        const std::uint32_t high = __byte_perm(offset_codes, kExponent1024, 0x4342);
+        packed[2 * word] =
+            __hmul2(__hsub2(*reinterpret_cast<const half2*>(&low), bias1152), scale);
+        packed[2 * word + 1] =
+            __hmul2(__hsub2(*reinterpret_cast<const half2*>(&high), bias1152), scale);
     }
     return *reinterpret_cast<const int4*>(packed);
+}
+
+// PV with an fp32 accumulator: D (32x8 fp32, volta_d_get_i/j layout) += P (32x8 fp16) @ V
+// (8x8 fp16). Same operand fragments as volta_mma_pv, whose fp16 output had to be widened and
+// folded into an fp32 accumulator by hand after every mma.
+__device__ __forceinline__ void causal_small_t_mma_pv_f32(float (&d)[8], const half2 (&p)[4],
+                                                           const half2 (&v)[4]) {
+    const int* Pxi = reinterpret_cast<const int*>(p);
+    const int* Vxi = reinterpret_cast<const int*>(v);
+    asm volatile("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
+                 "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
+                 "{%0, %1, %2, %3, %4, %5, %6, %7};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]),
+                   "+f"(d[6]), "+f"(d[7])
+                 : "r"(Pxi[0]), "r"(Pxi[1]), "r"(Vxi[0]), "r"(Vxi[1]));
+    asm volatile("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
+                 "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
+                 "{%0, %1, %2, %3, %4, %5, %6, %7};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]),
+                   "+f"(d[6]), "+f"(d[7])
+                 : "r"(Pxi[2]), "r"(Pxi[3]), "r"(Vxi[2]), "r"(Vxi[3]));
 }
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
@@ -395,9 +426,9 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         const int tail_row      = (lane & 3) + ((lane & 16) != 0 ? 4 : 0);
 
         // acc_f[c] holds this warp's DSlice-wide PV output for head-dim chunk c (columns
-        // [dim_warp*DSlice + c*8, +8)), folded across key-tiles by the online-softmax
-        // alpha rescale -- see file comment #1 for why this is DChunksLocal (not DChunks)
-        // wide.
+        // [dim_warp*DSlice + c*8, +8)) as an fp32 mma accumulator, folded across key-tiles by
+        // the online-softmax alpha rescale -- see file comment #1 for why this is DChunksLocal
+        // (not D/8) wide.
         float acc_f[DChunksLocal][8];
 #pragma unroll
         for (int c = 0; c < DChunksLocal; ++c) {
@@ -442,8 +473,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                         kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, page_offset);
                     const std::int64_t scale_off = kv_cache_int8_quant_scale_index<Geometry>(
                         physical_page, kv_head, d / kKVCacheInt8Group, page_offset);
-                    const float ks = __half2float(cache_k_scale[scale_off]);
-                    const float vs = __half2float(cache_v_scale[scale_off]);
+                    const half2 ks = __half2half2(cache_k_scale[scale_off]);
+                    const half2 vs = __half2half2(cache_v_scale[scale_off]);
                     store_vec(k_dst, causal_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
                     store_vec(v_dst, causal_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
                 } else {
@@ -617,16 +648,30 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                 bl_lo        = bl_lo + __shfl_xor_sync(FullMask, bl_lo, 2, 32);
                 bl_hi        = bl_hi + __shfl_xor_sync(FullMask, bl_hi, 2, 32);
 
+                // A row with no finite maximum yet has an exactly-zero accumulator (every P it
+                // saw was zero), so its alpha = 0 rescale is a no-op; padding rows and rows fully
+                // masked so far stay in that state for the whole split.
+                const bool rescale_lo = m_lo != -CUDART_INF_F && alpha_lo != 1.0f;
+                const bool rescale_hi = m_hi != -CUDART_INF_F && alpha_hi != 1.0f;
                 l_lo = l_lo * alpha_lo + bl_lo;
                 l_hi = l_hi * alpha_hi + bl_hi;
                 m_lo = new_m_lo;
                 m_hi = new_m_hi;
-                // Own-row selection: this thread's PV accumulator (acc_f) is tied to output
-                // row=lane specifically, which is r_lo when lane&2==0 and r_hi otherwise --
-                // see volta_mma.cuh's I_MAJOR addressing for the Q/P/PV-output tile.
-                const float alpha = ((lane & 2) == 0) ? alpha_lo : alpha_hi;
-
                 if (!CompactTail || warp < DimSplit) {
+                    // acc_f[c] is an fp32 mma accumulator in the QK^T D layout, so its registers
+                    // hold rows r_lo (l&2 == 0) and r_hi exactly like d_score. The online-softmax
+                    // rescale only has work to do when a live row's maximum moved (alpha != 1,
+                    // which exp2 of zero makes exact); past the first key tiles of a long context
+                    // that is rare, so the warp skips it when no lane needs it.
+                    if (__any_sync(FullMask, rescale_lo || rescale_hi)) {
+#pragma unroll
+                        for (int c = 0; c < DChunksLocal; ++c) {
+#pragma unroll
+                            for (int l = 0; l < 8; ++l) {
+                                acc_f[c][l] *= (l & 2) == 0 ? alpha_lo : alpha_hi;
+                            }
+                        }
+                    }
                     half2 p[4];
                     volta_softmax_to_half2(p, d_score);
 #pragma unroll
@@ -636,14 +681,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                                      reinterpret_cast<const half2*>(
                                          &v_s[sub * 8 * SmemStride + dim_warp * DSlice + c * 8]),
                                      SmemStride / 2);
-                        half2 pv[4] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
-                        volta_mma_pv(pv, p, vf);
-#pragma unroll
-                        for (int n = 0; n < 4; ++n) {
-                            const float2 contrib = __half22float2(pv[n]);
-                            acc_f[c][2 * n + 0]   = acc_f[c][2 * n + 0] * alpha + contrib.x;
-                            acc_f[c][2 * n + 1]   = acc_f[c][2 * n + 1] * alpha + contrib.y;
-                        }
+                        causal_small_t_mma_pv_f32(acc_f[c], p, vf);
                     }
                 }
                 if constexpr (CompactTail) {
@@ -734,22 +772,29 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                         own_l;
                 }
             }
-            if (row < rows_here) {
+            // acc_f is in the D layout: registers l&2 == 0 hold row r_lo, the others r_hi, and
+            // registers (0,1) / (4,5) are adjacent column pairs at (lane&2) and (lane&2)+4.
+            const int acc_row_lo = volta_d_get_i(0) & ~2;
+            const int acc_col    = lane & 2;
+#pragma unroll
+            for (int half_row = 0; half_row < 2; ++half_row) {
+                const int acc_row = acc_row_lo | (half_row * 2);
+                if (acc_row >= rows_here) { continue; }
                 int q_head = 0;
                 int token  = 0;
-                causal_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head,
+                causal_small_t_tc_row_to_qt<Geometry>(row_base + acc_row, tokens, kv_head, q_head,
                                                       token);
-                if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
+                if (!causal_valid_q_head<Geometry>(kv_head, q_head)) { continue; }
 #pragma unroll
-                    for (int c = 0; c < DChunksLocal; ++c) {
-                        const int d = dim_warp * DSlice + c * 8;
-                        const std::int64_t dst = causal_partial_acc_index<Geometry>(
-                            q_head, d, token, split, tokens);
-                        store_vec(&partial_acc[dst],
-                                  *reinterpret_cast<const int4*>(&acc_f[c][0]));
-                        store_vec(&partial_acc[dst + 4],
-                                  *reinterpret_cast<const int4*>(&acc_f[c][4]));
-                    }
+                for (int c = 0; c < DChunksLocal; ++c) {
+                    const int d            = dim_warp * DSlice + c * 8 + acc_col;
+                    const std::int64_t dst = causal_partial_acc_index<Geometry>(
+                        q_head, d, token, split, tokens);
+                    const int l = half_row * 2;
+                    *reinterpret_cast<float2*>(&partial_acc[dst]) =
+                        make_float2(acc_f[c][l], acc_f[c][l + 1]);
+                    *reinterpret_cast<float2*>(&partial_acc[dst + 4]) =
+                        make_float2(acc_f[c][l + 4], acc_f[c][l + 5]);
                 }
             }
         }
