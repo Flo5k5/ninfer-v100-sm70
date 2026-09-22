@@ -10,11 +10,9 @@ import numpy as np
 from safetensors import safe_open
 import torch
 
-from tools.artifact.layouts import (
-    encode_direct,
-    encode_fp8_row_scaled,
-    row_scale_geometry,
-)
+from tools.artifact.codecs.direct import encode_direct
+from tools.artifact.codecs.fp8_row import encode_fp8_row_scaled
+from tools.artifact.layouts import row_scale_geometry
 from tools.convert.common.safetensors import ShardReader
 
 
@@ -159,7 +157,7 @@ def iter_reader_payload(
         raise ValueError("rows_per_chunk must be a positive integer") from None
     if isinstance(rows_per_chunk, bool) or chunk_rows <= 0:
         raise ValueError("rows_per_chunk must be a positive integer")
-    geometry = row_scale_geometry("FP8_E4M3FN_ROW_BF16S", shape)
+    geometry = row_scale_geometry("fp8_e4m3fn_row_bf16", shape)
     if source_name not in reader.weight_map:
         raise ValueError(f"embedding source is missing {source_name}")
 
@@ -190,7 +188,7 @@ def iter_reader_payload(
     if padding:
         yield bytes(padding)
     scales = torch.from_numpy(scale_words.view(np.int16)).view(torch.bfloat16)
-    yield encode_direct(scales, "BF16")
+    yield encode_direct(scales, "bf16")
 
 
 __all__ = [

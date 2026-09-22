@@ -12,8 +12,9 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from tools.artifact.layouts import encode_row_split, row_split_geometry
-from tools.artifact.numeric import QuantFormat, get_format
+from tools.artifact.codecs.row_split import encode_row_split
+from tools.artifact.formats import QuantFormat, get_format
+from tools.artifact.layouts import row_split_geometry
 
 
 _FP16_MIN_SUBNORMAL = 2.0**-24
