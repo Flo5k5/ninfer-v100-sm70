@@ -9,7 +9,13 @@ int main() {
     using namespace ninfer::test::linear_swiglu;
 
     try {
+#ifdef NINFER_VOLTA_BUILD
+        // QPN split covers up to 32 tokens per pass: 5 is the K=4 verify width, 9/17/32 the
+        // two- and four-tile buckets, 33 the first CUTLASS width.
+        constexpr std::array<std::int32_t, 9> kA16Cases{1, 2, 4, 5, 8, 9, 17, 32, 33};
+#else
         constexpr std::array<std::int32_t, 2> kA16Cases{1, 2};
+#endif
         constexpr std::array<std::int32_t, 6> kA8Cases{1, 2, 3, 48, 65, 1024};
         int failures = 0;
         failures += run_profile(
