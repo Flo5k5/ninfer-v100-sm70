@@ -981,6 +981,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    if (Variant::gdn_output_takes_fp16(*w.out_proj, T)) {
+        on = Tensor(on.data, DType::FP16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    }
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);

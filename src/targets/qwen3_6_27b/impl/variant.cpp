@@ -305,6 +305,10 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               workspace, hidden, g, beta, execution);
 }
 
+bool Variant::gdn_output_takes_fp16(const Weight& weight, std::int32_t tokens) {
+    return ops::linear_add_fp16_activation_supported(weight, text_policy(weight), tokens);
+}
+
 bool Variant::post_mixer_takes_fp16(const PostMixerWeights& weights, std::int32_t tokens) {
     return ops::linear_swiglu_fp16_activation_supported(weights.gate_up,
                                                         text_policy(weights.gate_up), tokens) &&
