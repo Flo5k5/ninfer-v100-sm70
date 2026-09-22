@@ -256,6 +256,66 @@ __device__ __forceinline__ float q4_gemv_dot_word_async(
     return accumulator;
 }
 
+#ifdef NINFER_VOLTA_BUILD
+// sm_70 has no cp.async: the pipeline primitives degrade to a blocking load + store, so the async
+// word path above waits out the full DRAM latency of every tile (the 27B proposal head ran at 65%
+// of HBM bandwidth, long-scoreboard bound). Double-buffer through registers instead: the next
+// tile's code vector and scale pair are loaded before the current tile is consumed, then published
+// to shared memory, which keeps the async path's cross-lane word ownership unchanged.
+template <class Schedule>
+__device__ __forceinline__ float q4_gemv_dot_word_register_pipelined(
+    Q4GemvTileStorage<Schedule>& shared_tiles, int cta_warp,
+    const __nv_bfloat16* __restrict__ activation, const std::uint8_t* __restrict__ code_row,
+    const std::uint8_t* __restrict__ scale_row, int group_begin, int group_end, int lane) {
+    constexpr int kGroupsPerTile = Schedule::kGroupsPerWarpTile;
+    static_assert(Schedule::kCodeVectorsPerTile == 32,
+                  "register pipelining maps one code vector to each lane");
+    static_assert(Schedule::kScalePairsPerTile <= 32,
+                  "register pipelining maps at most one scale pair to each lane");
+
+    uint4* shared_codes              = shared_tiles.codes[cta_warp][0];
+    std::uint32_t* shared_scale_pairs = shared_tiles.scale_pairs[cta_warp][0];
+    const int tile_count             = div_up(group_end - group_begin, kGroupsPerTile);
+
+    uint4 next_codes              = make_uint4(0u, 0u, 0u, 0u);
+    std::uint32_t next_scale_pair = 0u;
+    const auto load_tile = [&](int tile) {
+        const int tile_group_begin = group_begin + tile * kGroupsPerTile;
+        const int active_groups    = min(kGroupsPerTile, group_end - tile_group_begin);
+        const int active_vectors   = active_groups * Q4RowSplitStorage::kCodeBytesPerGroup /
+                                   static_cast<int>(sizeof(uint4));
+        const auto* global_codes = reinterpret_cast<const uint4*>(
+            code_row +
+            static_cast<std::int64_t>(tile_group_begin) * Q4RowSplitStorage::kCodeBytesPerGroup);
+        next_codes = lane < active_vectors ? __ldg(&global_codes[lane]) : make_uint4(0u, 0u, 0u, 0u);
+        const std::uint8_t* global_scale_pairs =
+            scale_row +
+            static_cast<std::int64_t>(tile_group_begin) * Q4RowSplitStorage::kScaleBytesPerGroup;
+        next_scale_pair = lane < active_groups / 2
+                              ? __ldg(reinterpret_cast<const std::uint32_t*>(global_scale_pairs) +
+                                      lane)
+                              : 0u;
+    };
+
+    float accumulator = 0.0f;
+    load_tile(0);
+    for (int tile = 0; tile < tile_count; ++tile) {
+        shared_codes[lane] = next_codes;
+        if (lane < Schedule::kScalePairsPerTile) { shared_scale_pairs[lane] = next_scale_pair; }
+        __syncwarp();
+        if (tile + 1 < tile_count) { load_tile(tile + 1); }
+
+        const int tile_group_begin = group_begin + tile * kGroupsPerTile;
+        const int active_groups    = min(kGroupsPerTile, group_end - tile_group_begin);
+        accumulator = q4_gemv_consume_word_tile<Schedule>(shared_codes, shared_scale_pairs,
+                                                          activation, tile_group_begin,
+                                                          active_groups, lane, accumulator);
+        __syncwarp();
+    }
+    return accumulator;
+}
+#endif
+
 template <class Schedule, int GroupsPerWarp>
 __device__ __forceinline__ float
 q4_gemv_dot_byte_static(Q4GemvTileStorage<Schedule>& shared_tiles, int cta_warp,
@@ -487,9 +547,15 @@ void q4_rowsplit_gemv_kernel(
                     q4_gemv_dot_byte_sync<Schedule>(shared_tiles, cta_warp, activation, code_row,
                                                     scale_row, group_begin, group_end, lane);
             } else {
+#ifdef NINFER_VOLTA_BUILD
+                accumulator = q4_gemv_dot_word_register_pipelined<Schedule>(
+                    shared_tiles, cta_warp, activation, code_row, scale_row, group_begin,
+                    group_end, lane);
+#else
                 accumulator =
                     q4_gemv_dot_word_async<Schedule>(shared_tiles, cta_warp, activation, code_row,
                                                      scale_row, group_begin, group_end, lane);
+#endif
             }
         }
     }
