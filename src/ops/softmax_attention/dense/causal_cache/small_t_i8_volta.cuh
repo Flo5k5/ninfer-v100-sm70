@@ -42,8 +42,12 @@
 //      cap with nothing left for Q/K fragments or loop state. Fix: split the head dimension
 //      across warps (DimSplit=4 below) instead of giving each warp the full D range, so each
 //      warp only holds D/4=64 columns resident (8 chunks x 8 floats = 64 registers). Warps
-//      that share a row-tile redundantly recompute the (cheap, register-light) QK^T +
-//      online-softmax step identically and only diverge for the PV accumulate.
+//      that share a row-tile also split the QK^T contraction along D (split-K): each
+//      contracts its own D/4 slice and the four partial score tiles are summed through shared
+//      memory in a fixed order, so every warp runs the (cheap) online-softmax step on
+//      bit-identical scores and they only diverge for the PV accumulate. Recomputing the
+//      full-D QK^T in every warp made this kernel issue-bound at long context: QK^T is four
+//      times the PV tensor work per warp.
 //
 //   2. Shared-memory wall. This kernel reloads Q from shared memory every key-tile
 //      iteration rather than keeping Q fragments resident in registers (that trade-off is
@@ -61,7 +65,8 @@
 //      codebase instantiates). The general route therefore loops over 32-row passes. The hot
 //      27B width-six shape is exactly 36 rows, so its long-context route instead gives the
 //      four-row tail to a fifth warp. That warp uses the four independent mma quadpairs as
-//      D slices for PV, sharing the first tile's K/V walk rather than starting a second pass.
+//      D slices, for PV as well as for its QK^T contraction (reduced across quadpairs by
+//      shuffle), sharing the first tile's K/V walk rather than starting a second pass.
 
 #include "ops/common/volta_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
@@ -109,7 +114,6 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     constexpr int Bc            = 16;          // keys per shared-memory tile
     constexpr int D             = kCausalHeadDim;
     constexpr int Threads       = WarpsPerCta * 32;
-    constexpr int DChunks       = D / 8;           // QK^T: full head-dim contraction, unsplit
     constexpr int PVChunks      = Bc / 8;          // key sub-groups per Bc tile
     constexpr int DSlice        = D / DimSplit;    // this warp's PV output width
     constexpr int DChunksLocal  = DSlice / 8;       // this warp's resident accumulator chunks
@@ -143,6 +147,24 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     __shared__ __align__(16) half k_s[Bc * SmemStride];
     __shared__ __align__(16) half v_s[Bc * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
+    // Split-K QK^T exchange. Each dim-split warp contracts only its own DSlice of the head dim
+    // and publishes that partial 32x8 score tile per 8-key sub-group; every dim-split warp then
+    // sums the DimSplit partials in the same fixed order, so all of them hold bit-identical
+    // scores and therefore identical online-softmax state (dim_warp 0 writes the m/l the others'
+    // PV slices are normalized by). Layout [warp][sub][half][lane][4] keeps the 16-byte
+    // accesses of a warp on distinct banks.
+    __shared__ __align__(16) float qk_part_s[DimSplit * PVChunks * 2 * 32 * 4];
+    const auto qk_part_index = [](int part_warp, int sub, int half_index, int part_lane) {
+        return (((part_warp * PVChunks + sub) * 2 + half_index) * 32 + part_lane) * 4;
+    };
+    // Quadpair-split QK^T for the compact tail warp: at step s quadpair qp contracts head dims
+    // [d0, d0+4). The interleave spreads one step's K-row loads over all 32 banks
+    // (bank = 4*row + 4*(s&3) + 2*(qp&1) + 16*(qp>>1) mod 32, for both the Q and the K row)
+    // while the 16 steps of the four quadpairs still tile D=256 exactly once.
+    const auto tail_qk_d0 = [](int step, int quadpair) {
+        return (step >> 2) * 64 + (step & 3) * 8 + (quadpair & 1) * 4 + (quadpair >> 1) * 32;
+    };
+    constexpr int TailQkSteps = D / (4 * 4);
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -356,6 +378,22 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
 
         int physical_page = physical_pages_s[0];
 
+        // QK^T operands are read from shared memory as whole 16-byte fragments (the four half2
+        // of a Volta Q/K fragment row are contiguous). With the 528-byte padded row stride the
+        // eight lanes of each LDS.128 phase land on distinct 4-bank groups, so these reads are
+        // conflict-free, unlike four scalar half2 loads. Keeping Q in registers instead would
+        // cost 32 registers the five-warp route cannot spare under its 2-CTA/SM bound.
+        const auto load_frag16 = [](half2 (&dst)[4], const half* src) {
+            const int4 raw = *reinterpret_cast<const int4*>(src);
+            const half2* h = reinterpret_cast<const half2*>(&raw);
+#pragma unroll
+            for (int l = 0; l < 4; ++l) { dst[l] = h[l]; }
+        };
+        const int q_frag_row  = volta_qp_get_i();
+        const int k_frag_row  = volta_k_get_i();
+        const int tail_quadpair = (lane >> 2) & 3;
+        const int tail_row      = (lane & 3) + ((lane & 16) != 0 ? 4 : 0);
+
         // acc_f[c] holds this warp's DSlice-wide PV output for head-dim chunk c (columns
         // [dim_warp*DSlice + c*8, +8)), folded across key-tiles by the online-softmax
         // alpha rescale -- see file comment #1 for why this is DChunksLocal (not DChunks)
@@ -415,55 +453,124 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
             }
             __syncthreads();
 
-            // Bc=16 keys are staged together, but QK^T/softmax/PV operate on 8-key
-            // sub-groups within that stage: each mma.sync.m8n8k4 call only covers an
-            // 8-key "N" dimension, so each sub-group gets its own complete online-softmax
-            // rescale step (same recurrence as the outer kb loop, one level finer). Every
-            // dim-split warp sharing this row-tile computes this step identically and
-            // redundantly -- see file comment #1.
+            // --- QK^T, split-K over the head dim. A dim-split warp contracts only its own
+            // DSlice (DChunksLocal of the D/8 chunks) for both 8-key sub-groups and publishes the
+            // partial tiles; the tail warp contracts its four rows with the quadpair-split
+            // mapping and reduces across quadpairs by shuffle. This replaces DimSplit+1
+            // identical full-D contractions per sub-group (file comment #1) with one. ---
+            float tail_scores[CompactTail ? PVChunks : 1][8];
+            if (!CompactTail || warp < DimSplit) {
+                // The sub-groups' accumulator chains are independent: interleaving them gives
+                // the fixed-latency mma pipe two chains to alternate between.
+                float partial[PVChunks][8] = {};
+#pragma unroll
+                for (int cl = 0; cl < DChunksLocal; ++cl) {
+                    half2 qf[4];
+                    load_frag16(qf, &q_s[q_frag_row * SmemStride + (dim_warp * DChunksLocal + cl) * 8]);
+#pragma unroll
+                    for (int sub = 0; sub < PVChunks; ++sub) {
+                        half2 kf[4];
+                        load_frag16(kf, &k_s[(sub * 8 + k_frag_row) * SmemStride +
+                                             (dim_warp * DChunksLocal + cl) * 8]);
+                        volta_mma_qk(partial[sub], qf, kf);
+                    }
+                }
+#pragma unroll
+                for (int sub = 0; sub < PVChunks; ++sub) {
+                    *reinterpret_cast<float4*>(&qk_part_s[qk_part_index(dim_warp, sub, 0, lane)]) =
+                        make_float4(partial[sub][0], partial[sub][1], partial[sub][2],
+                                    partial[sub][3]);
+                    *reinterpret_cast<float4*>(&qk_part_s[qk_part_index(dim_warp, sub, 1, lane)]) =
+                        make_float4(partial[sub][4], partial[sub][5], partial[sub][6],
+                                    partial[sub][7]);
+                }
+            }
+            if constexpr (CompactTail) {
+                if (warp == DimSplit) {
+#pragma unroll
+                    for (int sub = 0; sub < PVChunks; ++sub) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { tail_scores[sub][i] = 0.0f; }
+                    }
+#pragma unroll
+                    for (int step = 0; step < TailQkSteps; ++step) {
+                        const int d0 = tail_qk_d0(step, tail_quadpair);
+                        // A operand: row tail_row of the 8x4 slice, rows 4..7 being zero padding.
+                        uint2 q_codes = make_uint2(0u, 0u);
+                        if (tail_row < 4) {
+                            q_codes = *reinterpret_cast<const uint2*>(
+                                &q_tail_s[tail_row * SmemStride + d0]);
+                        }
+#pragma unroll
+                        for (int sub = 0; sub < PVChunks; ++sub) {
+                            // B operand: column tail_row of the 8x4 slice is key tail_row's four
+                            // head dims [d0, d0+4), two packed half2 registers.
+                            const uint2 key_codes = *reinterpret_cast<const uint2*>(
+                                &k_s[(sub * 8 + tail_row) * SmemStride + d0]);
+                            volta_mma_qp_n(tail_scores[sub], q_codes.x, q_codes.y, key_codes.x,
+                                           key_codes.y);
+                        }
+                    }
+                    // Quadpairs hold disjoint head-dim partials of the same 8x8 tile. The xor-4
+                    // then xor-8 butterfly adds commutative pairs, so every quadpair ends with
+                    // bit-identical sums.
+#pragma unroll
+                    for (int sub = 0; sub < PVChunks; ++sub) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            tail_scores[sub][i] +=
+                                __shfl_xor_sync(FullMask, tail_scores[sub][i], 4, 32);
+                            tail_scores[sub][i] +=
+                                __shfl_xor_sync(FullMask, tail_scores[sub][i], 8, 32);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+
+            // Bc=16 keys are staged together, but softmax/PV operate on 8-key sub-groups
+            // within that stage: each mma.sync.m8n8k4 call only covers an 8-key "N"
+            // dimension, so each sub-group gets its own complete online-softmax rescale step
+            // (same recurrence as the outer kb loop, one level finer). Every dim-split warp
+            // sharing this row-tile runs this step on identical scores.
 #pragma unroll
             for (int sub = 0; sub < PVChunks; ++sub) {
                 const int sub_k0 = k0 + sub * 8;
+                const bool tail_worker = CompactTail && warp == DimSplit;
 
-                // --- QK^T: accumulate over the full D=256 head dim, 8 real k-elements/call. ---
-                float d_score[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                float d_score[8];
+                if (tail_worker) {
 #pragma unroll
-                for (int c = 0; c < DChunks; ++c) {
-                    half2 qf[4];
-                    if constexpr (CompactTail) {
-                        if (warp == DimSplit) {
-                            const int qrow = volta_qp_get_i();
+                    for (int i = 0; i < 8; ++i) { d_score[i] = tail_scores[CompactTail ? sub : 0][i]; }
+                } else {
+                    // Fixed summation order 0..DimSplit-1: identical in every dim-split warp.
+                    float4 lo4 = *reinterpret_cast<const float4*>(
+                        &qk_part_s[qk_part_index(0, sub, 0, lane)]);
+                    float4 hi4 = *reinterpret_cast<const float4*>(
+                        &qk_part_s[qk_part_index(0, sub, 1, lane)]);
 #pragma unroll
-                            for (int l = 0; l < 4; ++l) {
-                                qf[l] = qrow < 4
-                                            ? reinterpret_cast<const half2*>(
-                                                  &q_tail_s[qrow * SmemStride + c * 8])[l]
-                                            : __half2half2(__ushort_as_half(0));
-                            }
-                        } else {
-                            volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]),
-                                          SmemStride / 2);
-                        }
-                    } else {
-                        volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]),
-                                      SmemStride / 2);
+                    for (int part_warp = 1; part_warp < DimSplit; ++part_warp) {
+                        const float4 plo = *reinterpret_cast<const float4*>(
+                            &qk_part_s[qk_part_index(part_warp, sub, 0, lane)]);
+                        const float4 phi = *reinterpret_cast<const float4*>(
+                            &qk_part_s[qk_part_index(part_warp, sub, 1, lane)]);
+                        lo4.x += plo.x; lo4.y += plo.y; lo4.z += plo.z; lo4.w += plo.w;
+                        hi4.x += phi.x; hi4.y += phi.y; hi4.z += phi.z; hi4.w += phi.w;
                     }
-                    half2 kf[4];
-                    volta_load_k(
-                        kf, reinterpret_cast<const half2*>(&k_s[sub * 8 * SmemStride + c * 8]),
-                        SmemStride / 2);
-                    volta_mma_qk(d_score, qf, kf);
+                    d_score[0] = lo4.x; d_score[1] = lo4.y; d_score[2] = lo4.z; d_score[3] = lo4.w;
+                    d_score[4] = hi4.x; d_score[5] = hi4.y; d_score[6] = hi4.z; d_score[7] = hi4.w;
                 }
 
-                // --- Causal mask + scale. Row = volta_d_get_i(l) (0..31, this pass's local
-                // row index); each thread's 8 registers span exactly two distinct rows
-                // (l&2==0 vs l&2==2, see volta_mma.cuh), so two qabs lookups (not eight)
-                // cover this thread's own rows. ---
-                const int r_lo = volta_d_get_i(0) & ~2;
-                const int r_hi = volta_d_get_i(0) | 2;
-                const int worker_row_base = CompactTail && warp == DimSplit ? Br : row_base;
-                const int worker_rows     = CompactTail && warp == DimSplit ? row_count - Br
-                                                                            : rows_here;
+                // --- Causal mask + scale. Each thread's 8 registers span exactly two distinct
+                // rows (l&2==0 vs l&2==2, see volta_mma.cuh), so two qabs lookups (not eight)
+                // cover this thread's own rows. The column mapping of the warp-wide D tile and
+                // of the quadpair-split tail tile is the same; only the row mapping differs:
+                // the tail tile is 8 rows per quadpair, rows 4..7 being zero padding. ---
+                const int r_lo = tail_worker ? (((lane & 16) != 0 ? 4 : 0) | (lane & 1))
+                                             : (volta_d_get_i(0) & ~2);
+                const int r_hi = r_lo | 2;
+                const int worker_row_base = tail_worker ? Br : row_base;
+                const int worker_rows     = tail_worker ? row_count - Br : rows_here;
                 int q_head_lo = 0, tok_lo = 0, q_head_hi = 0, tok_hi = 0;
                 causal_small_t_tc_row_to_qt<Geometry>(worker_row_base + r_lo, tokens, kv_head,
                                                       q_head_lo, tok_lo);
@@ -473,10 +580,10 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                 const int qabs_hi = (r_hi < worker_rows) ? pos[tok_hi] : -1;
 #pragma unroll
                 for (int l = 0; l < 8; ++l) {
-                    const int row   = volta_d_get_i(l);
+                    const bool lo   = (l & 2) == 0;
+                    const int row   = lo ? r_lo : r_hi;
                     const int col   = volta_d_get_j(l);
                     const int key   = sub_k0 + col;
-                    const bool lo   = (l & 2) == 0;
                     const int qabs  = lo ? qabs_lo : qabs_hi;
                     const bool ok =
                         row < worker_rows && key >= split_start && key < split_end && key <= qabs;
@@ -541,12 +648,15 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                 }
                 if constexpr (CompactTail) {
                     if (warp == DimSplit) {
+                        // Every quadpair holds the same reduced tile; quadpair 0 publishes it.
+                        if (tail_quadpair == 0) {
 #pragma unroll
-                        for (int l = 0; l < 8; ++l) {
-                            const int prow = volta_d_get_i(l);
-                            if (prow < 4) {
-                                p_tail_s[prow * 8 + volta_d_get_j(l)] =
-                                    __float2half(d_score[l]);
+                            for (int l = 0; l < 8; ++l) {
+                                const int prow = (l & 2) == 0 ? r_lo : r_hi;
+                                if (prow < 4) {
+                                    p_tail_s[prow * 8 + volta_d_get_j(l)] =
+                                        __float2half(d_score[l]);
+                                }
                             }
                         }
                         __syncwarp();
@@ -565,13 +675,17 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                                                        p_tail_s[input_row * 8 + 2 * l + 1])
                                        : __half2half2(__ushort_as_half(0));
                         }
+                        // p_tail_s is rewritten by the next sub-group; keep every lane's read
+                        // ordered before that write.
+                        __syncwarp();
                         const unsigned* P = reinterpret_cast<const unsigned*>(p);
-                        float alpha_rows[4];
-#pragma unroll
-                        for (int tail_row = 0; tail_row < 4; ++tail_row) {
-                            alpha_rows[tail_row] =
-                                __shfl_sync(FullMask, alpha, tail_row, 32);
-                        }
+                        // Tail row r lives in lane r&1 of the quadpair-split tile, as its lo
+                        // series for r<2 and its hi series for r>=2.
+                        const float alpha_rows[4] = {
+                            __shfl_sync(FullMask, alpha_lo, 0, 32),
+                            __shfl_sync(FullMask, alpha_lo, 1, 32),
+                            __shfl_sync(FullMask, alpha_hi, 0, 32),
+                            __shfl_sync(FullMask, alpha_hi, 1, 32)};
 
 #pragma unroll
                         for (int c = 0; c < DChunksLocal; ++c) {
@@ -641,15 +755,21 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         }
         if constexpr (CompactTail) {
             if (warp == DimSplit) {
+                // Tail row r's softmax state lives in lane r&1 (lo series for r<2, hi for r>=2)
+                // of the quadpair-split tile; gather it so lane r writes row r.
+                const float tail_m_lo = __shfl_sync(FullMask, m_lo, lane & 1, 32);
+                const float tail_m_hi = __shfl_sync(FullMask, m_hi, lane & 1, 32);
+                const float tail_l_lo = __shfl_sync(FullMask, l_lo, lane & 1, 32);
+                const float tail_l_hi = __shfl_sync(FullMask, l_hi, lane & 1, 32);
                 if (lane < 4) {
                     int q_head = 0;
                     int token  = 0;
                     causal_small_t_tc_row_to_qt<Geometry>(Br + lane, tokens, kv_head, q_head,
                                                           token);
                     partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
-                        own_m;
+                        (lane & 2) == 0 ? tail_m_lo : tail_m_hi;
                     partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
-                        own_l;
+                        (lane & 2) == 0 ? tail_l_lo : tail_l_hi;
                 }
 #pragma unroll
                 for (int c = 0; c < DChunksLocal; ++c) {

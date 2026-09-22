@@ -93,6 +93,28 @@ __device__ __forceinline__ int causal_small_t_default_splits(int window) {
     return splits < Geometry::SmallTMaximumSplits ? splits : Geometry::SmallTMaximumSplits;
 }
 
+// V100 wave alignment: 80 SMs x 2 CTAs/SM = 160 partial-kernel slots. A 55-split policy on
+// KVHeads=4 is 220 CTAs = 1.375 waves, the last one leaving most of the GPU idle. Round a
+// multi-wave split count to the nearest whole number of waves (ties and overflow go down: fewer
+// splits also means less reduce work). Shared by the host launch capacity and the device
+// active-split policy; aligning only the host side left the device on its unaligned count.
+template <typename Geometry>
+__host__ __device__ __forceinline__ int causal_small_t_wave_aligned_splits(int splits) {
+#ifdef NINFER_VOLTA_BUILD
+    constexpr int kVoltaSlots   = 160;
+    constexpr int kSplitsPerWave = kVoltaSlots / Geometry::KVHeads;
+    if (kSplitsPerWave <= 1 || splits <= kSplitsPerWave) { return splits; }
+    const int rounded_down = (splits / kSplitsPerWave) * kSplitsPerWave;
+    const int rounded_up   = rounded_down + kSplitsPerWave;
+    if (splits - rounded_down <= rounded_up - splits || rounded_up > Geometry::SmallTMaximumSplits) {
+        return rounded_down;
+    }
+    return rounded_up;
+#else
+    return splits;
+#endif
+}
+
 template <typename Geometry, bool Int8>
 __device__ __forceinline__ int causal_small_t_active_splits(int window, int launch_capacity,
                                                             int tokens) {
@@ -111,10 +133,12 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
             splits             = splits > kMin ? splits : kMin;
             splits             = splits < kMax ? splits : kMax;
         } else {
-            splits = causal_small_t_default_splits<Geometry>(window);
+            splits = causal_small_t_wave_aligned_splits<Geometry>(
+                causal_small_t_default_splits<Geometry>(window));
         }
     } else {
-        splits = causal_small_t_default_splits<Geometry>(window);
+        splits = causal_small_t_wave_aligned_splits<Geometry>(
+            causal_small_t_default_splits<Geometry>(window));
     }
     return splits < launch_capacity ? splits : launch_capacity;
 }
