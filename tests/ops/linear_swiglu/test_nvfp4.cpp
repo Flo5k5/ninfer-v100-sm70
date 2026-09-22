@@ -15,7 +15,20 @@ int main() {
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
                                 kA16Cases);
-#ifndef NINFER_VOLTA_BUILD
+#ifdef NINFER_VOLTA_BUILD
+        // Production prepacks NVFP4 gate/up at load, so the QPN2 prepacked kernel is the route
+        // every decode and verify width takes. The second divisor is checkpoint-like and keeps
+        // the kernel's folded scale in fp16 range; the default one forces its fp32 fallback.
+        constexpr std::array<std::int32_t, 7> kPrepackedCases{1, 4, 5, 8, 9, 16, 32};
+        failures += run_profile("LinearSwiGLU NVFP4_A16 prepacked",
+                                {QType::NVFP4, 34816, 5120, 17408, 1805U, ActivationCompute::A16,
+                                 true},
+                                kPrepackedCases);
+        failures += run_profile("LinearSwiGLU NVFP4_A16 prepacked real-divisor",
+                                {QType::NVFP4, 34816, 5120, 17408, 1807U, ActivationCompute::A16,
+                                 true, 2688.0F},
+                                kPrepackedCases);
+#else
         failures +=
             run_profile("LinearSwiGLU NVFP4_A4",
                         {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4}, kA4Cases);
