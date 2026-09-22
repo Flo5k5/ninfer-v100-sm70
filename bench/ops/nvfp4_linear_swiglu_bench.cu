@@ -152,9 +152,11 @@ int main(int argc, char** argv) {
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
         bench::PackedQuantizedWeight packed  = bench::make_nvfp4_weight(kGateUpRows, kHidden);
-        // Production loads prepack NVFP4 weights for the Volta QPN kernel (bindings.cpp).
-        if (std::getenv("NINFER_BENCH_PREPACK") != nullptr) {
-            ops::detail::nvfp4_prepack_qpn_sm70(packed.weight, stream);
+        // Production loads prepack NVFP4 gate/up SwiGLU-interleaved for the Volta QPN kernel
+        // (bindings.cpp); NINFER_BENCH_PREPACK=plain keeps the non-interleaved prepacked layout.
+        if (const char* prepack = std::getenv("NINFER_BENCH_PREPACK"); prepack != nullptr) {
+            ops::detail::nvfp4_prepack_qpn_sm70(packed.weight, stream,
+                                                std::string_view(prepack) != "plain");
         }
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
             QType::NVFP4, kGateUpRows, kHidden, options.policy, min_t, max_t);
