@@ -93,6 +93,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 #ifdef NINFER_VOLTA_BUILD
 bool q4_launch_needs_volta_fallback(Q4Launch launch) noexcept {
     return launch != launch_q4_gemv_r1_w8_direct && launch != launch_q4_gemv_r4_w1_direct &&
+           launch != launch_q4_volta_gemv_t1 &&
            launch != launch_q4_draft_head_small_t && launch != launch_q4_simt_r8_c4 &&
            launch != launch_q4_simt_r8_c8;
 }
@@ -104,6 +105,10 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::AllowA8: {
         const Q4Launch launch = select_q4_a16_launch(n, k, t);
 #ifdef NINFER_VOLTA_BUILD
+        // The proposal head at T=1: register-streamed GEMV, 581.7 -> 452.6 us on [131072,5120].
+        if (launch == launch_q4_gemv_r4_w1_direct && k == 5120 && t == 1) {
+            return launch_q4_volta_gemv_t1;
+        }
         if (q4_launch_needs_volta_fallback(launch)) { return launch_q4_simt_r8_c8; }
 #endif
         return launch;
