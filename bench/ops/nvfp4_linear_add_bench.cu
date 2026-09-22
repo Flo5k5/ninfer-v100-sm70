@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -153,6 +154,10 @@ int main(int argc, char** argv) {
         DeviceBuffer input    = bench::make_bf16(static_cast<std::size_t>(options.k) * max_t);
         DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(options.n) * max_t);
         bench::PackedQuantizedWeight packed  = bench::make_nvfp4_weight(options.n, options.k);
+        // Production loads prepack NVFP4 weights for the Volta QPN kernel (bindings.cpp).
+        if (std::getenv("NINFER_BENCH_PREPACK") != nullptr) {
+            ops::detail::nvfp4_prepack_qpn_sm70(packed.weight, stream);
+        }
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, options.n, options.k, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
