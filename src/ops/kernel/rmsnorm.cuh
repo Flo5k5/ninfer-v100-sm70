@@ -6,6 +6,7 @@
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -25,13 +26,30 @@ __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weig
     return value;
 }
 
+// Output pair store. An FP16 output carries the BF16-rounded value: it is the fp16 activation copy
+// the Volta QPN GEMVs read, bit-identical to writing BF16 and staging that to fp16 afterwards.
+template <class OutPair>
+__device__ __forceinline__ OutPair rmsnorm_pack(float a, float b);
+
+template <>
+__device__ __forceinline__ __nv_bfloat162 rmsnorm_pack<__nv_bfloat162>(float a, float b) {
+    return __floats2bfloat162_rn(a, b);
+}
+
+template <>
+__device__ __forceinline__ __half2 rmsnorm_pack<__half2>(float a, float b) {
+    const float2 rounded = __bfloat1622float2(__floats2bfloat162_rn(a, b));
+    return __floats2half2_rn(rounded.x, rounded.y);
+}
+
 // Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
 // registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
 // than part of the row geometry.
-template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0>
+template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0,
+          class OutPair = __nv_bfloat162>
 __launch_bounds__(Block) __global__
     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                    const __nv_bfloat162* z, __nv_bfloat162* out,
+                                    const __nv_bfloat162* z, OutPair* out,
                                     std::int32_t input_d, std::int64_t rows, float eps) {
     const int d = FixedD ? FixedD : input_d;
     static_assert(Block % kWarpSize == 0);
@@ -85,7 +103,7 @@ __launch_bounds__(Block) __global__
             float2 zf{0.0f, 0.0f};
             if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_pair); }
             out[row_base + pair] =
-                __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
+                rmsnorm_pack<OutPair>(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
         }
     }
@@ -135,12 +153,65 @@ __launch_bounds__(Block) __global__
                               rmsnorm_epilogue<Epilogue>(x1.y, inv, w1.y, z1.y));
 }
 
+// The 5120-wide hidden row in one vector pass: 640 threads, eight BF16 per thread through one
+// 16-byte load of x and one of the gain, no loops. Small on purpose. A decode step runs this ~150
+// times, each between weight streams that evict its code from L2, and ncu shows the unrolled CTA
+// kernel below (536 SASS instructions at D=5120) spending ~60% of its warp cycles stalled on
+// no_instruction: every launch paid a cold instruction fetch. Plain and offset epilogues only;
+// the launcher requires 16-byte aligned x, weight and out.
+template <RmsEpilogue Epilogue, class OutPair>
+__launch_bounds__(640) __global__
+    void rmsnorm_row5120_vec8_kernel(const uint4* __restrict__ x, const uint4* __restrict__ weight,
+                                     uint4* __restrict__ out, float eps) {
+    static_assert(Epilogue != RmsEpilogue::Gated);
+    static_assert(sizeof(OutPair) == 4);
+    constexpr int kThreads = 640;
+    constexpr int kWarps   = kThreads / kWarpSize;
+    const int tid          = static_cast<int>(threadIdx.x);
+    const std::int64_t row = blockIdx.x;
+
+    const uint4 x_vec = x[row * kThreads + tid];
+    const uint4 w_vec = weight[tid];
+    const auto* x_pairs = reinterpret_cast<const __nv_bfloat162*>(&x_vec);
+    float2 xf[4];
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        xf[j] = __bfloat1622float2(x_pairs[j]);
+        sum += xf[j].x * xf[j].x + xf[j].y * xf[j].y;
+    }
+
+    __shared__ float warp_sums[kWarps];
+    __shared__ float inv_shared;
+    sum = warp_reduce_sum(sum);
+    if ((tid & (kWarpSize - 1)) == 0) { warp_sums[tid / kWarpSize] = sum; }
+    __syncthreads();
+    if (tid < kWarpSize) {
+        float total = tid < kWarps ? warp_sums[tid] : 0.0f;
+        total       = warp_reduce_sum(total);
+        if (tid == 0) { inv_shared = rsqrtf(total * (1.0f / 5120.0f) + eps); }
+    }
+    __syncthreads();
+    const float inv = inv_shared;
+
+    const auto* w_pairs = reinterpret_cast<const __nv_bfloat162*>(&w_vec);
+    OutPair result[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 wf = __bfloat1622float2(w_pairs[j]);
+        result[j]       = rmsnorm_pack<OutPair>(rmsnorm_epilogue<Epilogue>(xf[j].x, inv, wf.x, 0.0f),
+                                                rmsnorm_epilogue<Epilogue>(xf[j].y, inv, wf.y, 0.0f));
+    }
+    out[row * kThreads + tid] = *reinterpret_cast<const uint4*>(result);
+}
+
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
 // values per lane. The launcher admits only widths evenly divisible by the CTA vector span.
-template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool Prefetch, int FixedD = 0>
+template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool Prefetch, int FixedD = 0,
+          class OutPair = __nv_bfloat162>
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                   const __nv_bfloat162* z, __nv_bfloat162* out,
+                                   const __nv_bfloat162* z, OutPair* out,
                                    std::int32_t input_d, std::int64_t rows, float eps) {
     const int d = FixedD ? FixedD : input_d;
     static_assert(Block % kWarpSize == 0);
@@ -198,7 +269,7 @@ __launch_bounds__(Block) __global__
             float2 zf{0.0f, 0.0f};
             if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_pair); }
             out[row_base + pair] =
-                __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
+                rmsnorm_pack<OutPair>(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
         }
     }

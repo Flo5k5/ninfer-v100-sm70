@@ -49,9 +49,10 @@ namespace {
 
 void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                   const Tensor* z, Tensor& out, cudaStream_t stream) {
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || out.dtype != DType::BF16 ||
+    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
+        (out.dtype != DType::BF16 && out.dtype != DType::FP16) ||
         (z != nullptr && z->dtype != DType::BF16)) {
-        throw std::invalid_argument("rmsnorm: x/weight/z/out must be BF16");
+        throw std::invalid_argument("rmsnorm: x/weight/z must be BF16 and out BF16 or FP16");
     }
     if (!(eps > 0.0f) || !std::isfinite(eps)) {
         throw std::invalid_argument("rmsnorm: eps must be positive and finite");

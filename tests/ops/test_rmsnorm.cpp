@@ -3,7 +3,10 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 
+#include <cuda_fp16.h>
+
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -113,6 +116,58 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
     return failures;
 }
 
+// FP16 output is the BF16 result staged to fp16 (the Volta QPN GEMVs' activation copy): it must
+// match converting the BF16 output bit for bit, including through a captured graph.
+int run_fp16_case(const std::string& label, const Shape& shape, bool unit_offset,
+                  std::uint32_t seed, float input_scale = 4.0F) {
+    const std::size_t count = shape.elements();
+    std::vector<float> input(count), weight(shape.d);
+    fill_uniform(input, seed, -input_scale, input_scale);
+    fill_uniform(weight, seed + 1U, -1.5F, 1.5F);
+    round_to_bf16(input);
+    round_to_bf16(weight);
+    DeviceInput device_input  = make_input(input, false);
+    DeviceInput device_weight = make_input(weight, false);
+    GuardedDeviceBuffer bf16_output(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer fp16_output(count * sizeof(std::uint16_t));
+    bf16_output.fill(0xff);
+    fp16_output.fill(0xff);
+    Tensor input_tensor = tensor_for(device_input.data, shape);
+    Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
+    Tensor bf16_tensor = tensor_for(bf16_output.data(), shape);
+    Tensor fp16_tensor = tensor_for(fp16_output.data(), shape);
+    fp16_tensor.dtype  = DType::FP16;
+
+    DeviceContext device;
+    ops::rmsnorm(input_tensor, weight_tensor, kEps, unit_offset, bf16_tensor, device.stream);
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    definition.capture(device.stream, [&] {
+        ops::rmsnorm(input_tensor, weight_tensor, kEps, unit_offset, fp16_tensor, device.stream);
+    });
+    graph.instantiate(definition);
+    graph.launch(device.stream);
+    cuda_synchronize(device.stream);
+
+    std::vector<std::uint16_t> bf16_bits(count), fp16_bits(count);
+    CUDA_CHECK(cudaMemcpy(bf16_bits.data(), bf16_output.data(), count * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(fp16_bits.data(), fp16_output.data(), count * 2, cudaMemcpyDeviceToHost));
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uint32_t widened = static_cast<std::uint32_t>(bf16_bits[i]) << 16;
+        float value                 = 0.0F;
+        std::memcpy(&value, &widened, sizeof(value));
+        const __half expected = __float2half_rn(value);
+        std::uint16_t expected_bits = 0;
+        std::memcpy(&expected_bits, &expected, sizeof(expected_bits));
+        if (expected_bits != fp16_bits[i]) {
+            std::cerr << label << ": FP16 output " << i << " is 0x" << std::hex << fp16_bits[i]
+                      << ", staged BF16 gives 0x" << expected_bits << std::dec << '\n';
+            return 1;
+        }
+    }
+    return verify_output_storage(label + " fp16 output", fp16_output, false);
+}
+
 } // namespace
 
 int main() {
@@ -176,6 +231,12 @@ int main() {
             failures += run_case("rmsnorm QK scale/unaligned", {256, 4, 17}, offset, 2002U, scale,
                                  true, true);
         }
+    for (int t : {1, 5, 32, 129})
+        for (bool offset : {false, true})
+            failures += run_fp16_case("rmsnorm hidden5120 FP16 T=" + std::to_string(t) +
+                                          (offset ? " offset" : " plain"),
+                                      {5120, 1, t}, offset, 2100U + t);
+    failures += run_fp16_case("rmsnorm hidden5120 FP16 large", {5120, 1, 5}, true, 2200U, 4096.F);
     std::cout << (failures ? "FAIL" : "OK") << " rmsnorm\n";
     return failures ? 1 : 0;
 }
