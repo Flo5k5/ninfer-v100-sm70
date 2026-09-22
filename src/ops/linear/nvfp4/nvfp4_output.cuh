@@ -30,6 +30,21 @@ struct Nvfp4ContiguousOutput {
     }
 };
 
+// Adds the projection into a BF16 residual stream in place: one fp32 add and a single BF16
+// round, where materializing the projection first and running residual_add rounds twice and costs
+// a second launch (the FP8 sibling's Fp8ResidualOutput). Each (row, token) is owned by exactly one
+// thread of one CTA, so the read-modify-write needs no atomics.
+struct Nvfp4ResidualOutput {
+    __nv_bfloat16* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        const std::int64_t index = static_cast<std::int64_t>(token) * rows + parent_row;
+        data[index]              = __float2bfloat16_rn(value + __bfloat162float(data[index]));
+    }
+};
+
 // Writes the mma accumulator straight through, no BF16 round. Exists for split-projection SwiGLU
 // (see nvfp4_linear_swiglu_qpn_split.cuh): two independent QPN2 launches -- one per weight half,
 // unmodified, at whatever schedule QPN2 already measured fastest for this shape -- write gate and
