@@ -26,6 +26,10 @@ void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t)
 // 5120x17408 down projection (114 us with in-loop conversion, 88 us without).
 void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const Weight& w, const void* x_fp16, Tensor& out,
                                  cudaStream_t stream);
+// residual += x * W^T in the QPN epilogue (one BF16 round, no materialized projection). x_fp16 is
+// the caller's staged fp16 copy of x, or nullptr for the in-loop conversion.
+void launch_nvfp4_volta_qpn_residual(const Tensor& x, const Weight& w, const void* x_fp16,
+                                     Tensor& residual, cudaStream_t stream);
 [[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                              std::int32_t t) noexcept;
 
