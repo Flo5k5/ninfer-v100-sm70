@@ -1,12 +1,16 @@
 #pragma once
 
 #include "ninfer_bench_common.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
+#endif
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -276,6 +280,10 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k) {
     weight.scale_nb[1]      = static_cast<std::int64_t>(n) * 2;
     weight.scale_nb[2]      = weight.scale_nb[1];
     weight.scale_nb[3]      = weight.scale_nb[1];
+#ifdef NINFER_VOLTA_BUILD
+    // Production prepacks every QPN-consumed FP8 weight at load (bindings.cpp).
+    if (std::getenv("NINFER_BENCH_PREPACK") != nullptr) { ops::detail::fp8_prepack_qpn_sm70(weight); }
+#endif
     return result;
 }
 
