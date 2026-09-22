@@ -103,6 +103,9 @@ struct Variant {
     // in which the caller's RMSNorm writes the copy the QPN GEMVs would otherwise stage.
     [[nodiscard]] static bool post_mixer_takes_fp16(const PostMixerWeights& weights,
                                                     std::int32_t tokens);
+    // True when gdn_output_projection takes an FP16 `hidden` at this width (the caller's gated
+    // RMSNorm then writes the QPN GEMV's fp16 copy itself).
+    [[nodiscard]] static bool gdn_output_takes_fp16(const Weight& weight, std::int32_t tokens);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 
