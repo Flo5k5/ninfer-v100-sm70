@@ -12,6 +12,13 @@ namespace ninfer::ops::detail {
 using Q4Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 #ifdef NINFER_VOLTA_BUILD
+// Register-streamed T=1 GEMV (q4_volta_gemv.cu) for the MTP proposal head; falls back to
+// launch_q4_gemv_r4_w1_direct outside its layout and alignment contract.
+void launch_q4_volta_gemv_t1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+[[nodiscard]] bool q4_volta_gemv_t1_supported(const Tensor& x, const Weight& w) noexcept;
+#endif
+
+#ifdef NINFER_VOLTA_BUILD
 // Fused-dequant tensor-core route (see q4_volta_mma_gemm.cuh). Kept out of the Q4Launch table
 // deliberately: split-K needs an fp32 accumulation workspace, which that signature cannot carry.
 // `weight_row_offset` selects a contiguous row band of a parent weight; see the Q5 sibling.
