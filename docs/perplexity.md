@@ -118,6 +118,15 @@ artifact tokenizer produced different ids, a different chunk count, or a differe
 prefix that `kld.py compare --chunks N` compares. It also rejects a logits row width that differs
 from the reference vocabulary.
 
+Two engine differences are measured and small. llama.cpp normalizes over all 248,320 rows, NInfer
+over the 248,077-token domain; with Qwen3.8-27B the padding rows hold a probability mass of 1.0e-6
+on average (at most 4e-5) in llama.cpp, which biases a cross-engine KLD by about as much. NInfer's
+output head writes BF16 logits: rounding FP32 logits to BF16 costs a KLD of 0.00023 nat on average
+(p99 0.001, matching the uniform-rounding estimate `0.5 sum p(1-p) step^2/12`) but flips the top-1
+token at 1.7% of positions, where two candidates are within one BF16 step (0.125 for logits in
+[16, 32)). Compare top-1 agreement between runs of the same engine; against an FP32-logits
+reference, a BF16-logits run starts about 1.5 points lower.
+
 Because of the 16-nat window, a target less likely than `max_prob*e^-16` is counted at the floor, so
 perplexity recomputed from dumps slightly under-counts very surprising tokens (llama.cpp's
 `PPL(base)` has the same bias). Each run also reports the unclamped perplexity of the same positions:
