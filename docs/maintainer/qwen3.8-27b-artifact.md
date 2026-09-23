@@ -913,3 +913,47 @@ python3 -m tools.convert.qwen3_8_27b.convert \
 The converter validates the official and DFlash2 checkpoints, frontend resources, complete object
 plan, and numeric recipes before opening the output, then writes the sibling
 `qwen3_8_27b.ninfer.conversion.json` report.
+
+## 14. `nvfp4-full-a` derived artifact (sm_70)
+
+`nvfp4-full-a` is the first step of moving the FP8 roles of an `nvfp4` artifact to NVFP4. It is
+derived from an existing `nvfp4` artifact rather than converted from scratch:
+
+```text
+model_id   = qwen3.8-27b
+weights_id = nvfp4-full-a
+recipe_id  = qwen3_8_27b_nvfp4-full-a
+```
+
+Relative to Section 1, only these objects change:
+
+| Role | Layers | Format before | Format after |
+|---|---|---|---|
+| MLP gate/up and down | `56..63` | `FP8_E4M3FN_ROW_BF16S` | `NVFP4` |
+| `text/output_head` | - | `FP8_E4M3FN_ROW_BF16S` | `NVFP4` |
+
+Bindings, the token embedding (still FP8), attention, GDN, MTP, the proposal head, Vision and
+DFlash2 objects are copied byte for byte. The rewritten Uses switch to `AllowA4` and gain an
+`activation_input_divisor` auxiliary; the three Uses of `text/output_head` (text, MTP and DFlash2
+hidden states) share one divisor object. These input divisors are not calibrated: the MLP ones
+repeat the nearest calibrated layer (55) and the output head uses 1.0. sm_70 runs every NVFP4
+matrix with 16-bit activations and never scales by them.
+
+The new matrices use the round-to-nearest quantizer of `tools/convert/common/nvfp4_quantize.py`:
+one FP32 divisor `448 * 6 / amax` per parent (gate and up share it), a BF16-rounded `amax / 6` per
+16-element block multiplied by the divisor and rounded to E4M3FN, and E2M1 codes rounded to
+nearest with ties to even. With the published divisor it reproduces the compressed-tensors NVFP4
+words of the source bit for bit. Values come from BF16 matrices, or from dequantized row-scaled
+FP8 matrices when `--mlp-source` names a compressed-tensors checkpoint (a double quantization,
+recorded in `provenance.rewrite`).
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.rewrite_nvfp4 \
+  --base out/qwen3_8_27b_nvfp4.ninfer \
+  --source /path/to/Qwen3.8-27B-BF16 \
+  --out out/qwen3_8_27b_nvfp4_stageA.ninfer --verify
+```
+
+The artifact binds through `Qwen38Nvfp4FullA`. Its output head runs through `linear()` on the
+Volta QPN2 route (prepacked at load); `linear_topk` has no NVFP4 vocabulary route, so DFlash2 is
+refused at load with this profile and MTP is the supported speculative backend.
