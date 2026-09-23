@@ -36,7 +36,7 @@ bool is_bf16_attention_output(std::size_t layer) { return layer == 3 || layer ==
 
 bool is_bf16_gdn_output(std::size_t layer) { return layer == 4; }
 
-NumericFormat endpoint_format(WeightsProfile weights_profile) {
+NumericFormat token_embedding_format(WeightsProfile weights_profile) {
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
         return NumericFormat::Q6G64_F16S;
@@ -44,9 +44,22 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
     case WeightsProfile::Qwen36Nvfp4:
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4FullA:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
     }
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+}
+
+// The output head shares the embedding format except where a profile moves it to NVFP4 alone:
+// the embedding gather reads rows directly and has no NVFP4 route.
+NumericFormat output_head_format(WeightsProfile weights_profile) {
+    if (weights_profile == WeightsProfile::Qwen38Nvfp4FullA) { return NumericFormat::NVFP4; }
+    return token_embedding_format(weights_profile);
+}
+
+// First MLP layer the Qwen3.8 NVFP4 profiles keep in FP8 (kTextLayers: every MLP is NVFP4).
+std::size_t qwen38_first_fp8_mlp_layer(WeightsProfile weights_profile) {
+    return weights_profile == WeightsProfile::Qwen38Nvfp4FullA ? kTextLayers : 56;
 }
 
 std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::uint64_t offset,
@@ -355,7 +368,8 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
     }
 }
 
-void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
+void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out,
+                                   std::size_t first_fp8_mlp_layer) {
     constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
@@ -395,7 +409,7 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (layer < 56) {
+        if (layer < first_fp8_mlp_layer) {
             target.mlp.gate_up =
                 bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
                                   prefix + "mlp/gate_up_projection/input_scale_divisor");
@@ -485,9 +499,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
 
-    const NumericFormat vocabulary_format = endpoint_format(weights_profile);
-    out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+    const NumericFormat head_format = output_head_format(weights_profile);
+    if (head_format == NumericFormat::NVFP4 && features.dflash2()) {
+        // DFlash2 ranks its full-head candidates with linear_topk, which has W8 and FP8 vocabulary
+        // routes only. MTP reads the head through linear() and is unaffected.
+        throw std::invalid_argument(
+            "DFlash2 is not supported with the NVFP4 output head of this artifact; use --spec mtp");
+    }
+    out.token_embedding = bind_weight(binder, "text/token_embedding",
+                                      token_embedding_format(weights_profile), {248320, 5120});
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -497,14 +517,19 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         bind_nvfp4_text_layers(binder, out);
         break;
     case WeightsProfile::Qwen38Nvfp4:
-        bind_qwen38_nvfp4_text_layers(binder, out);
+    case WeightsProfile::Qwen38Nvfp4FullA:
+        bind_qwen38_nvfp4_text_layers(binder, out, qwen38_first_fp8_mlp_layer(weights_profile));
         break;
     default:
         throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
+    out.output_head =
+        head_format == NumericFormat::NVFP4
+            ? bind_nvfp4_weight(binder, "text/output_head", 248320, 5120,
+                                "text/output_head_projection/input_scale_divisor")
+            : bind_weight(binder, "text/output_head", head_format, {248320, 5120});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
@@ -630,6 +655,14 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {5120});
     output_head = materialized_weight(backing, plan.output_head, 248320, 5120);
+#ifdef NINFER_VOLTA_BUILD
+    // Every consumer reads the head through linear(), whose Volta NVFP4 route for this shape is
+    // QPN2; its prepacked kernel batches the group loads. FP8 heads are prepacked by
+    // materialized_weight.
+    if (output_head.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(output_head);
+    }
+#endif
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
