@@ -41,8 +41,17 @@ struct KldBaseHeader {
 
 [[nodiscard]] KldBaseHeader read_kld_base_header(const std::filesystem::path& path);
 
+// Rejects a run whose evaluated tokens differ from a reference dump, before any scoring time is
+// spent. `chunks` windows of `context` tokens are evaluated from the start of `tokens`. Without
+// `prefix` the reference must hold exactly `chunks` windows; with it (a --chunks run) it may hold
+// more, and only the first chunks*context tokens are compared, as `kld.py compare --chunks` does.
+void check_reference_tokens(const KldBaseHeader& reference, std::uint32_t context,
+                            std::size_t chunks, std::span<const TokenId> tokens, bool prefix);
+
 // ScoreLogitsSink that writes a dump for the windows of plan_kld_chunks(). The file is written as
-// `<path>.partial` and renamed by finish(); an unfinished writer deletes its partial file.
+// `<path>.partial` and renamed by finish(); an unfinished writer deletes its partial file. The
+// constructor creates the partial file, so an unwritable destination fails before scoring; it
+// refuses an existing destination or a stale partial file left by an interrupted run.
 class KldBaseWriter final : public ScoreLogitsSink {
 public:
     // `tokens` is the evaluated stream prefix of exactly chunks*context tokens. A set
@@ -70,6 +79,7 @@ public:
 
 private:
     void open(std::uint32_t vocab, std::uint32_t valid_rows);
+    void require_space(std::uint32_t vocab) const;
 
     std::filesystem::path path_;
     std::filesystem::path partial_path_;
