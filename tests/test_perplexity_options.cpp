@@ -37,6 +37,20 @@ int main() {
     const auto sliding = parse({"model.ninfer", "--text", "t.txt"});
     failures += check(sliding.context == 4096 && sliding.stride == 2048 && !sliding.logits_out,
                       "sliding windows default to context 4096, stride 2048");
+    failures += check(sliding.prefill_chunk == 1024 && sliding.scored_chunk == 0,
+                      "scoring defaults to 1024-token prefill chunks for every target");
+    const auto narrow = parse({"model.ninfer", "--text", "t.txt", "--prefill-chunk", "2048",
+                               "--scored-chunk", "5"});
+    failures += check(narrow.prefill_chunk == 2048 && narrow.scored_chunk == 5,
+                      "--prefill-chunk and --scored-chunk are parsed");
+    failures += check(rejects([] {
+                          (void)parse({"model.ninfer", "--text", "t.txt", "--prefill-chunk", "1000"});
+                      }),
+                      "--prefill-chunk must be a multiple of 128");
+    failures += check(rejects([] {
+                          (void)parse({"model.ninfer", "--text", "t.txt", "--scored-chunk", "2048"});
+                      }),
+                      "--scored-chunk must not exceed the prefill chunk");
     failures +=
         check(rejects([] { (void)parse({"model.ninfer", "--text", "t.txt", "--context", "512"}); }),
               "a sliding plan still rejects the default stride above a small context");

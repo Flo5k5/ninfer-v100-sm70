@@ -1041,7 +1041,8 @@ ProgramImplCore::~ProgramImplCore() noexcept {
 
 std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                                                  std::uint32_t first_target,
-                                                 ScoreLogitsSink* logits_sink) {
+                                                 ScoreLogitsSink* logits_sink,
+                                                 CausalScoreOptions options) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -1146,7 +1147,14 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
 
         std::uint32_t cursor = 0;
         while (cursor < predictor_count) {
-            const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
+            std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
+            if (options.scored_chunk != 0) {
+                // The unscored history keeps prefill chunks; the scored region starts on its own
+                // chunk boundary and advances at the requested decode/verify width.
+                nominal = cursor < scored_predictor_begin
+                              ? std::min(nominal, scored_predictor_begin - cursor)
+                              : std::min(nominal, options.scored_chunk);
+            }
             schedule::PrefillContext schedule_state{
                 {device, model, work, state_images->linear(), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head},
