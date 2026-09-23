@@ -2,6 +2,7 @@
   "corpus_id": "ninfer-kld-v1",
   "context": 4096,
   "chunks": 32,
+  "rounds": 4,
   "slack_tokens": 64,
   "sources": [
     {"id": "wikitext-00", "domain": "english_reference", "path": "../perplexity-1m/data/wikitext/00.txt", "tokens": 28672},

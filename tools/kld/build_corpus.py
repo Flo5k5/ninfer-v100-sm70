@@ -3,7 +3,9 @@
 
 llama-perplexity evaluates one text file as one token stream, so every compared run (llama.cpp and
 ninfer-perplexity --logits-out) scores the same file. This tool concatenates the corpus sources of
-a manifest, cutting each source at a line boundary once it reaches its token budget, and writes:
+a manifest, cutting each source at a line boundary once it reaches its token budget. With
+`"rounds": R`, the budgets are split into R interleaved rounds, so the first chunks/R windows (and
+any whole number of rounds) sample every domain in proportion. It writes:
 
     corpus.txt      UTF-8 text, no trailing newline (llama-perplexity strips one)
     tokens.bin      the token stream of corpus.txt, int32 little-endian
@@ -83,28 +85,43 @@ def build(manifest_path: Path, tokenize: Tokenizer) -> tuple[str, list[int], dic
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     context = int(manifest["context"])
     chunks = int(manifest["chunks"])
+    rounds = int(manifest.get("rounds", 1))
     evaluated = context * chunks
     sources = manifest["sources"]
     if sources[-1]["tokens"] != "rest" or any(s["tokens"] == "rest" for s in sources[:-1]):
         raise ValueError("only the last source may take the remaining token budget")
+    if rounds < 1 or chunks % rounds:
+        raise ValueError("chunks must be a multiple of rounds")
 
+    texts = []
+    for source in sources:
+        path = (manifest_path.parent / source["path"]).resolve()
+        text = path.read_text(encoding="utf-8")
+        check_text(text, str(path))
+        texts.append(text)
+
+    # Every round takes 1/rounds of each budget, so the first chunks*k/rounds windows hold a
+    # proportional sample of every domain and `--chunks` subsets stay balanced.
     parts: list[tuple[dict[str, Any], str]] = []
     assigned = 0
-    for index, source in enumerate(sources):
-        path = (manifest_path.parent / source["path"]).resolve()
-        # Leading whitespace would merge with the separator into different tokens.
-        text = path.read_text(encoding="utf-8").lstrip()
-        check_text(text, str(path))
-        last = index == len(sources) - 1
-        # The last source fills the evaluated windows; the slack keeps the final window complete
-        # even if a boundary token merges differently in the joined stream.
-        budget = evaluated - assigned + int(manifest.get("slack_tokens", 64)) if last \
-            else int(source["tokens"])
-        if budget <= 0:
-            raise ValueError("the fixed budgets already exceed chunks*context tokens")
-        segment = cut_at_budget(text, budget, tokenize)
-        parts.append((source, segment))
-        assigned += len(tokenize(segment + ("" if last else SEPARATOR)))
+    for round_index in range(rounds):
+        for index, source in enumerate(sources):
+            last = index == len(sources) - 1
+            if last:
+                # The last source fills the round's windows; the slack keeps the final window
+                # complete even if a boundary token merges differently in the joined stream.
+                slack = int(manifest.get("slack_tokens", 64)) if round_index == rounds - 1 else 0
+                budget = evaluated * (round_index + 1) // rounds - assigned + slack
+            else:
+                budget = int(source["tokens"]) // rounds
+            if budget <= 0:
+                raise ValueError("the fixed budgets already exceed chunks*context tokens")
+            # Leading whitespace would merge with the separator into different tokens.
+            text = texts[index].lstrip()
+            segment = cut_at_budget(text, budget, tokenize)
+            texts[index] = text[len(segment):]
+            parts.append((source, segment))
+            assigned += len(tokenize(segment + SEPARATOR))
 
     corpus = SEPARATOR.join(segment for _, segment in parts)
     tokens = tokenize(corpus)
@@ -120,7 +137,8 @@ def build(manifest_path: Path, tokenize: Tokenizer) -> tuple[str, list[int], dic
             raise ValueError(f"segment {source['id']} does not end on a token boundary")
         begin = segments[-1]["token_end"] if segments else 0
         segments.append({"id": source["id"], "domain": source["domain"], "source": source["path"],
-                         "characters": len(segment), "token_begin": begin,
+                         "round": index // len(sources), "characters": len(segment),
+                         "token_begin": begin,
                          "token_end": len(prefix)})
         offset = end
 
@@ -130,6 +148,7 @@ def build(manifest_path: Path, tokenize: Tokenizer) -> tuple[str, list[int], dic
         "corpus_id": manifest["corpus_id"],
         "context": context,
         "chunks": chunks,
+        "rounds": rounds,
         "scored_positions": chunks * (context - 1 - context // 2),
         "token_count": len(tokens),
         "evaluated_tokens": {"context": context, "chunks": chunks, "count": evaluated,
