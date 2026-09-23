@@ -170,8 +170,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             reference = ninfer::perplexity::read_kld_base_header(*options.logits_reference);
             ninfer::perplexity::check_reference_tokens(*reference, options.context, chunks,
                                                        stream.tokens, options.chunks.has_value());
-            logger->info("tokenization matches the reference dump | {} chunks | {} tokens", chunks,
-                         ninfer::product::format_pretty_count(reference->tokens.size()));
+            logger->info("tokenization matches the reference dump | {} of {} chunks | {} tokens",
+                         chunks, reference->chunks,
+                         ninfer::product::format_pretty_count(chunks * options.context));
         }
         logits_writer = std::make_unique<KldBaseWriter>(
             *options.logits_out, options.context, static_cast<std::uint32_t>(chunks),
