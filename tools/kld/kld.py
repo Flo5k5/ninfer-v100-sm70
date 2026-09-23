@@ -11,12 +11,14 @@ Subcommands:
 
 KLD uses llama.cpp's definition, with the candidate read from its 16-bit clamped dump rather than
 from unquantized logits (see tools/kld/compare.py). Dumps clamp log-probabilities 16 nats below
-the top token, so `--exact-ppl NAME=SOURCE` attaches the unclamped perplexity each run prints: a
-number, a ninfer-perplexity report.json or a llama-perplexity log, which must cover the compared
-windows. The gate uses it whenever both compared runs provide it.
+the top token, so `--exact-ppl NAME=SOURCE` attaches the unclamped perplexity each run prints,
+which must cover the compared windows: VALUE@N, a llama-perplexity log (LOG or LOG@N) or a
+ninfer-perplexity report.json (see tools/kld/exact_ppl.py). The gate uses it whenever both
+compared runs provide it.
 
 Exit codes: 0 success (gate: PASS), 1 gate FAIL, 2 unusable input (missing or malformed file,
-mismatched runs, results that are not compare results).
+mismatched runs, results that are not compare results, non-finite or non-positive values),
+3 internal error (with a traceback).
 """
 
 from __future__ import annotations
@@ -25,11 +27,13 @@ import argparse
 import json
 import re
 import sys
+import traceback
 from pathlib import Path
 from typing import Any, Sequence
 
-from tools.kld.compare import compare, read_exact_ppl
+from tools.kld.compare import compare
 from tools.kld.dump import DumpError, read_dump
+from tools.kld.exact_ppl import read_exact_ppl
 from tools.kld.gate import DEFAULT_GATE, gate
 
 
@@ -114,7 +118,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     compare_parser.add_argument("--exact-ppl", action="append", default=[],
                                 metavar="NAME=SOURCE",
                                 help="unclamped PPL of a run (NAME 'reference' or a candidate): "
-                                     "a number, a ninfer report.json or a llama-perplexity log")
+                                     "VALUE@N, a llama-perplexity log (LOG or LOG@N) or a "
+                                     "ninfer report.json")
 
     gate_parser = commands.add_parser("gate", help="apply the quantization quality gate")
     gate_parser.add_argument("--results", required=True, nargs="+", type=Path,
@@ -154,19 +159,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_compare(document)
             _write_json(args.json, document)
             return 0
-        documents = [json.loads(path.read_text(encoding="utf-8")) for path in args.results]
+        documents = []
+        for path in args.results:
+            try:
+                documents.append(json.loads(path.read_text(encoding="utf-8")))
+            except json.JSONDecodeError as error:
+                raise DumpError(f"{path}: not valid JSON ({error})") from None
         limits = {key: getattr(args, key) for key in DEFAULT_GATE}
         verdict = gate(documents, prod=args.prod, candidate=args.candidate,
                        ceiling=args.ceiling, previous=args.previous, limits=limits)
         _print_gate(verdict)
         _write_json(args.json, verdict)
         return 0 if verdict["passed"] else 1
-    except (DumpError, OSError, ValueError) as error:
+    except (DumpError, OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
         print(f"kld: error: {error}", file=sys.stderr)
         return 2
-    except KeyError as error:
-        print(f"kld: error: missing field {error} in the input", file=sys.stderr)
-        return 2
+    except Exception:  # an internal error must not read as a gate FAIL (exit code 1)
+        traceback.print_exc()
+        print("kld: internal error", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

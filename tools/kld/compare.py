@@ -9,9 +9,9 @@ Qwen3.5-9B comparison this moved the mean KLD by about 1.2% (0.00015 nat) and to
 distributions; perplexity is exp(mean NLL of the target tokens).
 
 The dump format clamps every log-probability to [max_log_prob - 16, max_log_prob], so the dump
-perplexity under-counts very surprising targets (llama.cpp's "PPL(base)" has the same bias). Each
-run also prints the unclamped perplexity of its positions: `read_exact_ppl` reads it, with the
-number of windows it covers, from a ninfer-perplexity report.json or a llama-perplexity log.
+perplexity under-counts very surprising targets (llama.cpp's "PPL(base)" has the same bias). The
+unclamped perplexity each run prints can be attached if it covers the compared windows (see
+tools/kld/exact_ppl.py).
 """
 
 from __future__ import annotations
@@ -20,53 +20,18 @@ import json
 import math
 import multiprocessing
 import os
-import re
 import sys
 from pathlib import Path
-from typing import Any, NamedTuple, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
 from tools.kld.dump import Dump, DumpError, decode, read_dump
+from tools.kld.exact_ppl import ExactPpl, check_exact_ppl
 
 COMPARE_SCHEMA = "ninfer-kld-compare/1"
 LOG_PROB_FLOOR = -16.0
 PERCENTILES = {"p90": 90.0, "p95": 95.0, "p99": 99.0, "p999": 99.9}
-
-
-class ExactPpl(NamedTuple):
-    """An unclamped perplexity and the number of windows it covers (None: not recorded)."""
-
-    value: float
-    chunks: int | None
-
-
-def read_exact_ppl(source: str) -> ExactPpl:
-    """Unclamped perplexity from a number, a ninfer-perplexity report.json or a llama log.
-
-    A bare number carries no window count and is taken as given; report.json records its window
-    count under `logits_dump.chunks`, and a llama-perplexity log in its
-    "calculating perplexity over N chunks" line.
-    """
-    try:
-        return ExactPpl(float(source), None)
-    except ValueError:
-        pass
-    path = Path(source)
-    text = path.read_text(encoding="utf-8", errors="replace")
-    if path.suffix == ".json":
-        report = json.loads(text)
-        if report.get("execution", {}).get("window_plan") != "kld-chunks":
-            raise DumpError(f"{path}: not a ninfer-perplexity --logits-out report")
-        return ExactPpl(float(report["overall"]["perplexity"]),
-                        int(report["logits_dump"]["chunks"]))
-    values = re.findall(r"Final estimate: PPL = ([0-9.]+)", text)
-    if not values:
-        raise DumpError(f"{path}: no 'Final estimate: PPL' line (llama-perplexity log expected)")
-    chunks = re.findall(r"calculating perplexity over (\d+) chunks", text)
-    if not chunks:
-        raise DumpError(f"{path}: no 'calculating perplexity over N chunks' line")
-    return ExactPpl(float(values[-1]), int(chunks[-1]))
 
 
 def check_comparable(reference: Dump, candidate: Dump) -> None:
@@ -161,28 +126,28 @@ def _summary(kld: np.ndarray, same_top: np.ndarray, nll_reference: np.ndarray,
 
 def load_segments(path: Path, reference: Dump) -> list[dict[str, Any]]:
     path = Path(path)
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise DumpError(f"{path}: not valid JSON ({error})") from None
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("tokens_file"), str) or \
+            not isinstance(manifest.get("segments"), list):
+        raise DumpError(f"{path}: a segments manifest needs tokens_file and segments")
     corpus_tokens = np.fromfile(path.parent / manifest["tokens_file"], dtype="<i4")
     evaluated = reference.tokens.size
     if corpus_tokens.size < evaluated or \
             not np.array_equal(corpus_tokens[:evaluated], reference.tokens):
         raise DumpError(f"{path}: the reference dump did not evaluate the tokens of this corpus")
     segments = manifest["segments"]
-    for segment in segments:
+    for index, segment in enumerate(segments):
+        valid = isinstance(segment, dict) and isinstance(segment.get("domain"), str) and all(
+            isinstance(segment.get(key), int) and not isinstance(segment.get(key), bool)
+            for key in ("token_begin", "token_end"))
+        if not valid:
+            raise DumpError(f"{path}: segment {index} needs domain, token_begin and token_end")
         if segment["token_end"] <= segment["token_begin"]:
-            raise DumpError(f"{path}: empty segment {segment['id']}")
+            raise DumpError(f"{path}: empty segment {segment.get('id', index)}")
     return segments
-
-
-def _check_exact_ppl(exact_ppl: dict[str, ExactPpl], names: set[str], chunks: int) -> None:
-    unknown = set(exact_ppl) - names - {"reference"}
-    if unknown:
-        raise DumpError(f"--exact-ppl names no compared run: {sorted(unknown)}")
-    for name, exact in exact_ppl.items():
-        if exact.chunks is not None and exact.chunks != chunks:
-            raise DumpError(
-                f"--exact-ppl {name} covers {exact.chunks} windows but the comparison uses "
-                f"{chunks}; use the perplexity of the same windows")
 
 
 def compare(reference_path: Path, candidates: Sequence[tuple[str, Path]], *,
@@ -196,7 +161,11 @@ def compare(reference_path: Path, candidates: Sequence[tuple[str, Path]], *,
     if chunks is not None:
         reference = reference.prefix(chunks)
         candidate_dumps = [dump.prefix(chunks) for dump in candidate_dumps]
-    _check_exact_ppl(exact_ppl, {name for name, _ in candidates}, reference.chunks)
+    unknown = set(exact_ppl) - {name for name, _ in candidates} - {"reference"}
+    if unknown:
+        raise DumpError(f"--exact-ppl names no compared run: {sorted(unknown)}")
+    for name, exact in exact_ppl.items():
+        check_exact_ppl(name, exact, reference.chunks, reference.context)
     for candidate in candidate_dumps:
         check_comparable(reference, candidate)
     segments = load_segments(segments_path, reference) if segments_path else None
