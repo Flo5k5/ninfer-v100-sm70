@@ -12,6 +12,11 @@ windows, and a comparison may use it only over the same windows. A source is one
                   logits_dump.chunks windows of logits_dump.context_tokens
 
 A path that exists is always read as a path, even when it ends with @N.
+
+A log holding several appended runs (for example stdout redirected across retries) is read as
+its last run only: the window count, n_ctx, every `[N]` value and the final estimate are all
+taken from the text after the last 'calculating perplexity' line, so a stale earlier run can
+never contribute a number under the wrong context.
 """
 
 from __future__ import annotations
@@ -47,11 +52,16 @@ def _perplexity(text: str, label: str) -> float:
 
 def _from_log(path: Path, window: int | None) -> ExactPpl:
     text = path.read_text(encoding="utf-8", errors="replace")
-    runs = _LOG_RUN.findall(text)
+    runs = list(_LOG_RUN.finditer(text))
     if not runs:
         raise DumpError(f"{path}: no 'calculating perplexity over N chunks, n_ctx=C' line "
                         "(llama-perplexity log expected)")
-    chunks, context = int(runs[-1][0]), int(runs[-1][1])
+    last_run = runs[-1]
+    chunks, context = int(last_run.group(1)), int(last_run.group(2))
+    # Several appended runs (see the module docstring): keep only the text of the last one, so
+    # a [N] value or a Final estimate cannot be read from an earlier run under this run's chunks
+    # and n_ctx.
+    text = text[last_run.start():]
     if window is None:
         values = _LOG_FINAL.findall(text)
         if not values:

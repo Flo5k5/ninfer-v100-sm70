@@ -29,7 +29,7 @@ import re
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from tools.kld.compare import compare
 from tools.kld.dump import DumpError, read_dump
@@ -46,6 +46,17 @@ def _candidate_argument(value: str) -> tuple[str, Path]:
     if not name or not path:
         raise argparse.ArgumentTypeError(f"invalid candidate {value!r}; use NAME=FILE or FILE")
     return name, Path(path)
+
+
+def _bounded_int(minimum: int) -> Callable[[str], int]:
+    """An int argparse type that also rejects values below `minimum`."""
+    def parse(value: str) -> int:
+        parsed = int(value)
+        if parsed < minimum:
+            raise argparse.ArgumentTypeError(f"must be >= {minimum}, got {value!r}")
+        return parsed
+    parse.__name__ = "int"
+    return parse
 
 
 def _print_compare(document: dict[str, Any]) -> None:
@@ -110,9 +121,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     compare_parser.add_argument("--json", type=Path, help="write the machine-readable result")
     compare_parser.add_argument("--per-token-dir", type=Path,
                                 help="also save per-position KLD/NLL arrays as NAME.npz")
-    compare_parser.add_argument("--workers", type=int, default=0,
+    compare_parser.add_argument("--workers", type=_bounded_int(0), default=0,
                                 help="worker processes (default min(16, CPUs))")
-    compare_parser.add_argument("--block-rows", type=int, default=32)
+    compare_parser.add_argument("--block-rows", type=_bounded_int(1), default=32)
     compare_parser.add_argument("--chunks", type=int,
                                 help="compare only the first N windows of every dump")
     compare_parser.add_argument("--exact-ppl", action="append", default=[],
