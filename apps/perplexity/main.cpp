@@ -51,6 +51,7 @@ struct Options {
     std::optional<std::filesystem::path> output;
     std::optional<std::filesystem::path> logits_out;
     std::optional<std::filesystem::path> logits_reference;
+    std::optional<std::uint32_t> chunks;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     bool stride_set                     = false;
@@ -65,7 +66,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
-           "       [--logits-out <file> [--logits-reference <file>]]\n"
+           "       [--logits-out <file> [--logits-reference <file>] [--chunks N]]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -132,6 +133,8 @@ Options parse_options(int argc, char** argv) {
             out.logits_out = std::filesystem::path(value("--logits-out"));
         } else if (option == "--logits-reference") {
             out.logits_reference = std::filesystem::path(value("--logits-reference"));
+        } else if (option == "--chunks") {
+            out.chunks = parse_integer<std::uint32_t>(value("--chunks"), "chunks");
         } else if (option == "--log-level") {
             out.log_level = ninfer::product::parse_log_level(value("--log-level"));
         } else {
@@ -145,9 +148,10 @@ Options parse_options(int argc, char** argv) {
     if (out.context < 2 || out.stride == 0 || out.stride >= out.context) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
     }
-    if (out.logits_reference && !out.logits_out) {
-        usage_error("--logits-reference requires --logits-out");
+    if ((out.logits_reference || out.chunks) && !out.logits_out) {
+        usage_error("--logits-reference and --chunks require --logits-out");
     }
+    if (out.chunks && *out.chunks == 0) { usage_error("--chunks must be positive"); }
     if (out.logits_out) {
         if (!out.text) { usage_error("--logits-out requires --text (one token stream)"); }
         if (out.context < 4) { usage_error("--logits-out requires --context >= 4"); }
@@ -292,6 +296,15 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             options.logits_out
                 ? ninfer::perplexity::plan_kld_chunks(tokens.size(), options.context)
                 : ninfer::perplexity::plan_windows(tokens.size(), options.context, options.stride);
+        if (options.chunks) {
+            // Like llama-perplexity --chunks: the first N windows of the same stream.
+            if (*options.chunks > windows.size()) {
+                throw std::runtime_error("--chunks " + std::to_string(*options.chunks) +
+                                         " exceeds the " + std::to_string(windows.size()) +
+                                         " windows of the stream");
+            }
+            windows.resize(*options.chunks);
+        }
         total_input_tokens += static_cast<std::uint64_t>(tokens.size());
         total_scored_tokens += scored_targets(windows);
         total_windows += static_cast<std::uint64_t>(windows.size());
