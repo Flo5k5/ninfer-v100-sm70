@@ -36,28 +36,13 @@ from safetensors.torch import save_file
 
 from tools.artifact.codecs.direct import decode_direct
 from tools.artifact.codecs.fp8_row import dequantize_fp8_row_scaled
-from tools.artifact.codecs.nvfp4 import decode_nvfp4_words
+from tools.artifact.codecs.nvfp4 import dequantize_nvfp4
 from tools.artifact.codecs.row_split import dequantize_row_split
 from tools.artifact.formats import DIRECT_FORMATS, QUANT_FORMATS
 from tools.artifact.reader import Artifact
 from tools.convert.qwen3_8_27b.graft_single_source import logical_matrix
 
 OUTPUT_DTYPES = {"f16": torch.float16, "f32": torch.float32, "bf16": torch.bfloat16}
-_E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0,
-                      -4.0, -6.0], dtype=torch.float32)
-
-
-def dequantize_nvfp4(payload: bytes, shape: Sequence[int]) -> torch.Tensor:
-    """w = e2m1(code) * e4m3(block scale) / divisor; the even K element is the low nibble."""
-
-    codes, scales, divisor = decode_nvfp4_words(payload, shape)
-    rows, columns = shape
-    nibbles = torch.stack((codes & 0x0F, codes >> 4), dim=2).reshape(rows, columns).long()
-    values = _E2M1[nibbles].reshape(rows, columns // 16, 16)
-    multipliers = scales.view(torch.float8_e4m3fn).float() / divisor.float()
-    return (values * multipliers.unsqueeze(2)).reshape(rows, columns)
-
-
 def decode_object(artifact: Artifact, object_id: str) -> torch.Tensor:
     obj = artifact.by_id[object_id]
     payload = artifact.read_object(object_id)
@@ -140,20 +125,30 @@ def assemble(source: torch.Tensor, parts: list[tuple[str, Any]], decoder: Decode
     return out, sorted(set(formats))
 
 
-def convert(artifact_path: Path, source_dir: Path, out_dir: Path, dtype: torch.dtype) -> dict:
-    artifact = Artifact(artifact_path)
+def convert_artifact(artifact: Artifact, source_dir: Path, out_dir: Path,
+                     dtype: torch.dtype) -> dict:
+    """Write the checkpoint for an open artifact (or any object with its reader interface)."""
+
     decoder = Decoder(artifact)
     routes = text_routes(artifact)
+    shards = sorted(source_dir.glob("*.safetensors"))
+    available: set[str] = set()
+    for shard in shards:
+        with safe_open(str(shard), framework="pt", device="cpu") as handle:
+            available.update(handle.keys())
+    missing = sorted(set(routes) - available)
+    if missing:
+        raise ValueError(f"source checkpoint lacks {len(missing)} routed tensors, e.g. {missing[:3]}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for item in source_dir.iterdir():
         if item.is_file() and item.suffix != ".safetensors":
             shutil.copy2(item, out_dir / item.name)
 
-    report: dict[str, Any] = {"artifact": str(artifact_path), "source": str(source_dir),
-                              "dtype": str(dtype), "tensors": {}}
+    report: dict[str, Any] = {"artifact": str(getattr(artifact, "path", "")),
+                              "source": str(source_dir), "dtype": str(dtype), "tensors": {}}
     written: set[str] = set()
-    for shard in sorted(source_dir.glob("*.safetensors")):
+    for shard in shards:
         tensors: dict[str, torch.Tensor] = {}
         with safe_open(str(shard), framework="pt", device="cpu") as handle:
             metadata = handle.metadata()
@@ -179,11 +174,12 @@ def convert(artifact_path: Path, source_dir: Path, out_dir: Path, dtype: torch.d
         save_file(tensors, str(out_dir / shard.name), metadata=metadata or {"format": "pt"})
         print(f"{shard.name}: {sum(1 for name in tensors if name in written)} text tensors",
               flush=True)
-    missing = sorted(set(routes) - written)
-    if missing:
-        raise ValueError(f"source checkpoint lacks {len(missing)} routed tensors, e.g. {missing[:3]}")
-    artifact.close()
     return report
+
+
+def convert(artifact_path: Path, source_dir: Path, out_dir: Path, dtype: torch.dtype) -> dict:
+    with Artifact(artifact_path) as artifact:
+        return convert_artifact(artifact, source_dir, out_dir, dtype)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
