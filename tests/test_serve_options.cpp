@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -443,6 +444,21 @@ int main() {
                           automatic.kv_capacity.automatic_headroom_bytes ==
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
+
+    setenv("NINFER_API_KEY", "from-environment", 1);
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).api_key == "from-environment",
+                      "NINFER_API_KEY was not used without --api-key");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--api-key", "from-argument"}).api_key ==
+                          "from-argument",
+                      "--api-key did not take precedence over NINFER_API_KEY");
+    setenv("NINFER_API_KEY", "", 1);
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).api_key.empty(),
+                      "an empty NINFER_API_KEY enabled authentication");
+    unsetenv("NINFER_API_KEY");
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).api_key.empty(),
+                      "authentication was enabled without --api-key or NINFER_API_KEY");
+    failures += check(serve_usage_text("ninfer-serve").find("NINFER_API_KEY") != std::string::npos,
+                      "serve help omits NINFER_API_KEY");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});
