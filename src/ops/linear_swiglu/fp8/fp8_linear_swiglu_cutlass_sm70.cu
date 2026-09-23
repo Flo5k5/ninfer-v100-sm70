@@ -29,15 +29,22 @@ namespace {
 // scale is applied once, in FP32, by scale_gate_up_rows_kernel below, after accumulation instead
 // of before.
 __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, int n, int k,
-                                        bool prepacked, cutlass::half_t* __restrict__ out) {
+                                        bool prepacked, bool swiglu_interleave,
+                                        cutlass::half_t* __restrict__ out) {
     const int row      = blockIdx.y;
     const int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int pairs_per_row = k / 2;
     if (row >= n || pair_idx >= pairs_per_row) { return; }
 
     const int k0 = pair_idx * 2;
+    // `row` is logical; the SwiGLU layout stores gate row f and up row f in the same 32-row tile.
+    const int half_n       = n / 2;
+    const int physical_row = !swiglu_interleave ? row
+                             : row < half_n     ? (row / 16) * 32 + (row & 15)
+                                                : ((row - half_n) / 16) * 32 + 16 +
+                                                      ((row - half_n) & 15);
     const std::int64_t source_offset = prepacked
-                                           ? fp8_qpn_prepacked_offset(row, k0, k)
+                                           ? fp8_qpn_prepacked_offset(physical_row, k0, k)
                                            : static_cast<std::int64_t>(row) * k + k0;
     const std::uint16_t packed =
         *reinterpret_cast<const std::uint16_t*>(codes + source_offset);
@@ -158,7 +165,9 @@ void fp8_linear_swiglu_cutlass_sm70_launch(const Tensor& x, const Weight& w, Ten
         const dim3 grid(static_cast<unsigned>(div_up_i(k / 2, 256)), static_cast<unsigned>(n), 1u);
         dequant_fp8_row_to_fp16<<<grid, block, 0, stream>>>(static_cast<const std::uint8_t*>(w.qdata),
                                                             n, k,
-                                                            w.layout == QuantLayout::VoltaQpnPrepacked,
+                                                            w.layout == QuantLayout::VoltaQpnPrepacked ||
+                                                                w.layout == QuantLayout::VoltaQpnPrepackedSwiGlu,
+                                                            w.layout == QuantLayout::VoltaQpnPrepackedSwiGlu,
                                                             w_fp16);
         CUDA_CHECK(cudaGetLastError());
     }

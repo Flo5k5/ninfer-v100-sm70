@@ -296,7 +296,7 @@ int run_profile(std::string_view label, const Profile& profile,
     std::vector<std::uint8_t> expected_weight = host_weight.payload;
 #ifdef NINFER_VOLTA_BUILD
     if (profile.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        ops::detail::fp8_prepack_qpn_sm70(weight);
+        ops::detail::fp8_prepack_qpn_sm70(weight, nullptr, profile.fp8_swiglu_interleave);
         device_weight.copy_to_host(expected_weight.data(), expected_weight.size());
     }
     if (profile.qtype == QType::NVFP4 && profile.nvfp4_prepack) {

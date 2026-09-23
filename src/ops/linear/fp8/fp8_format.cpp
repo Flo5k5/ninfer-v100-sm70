@@ -49,7 +49,8 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
 
     const std::int64_t scale_stride = static_cast<std::int64_t>(weight.n) * 2;
     const bool supported_layout = weight.layout == QuantLayout::RowScale ||
-                                  weight.layout == QuantLayout::VoltaQpnPrepacked;
+                                  weight.layout == QuantLayout::VoltaQpnPrepacked ||
+                                  weight.layout == QuantLayout::VoltaQpnPrepackedSwiGlu;
     if (weight.qtype != QType::FP8_E4M3FN_ROW_BF16S || !supported_layout ||
         weight.scale_dtype != DType::BF16 ||
         weight.group_size != static_cast<std::uint32_t>(weight.k) || weight.group != weight.k ||

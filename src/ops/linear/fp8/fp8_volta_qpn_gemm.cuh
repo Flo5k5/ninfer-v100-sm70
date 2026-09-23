@@ -41,6 +41,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
 namespace ninfer::ops::detail {
@@ -203,21 +204,46 @@ __global__ __launch_bounds__(
     }
     __syncthreads(); // the only barrier: cross-warp K reduce
 
-    constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
-    for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * 32) {
-        const int row  = e / S::kColsPerCta;
-        const int cl   = e % S::kColsPerCta;
-        const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + cl;
-        if (row < t && ocol < n) {
-            float v = 0.0f;
+    if constexpr (fp8_swiglu_pairs_v<OutputPolicy>) {
+        // VoltaQpnPrepackedSwiGlu: columns [0, 16) of this CTA are gate features, [16, 32) the
+        // same up features. Row scales stay in logical order (gate f at f, up f at n/2 + f).
+        constexpr int kHalf  = S::kColsPerCta / 2;
+        constexpr int kPairs = kTiles * S::kRowsPerTile * kHalf;
+        for (int e = static_cast<int>(threadIdx.x); e < kPairs; e += SPLITK * 32) {
+            const int row     = e / kHalf;
+            const int local   = e % kHalf;
+            const int feature = static_cast<int>(blockIdx.x) * kHalf + local;
+            if (row < t && feature < n / 2) {
+                const int gate_index = row * S::kColsPerCta + local;
+                float gate           = 0.0f;
+                float up             = 0.0f;
 #pragma unroll
-            for (int w = 0; w < SPLITK; ++w) { v += cs[w][e]; }
-            // Row scale and the decode's 2^-8, together, once per output element. The store goes
-            // through the caller's policy so the fused attention projections can scatter straight
-            // into their q/gate/k/v (or qkv/z) planes instead of a contiguous buffer they would
-            // then have to split.
-            const float scale = __bfloat162float(scales[ocol]) * 256.0f;
-            output.store(ocol, row, v * scale);
+                for (int w = 0; w < SPLITK; ++w) {
+                    gate += cs[w][gate_index];
+                    up += cs[w][gate_index + kHalf];
+                }
+                const float gate_scale = __bfloat162float(scales[feature]) * 256.0f;
+                const float up_scale   = __bfloat162float(scales[n / 2 + feature]) * 256.0f;
+                output.store_pair(feature, row, gate * gate_scale, up * up_scale);
+            }
+        }
+    } else {
+        constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
+        for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * 32) {
+            const int row  = e / S::kColsPerCta;
+            const int cl   = e % S::kColsPerCta;
+            const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + cl;
+            if (row < t && ocol < n) {
+                float v = 0.0f;
+#pragma unroll
+                for (int w = 0; w < SPLITK; ++w) { v += cs[w][e]; }
+                // Row scale and the decode's 2^-8, together, once per output element. The store
+                // goes through the caller's policy so the fused attention projections can scatter
+                // straight into their q/gate/k/v (or qkv/z) planes instead of a contiguous buffer
+                // they would then have to split.
+                const float scale = __bfloat162float(scales[ocol]) * 256.0f;
+                output.store(ocol, row, v * scale);
+            }
         }
     }
 }
@@ -235,7 +261,8 @@ void launch_fp8_volta_qpn_typed(const Tensor& x, const Weight& w, const Activati
     const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
     const auto* scales = static_cast<const __nv_bfloat16*>(w.scales);
-    const bool prepacked = w.layout == QuantLayout::VoltaQpnPrepacked;
+    const bool prepacked = w.layout == QuantLayout::VoltaQpnPrepacked ||
+                           w.layout == QuantLayout::VoltaQpnPrepackedSwiGlu;
     // Generation-2 winners from a private sweep (bench/ops/fp8_qpn8_splitk_sweep.cu, deleted):
     // SPLITK8 NACC1 wins at every kTiles on attn input, GDN input, and the 17408-K residual shape
     // (1.08-1.55x over SPLITK4). The 6144-K residual shape is the one exception -- SPLITK16 wins
@@ -249,9 +276,11 @@ void launch_fp8_volta_qpn_typed(const Tensor& x, const Weight& w, const Activati
         if (prepacked) {                                                                   \
             fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, true>                           \
                 <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output);    \
-        } else {                                                                           \
+        } else if constexpr (!fp8_swiglu_pairs_v<OutputPolicy>) {                          \
             fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, false>                          \
                 <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output);    \
+        } else {                                                                           \
+            throw std::logic_error("FP8 QPN SwiGLU pairs need the interleaved layout");   \
         }                                                                                  \
     } while (false)
     if (t <= S::kRowsPerTile) {
