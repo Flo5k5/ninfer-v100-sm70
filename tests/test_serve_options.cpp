@@ -285,6 +285,101 @@ int main() {
                   explicit_effort.effective_reasoning_effort == ninfer::ReasoningEffort::Low,
               "explicit reasoning effort did not remain the effective effort");
     request.reasoning_effort.reset();
+
+    const ServeOptions effort_policy =
+        parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "low",
+               "--reasoning-effort-alias", "high=xhigh", "--reasoning-effort-alias", "minimal=low"});
+    failures += check(
+        effort_policy.default_reasoning_effort == RequestedReasoningEffort::Low &&
+            effort_policy.reasoning_effort_aliases[static_cast<std::size_t>(
+                RequestedReasoningEffort::High)] == RequestedReasoningEffort::XHigh &&
+            effort_policy.reasoning_effort_aliases[static_cast<std::size_t>(
+                RequestedReasoningEffort::Minimal)] == RequestedReasoningEffort::Low &&
+            !effort_policy.reasoning_effort_aliases[static_cast<std::size_t>(
+                RequestedReasoningEffort::Max)],
+        "reasoning effort policy flags were not preserved");
+    for (std::vector<std::string> invalid :
+         {std::vector<std::string>{"--default-reasoning-effort", "none"},
+          std::vector<std::string>{"--default-reasoning-effort", "turbo"},
+          std::vector<std::string>{"--reasoning-effort-alias", "high"},
+          std::vector<std::string>{"--reasoning-effort-alias", "high=none"},
+          std::vector<std::string>{"--reasoning-effort-alias", "turbo=low"}}) {
+        invalid.insert(invalid.begin(), {"ninfer-serve", "model.ninfer"});
+        bool rejected = false;
+        try {
+            (void)parse(invalid);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid reasoning effort policy flag was accepted");
+    }
+    const auto defaulted = resolve_prompt_semantics(request, effort_policy, prompt_capabilities);
+    failures += check(defaulted.reasoning_effort == ninfer::ReasoningEffort::Low &&
+                          defaulted.effective_reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "omitted reasoning effort did not take the server default");
+    request.enable_thinking = false;
+    failures += check(
+        !resolve_prompt_semantics(request, effort_policy, prompt_capabilities).reasoning_effort,
+        "server default reasoning effort overrode disabled thinking");
+    request.enable_thinking.reset();
+    ninfer::PromptCapabilities toggle_only;
+    toggle_only.enable_thinking = true;
+    failures += check(
+        !resolve_prompt_semantics(request, effort_policy, toggle_only).reasoning_effort,
+        "server default reasoning effort applied to a template without effort levels");
+    request.reasoning_effort = RequestedReasoningEffort::High;
+    failures += check(resolve_prompt_semantics(request, effort_policy, prompt_capabilities)
+                              .reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "reasoning effort alias did not map high onto xhigh");
+    request.reasoning_effort = RequestedReasoningEffort::XHigh;
+    failures += check(resolve_prompt_semantics(request, effort_policy, prompt_capabilities)
+                              .reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "explicit request effort did not win over the server default");
+    request.reasoning_effort.reset();
+    request.enable_thinking = true;
+    failures += check(resolve_prompt_semantics(request, effort_policy, prompt_capabilities)
+                              .reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "explicitly enabled thinking did not take the server default");
+    request.enable_thinking.reset();
+    const ServeOptions aliased_default =
+        parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "high",
+               "--reasoning-effort-alias", "high=low", "--reasoning-effort-alias", "max=low",
+               "--reasoning-effort-alias", "max=xhigh"});
+    failures += check(resolve_prompt_semantics(request, aliased_default, prompt_capabilities)
+                              .reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "server default did not go through the effort alias");
+    failures += check(aliased_default.reasoning_effort_aliases[static_cast<std::size_t>(
+                          RequestedReasoningEffort::Max)] == RequestedReasoningEffort::XHigh,
+                      "repeated effort alias did not keep the last mapping");
+    const auto policy_rejected = [&](const ServeOptions& server,
+                                     const ninfer::PromptCapabilities& capabilities) {
+        try {
+            validate_reasoning_effort_policy(server, capabilities);
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    failures += check(!policy_rejected(defaults, prompt_capabilities) &&
+                          !policy_rejected(defaults, toggle_only) &&
+                          !policy_rejected(effort_policy, prompt_capabilities) &&
+                          !policy_rejected(aliased_default, prompt_capabilities),
+                      "valid reasoning effort policy was rejected at startup");
+    failures += check(
+        policy_rejected(parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "high"}),
+                        prompt_capabilities) &&
+            policy_rejected(parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort",
+                                   "medium"}),
+                            prompt_capabilities) &&
+            policy_rejected(
+                parse({"ninfer-serve", "model.ninfer", "--reasoning-effort-alias", "high=max"}),
+                prompt_capabilities) &&
+            policy_rejected(effort_policy, toggle_only),
+        "unsupported reasoning effort policy was accepted at startup");
+    request.reasoning_effort = RequestedReasoningEffort::High;
+    bool unaliased_high_rejected = false;
+    try {
+        (void)resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    } catch (const std::exception&) { unaliased_high_rejected = true; }
+    failures += check(unaliased_high_rejected,
+                      "unsupported reasoning effort was accepted without an alias");
+    request.reasoning_effort.reset();
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "server preserve-thinking default was not resolved");
@@ -307,6 +402,13 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
                           std::string::npos,
                       "serve help omits --default-thinking-budget");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--omitted-thinking-as-summarized"})
+                          .omitted_thinking_as_summarized &&
+                          !parse({"ninfer-serve", "model.ninfer"}).omitted_thinking_as_summarized,
+                      "--omitted-thinking-as-summarized was not parsed");
+    failures += check(serve_usage_text("ninfer-serve").find("--reasoning-effort-alias") !=
+                          std::string::npos,
+                      "serve help omits --reasoning-effort-alias");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=

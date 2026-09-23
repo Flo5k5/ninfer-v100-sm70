@@ -106,7 +106,54 @@ std::string render_tool_definition(const ToolDefinition& tool) {
     return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
 }
 
+std::optional<ninfer::ReasoningEffort> template_reasoning_effort(RequestedReasoningEffort effort) {
+    switch (effort) {
+    case RequestedReasoningEffort::Low:
+        return ninfer::ReasoningEffort::Low;
+    case RequestedReasoningEffort::Medium:
+        return ninfer::ReasoningEffort::Medium;
+    case RequestedReasoningEffort::XHigh:
+        return ninfer::ReasoningEffort::XHigh;
+    case RequestedReasoningEffort::None:
+    case RequestedReasoningEffort::Minimal:
+    case RequestedReasoningEffort::High:
+    case RequestedReasoningEffort::Max:
+        break;
+    }
+    return std::nullopt;
+}
+
+RequestedReasoningEffort apply_reasoning_effort_alias(const ServeOptions& server,
+                                                      RequestedReasoningEffort effort) {
+    const auto alias = server.reasoning_effort_aliases[static_cast<std::size_t>(effort)];
+    return alias ? *alias : effort;
+}
+
 } // namespace
+
+void validate_reasoning_effort_policy(const ServeOptions& server,
+                                      const ninfer::PromptCapabilities& capabilities) {
+    const auto require_supported = [&](RequestedReasoningEffort effort, const std::string& origin) {
+        const auto rendered = template_reasoning_effort(effort);
+        if (!capabilities.reasoning_effort.default_effort || !rendered ||
+            !capabilities.reasoning_effort.supports(*rendered)) {
+            throw std::invalid_argument(origin + " resolves to reasoning effort '" +
+                                        std::string(requested_reasoning_effort_name(effort)) +
+                                        "', which the loaded chat template does not support");
+        }
+    };
+    if (server.default_reasoning_effort) {
+        require_supported(apply_reasoning_effort_alias(server, *server.default_reasoning_effort),
+                          "--default-reasoning-effort");
+    }
+    for (std::size_t index = 0; index < server.reasoning_effort_aliases.size(); ++index) {
+        if (const auto target = server.reasoning_effort_aliases[index]) {
+            require_supported(*target, "--reasoning-effort-alias " +
+                                           std::string(requested_reasoning_effort_name(
+                                               static_cast<RequestedReasoningEffort>(index))));
+        }
+    }
+}
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server,
@@ -130,9 +177,14 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         }
         return result;
     };
-    if (!request.reasoning_effort) { return complete(); }
+    std::optional<RequestedReasoningEffort> requested_effort = request.reasoning_effort;
+    if (!requested_effort && result.enable_thinking &&
+        capabilities.reasoning_effort.default_effort) {
+        requested_effort = server.default_reasoning_effort;
+    }
+    if (!requested_effort) { return complete(); }
 
-    const RequestedReasoningEffort requested = *request.reasoning_effort;
+    const RequestedReasoningEffort requested = apply_reasoning_effort_alias(server, *requested_effort);
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
     if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
         invalid_prompt_option("reasoning effort conflicts with enable_thinking", "reasoning_effort",

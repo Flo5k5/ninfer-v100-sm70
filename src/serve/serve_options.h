@@ -2,7 +2,9 @@
 
 #include "ninfer/types.h"
 #include "product/logging/logging.h"
+#include "serve/request.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -18,6 +20,8 @@ inline constexpr int kDefaultMaxTokens                    = 8192;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
+inline constexpr std::size_t kRequestedReasoningEffortCount =
+    static_cast<std::size_t>(RequestedReasoningEffort::Max) + 1;
 
 struct ServeOptions {
     bool help_requested = false;
@@ -52,6 +56,14 @@ struct ServeOptions {
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
     std::optional<std::uint32_t> default_thinking_budget;
+    // Effort for thinking-enabled requests that name none; applies only to templates that
+    // expose reasoning effort.
+    std::optional<RequestedReasoningEffort> default_reasoning_effort;
+    bool omitted_thinking_as_summarized = false; // --omitted-thinking-as-summarized
+    // Per-level substitution applied before template validation, so clients that send a level
+    // the loaded template lacks (Claude Code sends "high") resolve instead of failing.
+    std::array<std::optional<RequestedReasoningEffort>, kRequestedReasoningEffortCount>
+        reasoning_effort_aliases{};
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request

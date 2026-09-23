@@ -487,6 +487,12 @@ int test_thinking_and_count_tokens() {
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
     failures += check(api_code([&] { (void)parse(body); }) == "thinking_display_not_supported",
                       "hidden Thinking was accepted without restore semantics");
+    RequestLimits omitted_as_summarized    = limits();
+    omitted_as_summarized.omitted_thinking_as_summarized = true;
+    const AnthropicMessagesRequest visible =
+        parse_anthropic_messages_request(body, omitted_as_summarized);
+    failures += check(visible.generation.enable_thinking == true,
+                      "omitted Thinking served as summarized did not keep thinking enabled");
 
     body["max_tokens"]                        = 0;
     body["temperature"]                       = "ignored for counting";
