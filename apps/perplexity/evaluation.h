@@ -18,6 +18,12 @@ struct WindowPlan {
 [[nodiscard]] std::vector<WindowPlan> plan_windows(std::size_t tokens, std::uint32_t context,
                                                    std::uint32_t stride);
 
+// The llama.cpp `llama-perplexity` KL-divergence protocol: floor(tokens/context) non-overlapping
+// windows of exactly `context` tokens, each scoring only the targets after its first context/2
+// predictors, i.e. local targets [context/2+1, context). Tokens after the last full window are not
+// evaluated. Requires at least two windows, as llama-perplexity does.
+[[nodiscard]] std::vector<WindowPlan> plan_kld_chunks(std::size_t tokens, std::uint32_t context);
+
 struct ScoreAggregate {
     std::uint64_t scored_tokens = 0;
     double total_nll            = 0.0;

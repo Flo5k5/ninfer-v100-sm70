@@ -1,5 +1,8 @@
 #include "corpus.h"
 #include "evaluation.h"
+#include "logits_dump.h"
+#include "options.h"
+#include "preflight.h"
 
 #include "ninfer/engine.h"
 #include "product/logging/logging.h"
@@ -9,8 +12,6 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
 
-#include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -19,14 +20,14 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <map>
+#include <memory>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -35,120 +36,11 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using json  = nlohmann::json;
 using ninfer::perplexity::CorpusSelection;
+using ninfer::perplexity::KldBaseHeader;
+using ninfer::perplexity::KldBaseWriter;
+using ninfer::perplexity::Options;
 using ninfer::perplexity::ScoreAggregate;
 using ninfer::perplexity::WindowPlan;
-
-struct Options {
-    bool help_requested = false;
-    std::filesystem::path artifact;
-    std::optional<std::filesystem::path> corpus;
-    std::optional<std::filesystem::path> text;
-    std::optional<std::filesystem::path> output;
-    std::uint32_t context               = 4096;
-    std::uint32_t stride                = 2048;
-    int device                          = 0;
-    ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    bool quick                          = false;
-    ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
-};
-
-std::string usage_text() {
-    return "usage: ninfer-perplexity <model.ninfer> "
-           "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
-           "       [--log-level trace|debug|info|warning|error|critical|off]\n";
-}
-
-[[noreturn]] void usage_error(std::string_view message) {
-    throw std::invalid_argument(std::string(message));
-}
-
-template <class Integer>
-Integer parse_integer(std::string_view text, const char* label) {
-    Integer value{};
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (error != std::errc{} || end != text.data() + text.size()) {
-        usage_error(std::string("invalid ") + label + ": " + std::string(text));
-    }
-    return value;
-}
-
-Options parse_options(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        return Options{.help_requested = true};
-    }
-    if (argc < 2 || std::string_view(argv[1]).starts_with("--")) {
-        usage_error("artifact path is required");
-    }
-    Options out;
-    out.artifact = argv[1];
-    for (int i = 2; i < argc; ++i) {
-        const std::string_view option = argv[i];
-        const auto value              = [&](const char* label) -> std::string_view {
-            if (++i >= argc) { usage_error(std::string(label) + " requires a value"); }
-            return argv[i];
-        };
-        if (option == "--corpus") {
-            out.corpus = std::filesystem::path(value("--corpus"));
-        } else if (option == "--text") {
-            out.text = std::filesystem::path(value("--text"));
-        } else if (option == "--quick") {
-            out.quick = true;
-        } else if (option == "--context") {
-            out.context = parse_integer<std::uint32_t>(value("--context"), "context");
-        } else if (option == "--stride") {
-            out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
-        } else if (option == "--device") {
-            out.device = parse_integer<int>(value("--device"), "device");
-        } else if (option == "--kv-dtype") {
-            const std::string_view dtype = value("--kv-dtype");
-            if (dtype == "bf16") {
-                out.kv = ninfer::KvCacheStorage::BFloat16;
-            } else if (dtype == "int8") {
-                out.kv = ninfer::KvCacheStorage::Int8Group64;
-            } else if (dtype == "fp8") {
-                out.kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
-            } else if (dtype == "nvfp4") {
-                out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
-            } else if (dtype == "k8v4") {
-                out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
-            } else {
-                usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
-            }
-        } else if (option == "--output") {
-            out.output = std::filesystem::path(value("--output"));
-        } else if (option == "--log-level") {
-            out.log_level = ninfer::product::parse_log_level(value("--log-level"));
-        } else {
-            usage_error("unknown option: " + std::string(option));
-        }
-    }
-    if (out.corpus.has_value() == out.text.has_value()) {
-        usage_error("exactly one of --corpus and --text is required");
-    }
-    if (out.quick && !out.corpus) { usage_error("--quick requires --corpus"); }
-    if (out.context < 2 || out.stride == 0 || out.stride >= out.context) {
-        usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
-    }
-    return out;
-}
-
-std::string kv_name(ninfer::KvCacheStorage value) {
-    switch (value) {
-    case ninfer::KvCacheStorage::BFloat16:
-        return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
-        return "int8-g64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8-e4m3-r256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    throw std::logic_error("unknown KV dtype");
-}
 
 std::string safe_component(std::string_view value) {
     std::string out;
@@ -169,23 +61,12 @@ std::string timestamp() {
     return out.str();
 }
 
-std::filesystem::path prepare_output_directory(const Options& options,
-                                               const ninfer::LoadSummary& load,
-                                               const CorpusSelection& corpus) {
-    std::filesystem::path output = options.output.value_or(
-        std::filesystem::path("profiles/perplexity") / safe_component(load.model_id) /
-        safe_component(load.weights_id) / kv_name(options.kv) / safe_component(corpus.corpus_id) /
-        safe_component(corpus.mode) / timestamp());
-    if (std::filesystem::exists(output)) {
-        if (!std::filesystem::is_directory(output) ||
-            std::filesystem::directory_iterator(output) != std::filesystem::directory_iterator()) {
-            throw std::runtime_error("output directory exists and is not empty: " +
-                                     output.string());
-        }
-    } else if (!std::filesystem::create_directories(output)) {
-        throw std::runtime_error("cannot create output directory: " + output.string());
-    }
-    return std::filesystem::absolute(output).lexically_normal();
+// Report directory used when --output is omitted; it depends on the loaded artifact.
+std::filesystem::path default_output_path(const Options& options, const ninfer::LoadSummary& load,
+                                          const CorpusSelection& corpus) {
+    return std::filesystem::path("profiles/perplexity") / safe_component(load.model_id) /
+           safe_component(load.weights_id) / ninfer::perplexity::kv_dtype_name(options.kv) /
+           safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp();
 }
 
 double seconds_since(Clock::time_point begin) {
@@ -199,6 +80,12 @@ json aggregate_json(const ScoreAggregate& value) {
                 {"perplexity", value.ppl()}};
 }
 
+std::uint64_t scored_targets(const std::vector<WindowPlan>& windows) {
+    std::uint64_t out = 0;
+    for (const WindowPlan& window : windows) { out += window.target_end - window.target_begin; }
+    return out;
+}
+
 struct EvaluationStream {
     ninfer::perplexity::CorpusStream source;
     std::vector<ninfer::TokenId> tokens;
@@ -209,6 +96,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         ninfer::product::StartupLogRenderer& startup_log,
         const std::shared_ptr<ninfer::product::TerminalProgress>& progress) {
     const Clock::time_point total_started = Clock::now();
+    // Output paths and the reference dump are checked before the model is loaded.
+    const ninfer::perplexity::Preflight preflight = ninfer::perplexity::run_preflight(options);
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path    = options.artifact;
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
@@ -236,9 +125,20 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             throw std::runtime_error("stream tokenized to fewer than two tokens: " + source.id);
         }
         std::vector<WindowPlan> windows =
-            ninfer::perplexity::plan_windows(tokens.size(), options.context, options.stride);
+            options.logits_out
+                ? ninfer::perplexity::plan_kld_chunks(tokens.size(), options.context)
+                : ninfer::perplexity::plan_windows(tokens.size(), options.context, options.stride);
+        if (options.chunks) {
+            // Like llama-perplexity --chunks: the first N windows of the same stream.
+            if (*options.chunks > windows.size()) {
+                throw std::runtime_error("--chunks " + std::to_string(*options.chunks) +
+                                         " exceeds the " + std::to_string(windows.size()) +
+                                         " windows of the stream");
+            }
+            windows.resize(*options.chunks);
+        }
         total_input_tokens += static_cast<std::uint64_t>(tokens.size());
-        total_scored_tokens += static_cast<std::uint64_t>(tokens.size() - 1);
+        total_scored_tokens += scored_targets(windows);
         total_windows += static_cast<std::uint64_t>(windows.size());
         streams.push_back(EvaluationStream{.source  = std::move(source),
                                            .tokens  = std::move(tokens),
@@ -252,8 +152,34 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  ninfer::product::format_pretty_count(total_windows),
                  ninfer::product::format_pretty_duration(preflight_seconds));
 
-    const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
-    const Clock::time_point scoring_started      = Clock::now();
+    // Before the dump writer: an explicit --output was prepared by the preflight, so a dump
+    // inside it can be created now.
+    const std::filesystem::path output_directory =
+        preflight.report_directory ? *preflight.report_directory
+                                   : ninfer::perplexity::prepare_report_directory(
+                                         default_output_path(options, load, corpus));
+    const std::optional<KldBaseHeader>& reference = preflight.reference;
+    std::unique_ptr<KldBaseWriter> logits_writer;
+    if (options.logits_out) {
+        const EvaluationStream& stream = streams.front();
+        const std::size_t chunks       = stream.windows.size();
+        if (reference) {
+            ninfer::perplexity::check_reference_tokens(*reference, options.context, chunks,
+                                                       stream.tokens, options.chunks.has_value());
+            logger->info("tokenization matches the reference dump | {} of {} chunks | {} tokens",
+                         chunks, reference->chunks,
+                         ninfer::product::format_pretty_count(chunks * options.context));
+        }
+        logits_writer = std::make_unique<KldBaseWriter>(
+            *options.logits_out, options.context, static_cast<std::uint32_t>(chunks),
+            std::span<const ninfer::TokenId>(stream.tokens.data(), chunks * options.context),
+            reference ? std::optional<std::uint32_t>(reference->vocab) : std::nullopt);
+        logger->info("logits dump | {} | {} chunks | {} scored positions",
+                     options.logits_out->string(), chunks,
+                     ninfer::product::format_pretty_count(logits_writer->expected_positions()));
+    }
+
+    const Clock::time_point scoring_started = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  ninfer::product::format_pretty_count(streams.size()),
                  ninfer::product::format_pretty_count(total_scored_tokens),
@@ -287,7 +213,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             const Clock::time_point window_started = Clock::now();
             std::vector<float> logprobs;
             try {
-                logprobs = engine.score_tokens(std::move(input), window.first_target);
+                logprobs =
+                    engine.score_tokens(std::move(input), window.first_target, logits_writer.get());
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
@@ -345,7 +272,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         stream_report["domain"]          = stream.source.domain;
         stream_report["path"]            = stream.source.path.string();
         stream_report["input_tokens"]    = stream.tokens.size();
-        stream_report["unscored_tokens"] = 1;
+        stream_report["unscored_tokens"] = stream.tokens.size() - stream_score.scored_tokens;
         stream_report["seconds"]         = stream_seconds;
         stream_report["windows"]         = std::move(window_reports);
         stream_reports.push_back(std::move(stream_report));
@@ -353,6 +280,23 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
     const double scoring_seconds = seconds_since(scoring_started);
     progress->clear();
+    json logits_report = nullptr;
+    if (logits_writer) {
+        const std::uint64_t dump_bytes = logits_writer->finish();
+        logger->info("logits dump complete | {} | {} bytes", logits_writer->path().string(),
+                     dump_bytes);
+        logits_report = json{
+            {"path", std::filesystem::absolute(logits_writer->path()).lexically_normal().string()},
+            {"format", "llama-perplexity-kld-base"},
+            {"vocab_rows", logits_writer->vocab()},
+            {"valid_rows", logits_writer->valid_rows()},
+            {"context_tokens", options.context},
+            {"chunks", streams.front().windows.size()},
+            {"scored_positions", logits_writer->expected_positions()},
+            {"bytes", dump_bytes},
+            {"reference",
+             options.logits_reference ? json(options.logits_reference->string()) : json(nullptr)}};
+    }
     logger->info("scoring complete | {} tokens | {} windows | PPL {:.6g} | {} | {}",
                  ninfer::product::format_pretty_count(overall.scored_tokens), completed_windows,
                  overall.ppl(), ninfer::product::format_pretty_duration(scoring_seconds),
@@ -366,9 +310,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
 
     json report{
-        {"schema_version", 1},
+        {"schema_version", 2},
         {"metric",
-         {{"name", "fixed-window truncated-context causal perplexity"}, {"log_base", "natural"}}},
+         {{"name", options.logits_out ? "llama.cpp KLD-chunk causal perplexity"
+                                      : "fixed-window truncated-context causal perplexity"},
+          {"log_base", "natural"}}},
         {"artifact",
          {{"path", std::filesystem::absolute(options.artifact).lexically_normal().string()},
           {"target", load.target},
@@ -384,9 +330,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"device", options.device},
           {"context_tokens", options.context},
           {"stride_tokens", options.stride},
+          {"window_plan", options.logits_out ? "kld-chunks" : "sliding"},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
-          {"kv_dtype", kv_name(options.kv)}}},
+          {"kv_dtype", ninfer::perplexity::kv_dtype_name(options.kv)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"read_and_tokenize_seconds", preflight_seconds},
@@ -397,6 +344,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         {"streams", std::move(stream_reports)},
         {"domains", std::move(domain_reports)},
         {"overall", aggregate_json(overall)},
+        {"logits_dump", std::move(logits_report)},
     };
 
     const std::filesystem::path temporary = output_directory / "report.json.tmp";
@@ -412,9 +360,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
     std::cout << "Perplexity result\n"
               << "artifact: " << load.model_id << " / " << load.weights_id << '\n'
-              << "kv: " << kv_name(options.kv) << ", corpus: " << corpus.corpus_id << " / "
-              << corpus.mode << ", context/stride: " << options.context << '/' << options.stride
-              << "\n\n";
+              << "kv: " << ninfer::perplexity::kv_dtype_name(options.kv)
+              << ", corpus: " << corpus.corpus_id << " / " << corpus.mode
+              << ", context/stride: " << options.context << '/' << options.stride << "\n\n";
     std::cout << std::left << std::setw(24) << "domain" << std::right << std::setw(16) << "tokens"
               << std::setw(16) << "mean_nll" << std::setw(16) << "ppl" << '\n';
     for (const auto& [domain, aggregate] : domains) {
@@ -436,14 +384,14 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 int main(int argc, char** argv) {
     Options options;
     try {
-        options = parse_options(argc, argv);
+        options = ninfer::perplexity::parse_options(argc, argv);
     } catch (const std::exception& error) {
         std::cerr << "ninfer-perplexity: " << error.what() << '\n';
-        std::cerr << usage_text();
+        std::cerr << ninfer::perplexity::usage_text();
         return 1;
     }
     if (options.help_requested) {
-        std::cout << usage_text();
+        std::cout << ninfer::perplexity::usage_text();
         return 0;
     }
 
