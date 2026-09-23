@@ -3,6 +3,11 @@ from __future__ import annotations
 import math
 import struct
 
+import pytest
+import torch
+
+from tools.artifact.codecs.nvfp4 import dequantize_nvfp4, encode_nvfp4
+
 from tools.artifact.numeric import (
     decode_e2m1_word,
     decode_e4m3fn_word,
@@ -61,3 +66,23 @@ def test_nvfp4_stored_scale_and_divisor_word_validity():
     assert valid_positive_fp32_word(positive)
     for word in (0, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00000):
         assert not valid_positive_fp32_word(word)
+
+
+def test_nvfp4_dequantization_decodes_codes_scales_and_divisor() -> None:
+    rows, columns = 128, 64
+    generator = torch.Generator().manual_seed(3)
+    packed = torch.randint(0, 256, (rows, columns // 2), dtype=torch.uint8, generator=generator)
+    # Nonnegative finite E4M3FN words (0x7F is NaN).
+    scales = torch.randint(0, 0x7F, (rows, columns // 16), dtype=torch.uint8, generator=generator)
+    divisor = torch.tensor(37.5, dtype=torch.float32)
+    payload = encode_nvfp4(packed, scales, divisor.numpy().tobytes(), (rows, columns))
+
+    values = dequantize_nvfp4(payload, (rows, columns))
+
+    levels = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    for row, column in ((0, 0), (5, 1), (77, 30), (127, 63)):
+        byte = int(packed[row, column // 2])
+        code = byte & 0x0F if column % 2 == 0 else byte >> 4
+        magnitude = levels[code & 0x7] * (-1.0 if code & 0x8 else 1.0)
+        scale = float(scales[row, column // 16].view(torch.float8_e4m3fn).float())
+        assert float(values[row, column]) == pytest.approx(magnitude * scale / 37.5, rel=1e-6)
