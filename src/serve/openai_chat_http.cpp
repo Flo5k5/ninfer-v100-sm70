@@ -79,7 +79,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             return;
         } catch (const std::exception& exception) {
             const RequestFailure failure =
-                make_internal_request_failure(RequestFailurePhase::Generation, exception.what());
+                make_internal_request_failure(RequestFailurePhase::Generation);
             lifecycle->failure(failure);
             ApiError error;
             error.status  = 500;
@@ -93,8 +93,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             set_owned_json_content(res, make_chat_completion_response(identity, outcome),
                                    prepared.lifetime);
         } catch (const std::exception& exception) {
-            lifecycle->response_failure(make_internal_request_failure(
-                RequestFailurePhase::ResponseRender, exception.what()));
+            lifecycle->response_failure(
+                make_internal_request_failure(RequestFailurePhase::ResponseRender));
             ApiError error;
             error.status  = 500;
             error.type    = "internal_error";
@@ -130,9 +130,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         lifecycle->response_failure(
                             make_client_disconnected_failure(RequestFailurePhase::Transport));
                         return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
+                    } catch (const ResponseRenderFailure&) {
+                        lifecycle->response_failure(
+                            make_internal_request_failure(RequestFailurePhase::ResponseRender));
                         return false;
                     }
                 };
@@ -143,8 +143,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
                     return false;
                 } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
+                    lifecycle->failure(
+                        make_internal_request_failure(RequestFailurePhase::ResponseRender));
                     ApiError error;
                     error.status  = 500;
                     error.type    = "internal_error";
@@ -187,8 +187,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
                     return false;
                 } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
+                    lifecycle->failure(
+                        make_internal_request_failure(RequestFailurePhase::ResponseRender));
                     ApiError error;
                     error.status  = 500;
                     error.type    = "internal_error";
@@ -198,8 +198,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     lifecycle->failure(make_generation_request_failure(exception.error()));
                     return send_error(exception.error());
                 } catch (const std::exception& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
+                    lifecycle->failure(
+                        make_internal_request_failure(RequestFailurePhase::Generation));
                     ApiError error;
                     error.status  = 500;
                     error.type    = "internal_error";
@@ -212,8 +212,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 try {
                     terminal = encoder->finish(outcome);
                 } catch (const std::exception& exception) {
-                    lifecycle->response_failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
+                    lifecycle->response_failure(
+                        make_internal_request_failure(RequestFailurePhase::ResponseRender));
                     ApiError error;
                     error.status  = 500;
                     error.type    = "internal_error";
@@ -238,8 +238,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 }
             });
     } catch (const std::exception& exception) {
-        lifecycle->failure(
-            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
+        lifecycle->failure(make_internal_request_failure(RequestFailurePhase::ResponseRender));
         ApiError error;
         error.status  = 500;
         error.type    = "internal_error";

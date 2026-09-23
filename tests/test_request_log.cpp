@@ -343,10 +343,13 @@ int main() {
                           rejected.at("request").at("resolved_reasoning_effort").is_null(),
                       "rejection log fabricated a resolved reasoning effort");
     failures += check(rejected.at("error").at("status") == 400 &&
+                          rejected.at("error").at("type") == "invalid_request_error" &&
                           rejected.at("error").at("code") == "context_length_exceeded" &&
-                          rejected.at("error").at("param") == "messages" &&
-                          rejected.at("error").at("message") == preparation_error.message,
-                      "preparation rejection API error missing");
+                          rejected.at("error").at("param") == "messages",
+                      "preparation rejection API error classification missing");
+    failures += check(!rejected.at("error").contains("message") &&
+                          rejected.dump().find("sentinel-client-value") == std::string::npos,
+                      "preparation rejection record retained the client-facing error message");
     const OperationalRecord client_rejection = render_request_rejected(rejected_context);
     failures += check(
         client_rejection.severity == OperationalSeverity::Info &&
@@ -522,19 +525,50 @@ int main() {
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
 
+    const RequestFailure media_failure = make_generation_request_failure(
+        ApiError{.status  = 400,
+                 .message = "sentinel-client-value: cannot decode the supplied image",
+                 .param   = "messages",
+                 .code    = "invalid_media"});
     const Json error =
-        Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
+        Json::parse(format_request_error_json("serve-test", 4000, context, media_failure));
     failures += check(error.at("event") == "request_error", "request error event mismatch");
-    failures += check(error.at("error").at("message") == "generation failed",
-                      "request error message missing");
+    failures += check(error.at("error") == Json{{"phase", "generation"},
+                                                {"status", 400},
+                                                {"type", "invalid_request_error"},
+                                                {"code", "invalid_media"},
+                                                {"param", "messages"}},
+                      "request error classification mismatch or free-text message retained");
+    failures += check(error.dump().find("sentinel-client-value") == std::string::npos,
+                      "request error record retained the client-facing error message");
 
-    const OperationalRecord internal_failure = render_request_failure(
-        context,
-        make_internal_request_failure(RequestFailurePhase::Generation, "sentinel-internal-detail"));
-    failures +=
-        check(internal_failure.severity == OperationalSeverity::Error &&
-                  internal_failure.message.find("sentinel-internal-detail") == std::string::npos,
-              "operational internal failure severity or data policy mismatch");
+    const RequestFailure internal = make_internal_request_failure(RequestFailurePhase::Generation);
+    const Json internal_error =
+        Json::parse(format_request_error_json("serve-test", 4001, context, internal));
+    failures += check(internal_error.at("error") == Json{{"phase", "generation"},
+                                                         {"status", 500},
+                                                         {"type", "internal_error"},
+                                                         {"code", nullptr},
+                                                         {"param", nullptr}},
+                      "internal request error classification mismatch");
+    const Json disconnect_error = Json::parse(format_request_error_json(
+        "serve-test", 4002, context,
+        make_client_disconnected_failure(RequestFailurePhase::Transport)));
+    failures += check(disconnect_error.at("error").at("phase") == "transport" &&
+                          disconnect_error.at("error").at("status") == 499 &&
+                          disconnect_error.at("error").at("code") == "client_disconnected",
+                      "client disconnect request error classification mismatch");
+
+    const OperationalRecord internal_failure = render_request_failure(context, internal);
+    failures += check(internal_failure.severity == OperationalSeverity::Error &&
+                          internal_failure.message ==
+                              "req#7 failed during generation | openai-chat | HTTP 500 | "
+                              "internal error",
+                      "operational internal failure severity or rendering mismatch");
+    const OperationalRecord media_record = render_request_failure(context, media_failure);
+    failures += check(media_record.message.find("invalid media") != std::string::npos &&
+                          media_record.message.find("sentinel-client-value") == std::string::npos,
+                      "operational client failure rendered the client-facing error message");
     const OperationalRecord disconnected = render_request_failure(
         context, make_client_disconnected_failure(RequestFailurePhase::Transport));
     failures += check(disconnected.severity == OperationalSeverity::Info &&
@@ -677,7 +711,7 @@ int main() {
     {
         JsonlRequestLog writer(log_path.string());
         writer.write_request_rejected(rejected_context);
-        writer.write_request_error(context, "generation failed");
+        writer.write_request_error(context, media_failure);
     }
     std::ifstream input(log_path);
     std::string first_line;
@@ -698,6 +732,9 @@ int main() {
                           "second appended event mismatch");
         failures += check(Json::parse(third_line).at("event") == "request_error",
                           "third appended event mismatch");
+        failures += check((first_line + second_line + third_line).find("sentinel-client-value") ==
+                              std::string::npos,
+                          "JSONL file retained a client-facing error message");
     }
     input.close();
     std::filesystem::remove(log_path);

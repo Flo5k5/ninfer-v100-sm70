@@ -277,14 +277,42 @@ Json rejected_request_json(const RequestRejectionLogContext& context) {
                 {"resolved_reasoning_effort", nullptr}};
 }
 
+Json optional_identifier(const std::string& value) {
+    return value.empty() ? Json(nullptr) : Json(value);
+}
+
+// ApiError::message is deliberately not serialized: it can quote client input or model output.
 Json error_json(const ApiError& error) {
-    Json code  = error.code.empty() ? Json(nullptr) : Json(error.code);
-    Json param = error.param.empty() ? Json(nullptr) : Json(error.param);
     return Json{{"status", error.status},
                 {"type", error.type},
-                {"code", std::move(code)},
-                {"param", std::move(param)},
-                {"message", error.message}};
+                {"code", optional_identifier(error.code)},
+                {"param", optional_identifier(error.param)}};
+}
+
+const char* failure_phase_name(RequestFailurePhase phase) {
+    switch (phase) {
+    case RequestFailurePhase::Prepare:
+        return "prepare";
+    case RequestFailurePhase::Generation:
+        return "generation";
+    case RequestFailurePhase::ResponseRender:
+        return "response_render";
+    case RequestFailurePhase::ResponseStore:
+        return "response_store";
+    case RequestFailurePhase::Transport:
+        return "transport";
+    case RequestFailurePhase::Http:
+        return "http";
+    }
+    return "unknown";
+}
+
+Json failure_json(const RequestFailure& failure) {
+    return Json{{"phase", failure_phase_name(failure.phase)},
+                {"status", failure.http_status},
+                {"type", failure.error_type},
+                {"code", optional_identifier(failure.error_code)},
+                {"param", optional_identifier(failure.param)}};
 }
 
 Json arena_json(const ninfer::ArenaMemorySummary& arena) {
@@ -586,10 +614,10 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
 
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp, const RequestLogContext& context,
-                                      const std::string& message) {
+                                      const RequestFailure& failure) {
     Json record       = event_base(server_instance_id, timestamp, "request_error");
     record["request"] = request_json(context);
-    record["error"]   = Json{{"message", message}};
+    record["error"]   = failure_json(failure);
     return record.dump();
 }
 
@@ -856,9 +884,9 @@ void JsonlRequestLog::write_request_done(const RequestLogContext& context,
 }
 
 void JsonlRequestLog::write_request_error(const RequestLogContext& context,
-                                          const std::string& message) {
+                                          const RequestFailure& failure) {
     if (!enabled()) { return; }
-    append(format_request_error_json(server_instance_id_, unix_time_ms(), context, message));
+    append(format_request_error_json(server_instance_id_, unix_time_ms(), context, failure));
 }
 
 void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
