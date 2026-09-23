@@ -22,6 +22,11 @@ struct ResolvedPromptSemantics {
     bool preserve_thinking = false;
 };
 
+// Throws std::invalid_argument when the server effort default or an alias target names a level
+// the loaded template cannot render, so misconfiguration fails at startup instead of per request.
+void validate_reasoning_effort_policy(const ServeOptions& server,
+                                      const ninfer::PromptCapabilities& capabilities);
+
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
                                                  const ServeOptions& server,
                                                  const ninfer::PromptCapabilities& capabilities);

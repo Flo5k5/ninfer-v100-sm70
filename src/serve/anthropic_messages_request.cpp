@@ -848,7 +848,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                    int effective_max_tokens) {
+                    int effective_max_tokens, bool omitted_thinking_as_summarized) {
     if (!body.contains("thinking") || body.at("thinking").is_null()) { return; }
     const Json& thinking = body.at("thinking");
     if (!thinking.is_object() || !thinking.contains("type") || !thinking.at("type").is_string()) {
@@ -885,7 +885,8 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
                         "thinking");
         }
-        if (purpose == ParsePurpose::Messages && display == "omitted") {
+        if (purpose == ParsePurpose::Messages && display == "omitted" &&
+            !omitted_thinking_as_summarized) {
             bad_request("thinking.display='omitted' requires encrypted hidden-reasoning restore "
                         "semantics that NInfer does not provide",
                         "thinking", "thinking_display_not_supported");
@@ -1016,11 +1017,11 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 }
 
 void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens) {
+                         int effective_max_tokens, bool omitted_thinking_as_summarized = false) {
     lower_tools(body, request);
     parse_system(body, request);
     parse_messages(body, request);
-    parse_thinking(body, request, purpose, effective_max_tokens);
+    parse_thinking(body, request, purpose, effective_max_tokens, omitted_thinking_as_summarized);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
@@ -1061,7 +1062,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     }
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens);
+                        result.generation.max_tokens, limits.omitted_thinking_as_summarized);
     parse_generation_fields(body, result.generation);
     return result;
 }
