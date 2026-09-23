@@ -23,7 +23,8 @@ add_executable(ninfer-perplexity
   perplexity/corpus.cpp
   perplexity/evaluation.cpp
   perplexity/logits_dump.cpp
-  perplexity/options.cpp)
+  perplexity/options.cpp
+  perplexity/preflight.cpp)
 target_include_directories(ninfer-perplexity PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_SOURCE_DIR}/src

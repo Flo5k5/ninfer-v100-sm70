@@ -41,6 +41,13 @@ struct KldBaseHeader {
 
 [[nodiscard]] KldBaseHeader read_kld_base_header(const std::filesystem::path& path);
 
+// Rejects a reference dump written with another context.
+void check_reference_context(const KldBaseHeader& reference, std::uint32_t context);
+
+// Checks a dump destination: neither the dump nor a partial file of an interrupted run may exist,
+// and its directory must. KldBaseWriter runs the same check when it creates the partial file.
+void check_logits_destination(const std::filesystem::path& path);
+
 // Rejects a run whose evaluated tokens differ from a reference dump, before any scoring time is
 // spent. `chunks` windows of `context` tokens are evaluated from the start of `tokens`. Without
 // `prefix` the reference must hold exactly `chunks` windows; with it (a --chunks run) it may hold
