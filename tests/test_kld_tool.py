@@ -8,7 +8,7 @@ import pytest
 
 from kld_synthetic import write_dump
 from tools.kld import kld
-from tools.kld.compare import COMPARE_SCHEMA, compare
+from tools.kld.compare import COMPARE_SCHEMA, compare, load_segments
 from tools.kld.dump import DumpError, decode, read_dump
 from tools.kld.exact_ppl import ExactPpl, read_exact_ppl
 from tools.kld.gate import gate
@@ -180,6 +180,40 @@ def test_segments_split_results_by_domain(tmp_path) -> None:
                     segments_path=tmp_path / "segments.json", workers=1)
 
 
+@pytest.mark.parametrize(("content", "message"), [
+    ("{not json", "not valid JSON"),
+    ('{"segments": []}', "needs tokens_file and segments"),
+    ('{"tokens_file": "tokens.bin", "segments": "nope"}', "needs tokens_file and segments"),
+])
+def test_load_segments_rejects_a_malformed_manifest(tmp_path, content: str, message: str) -> None:
+    write_dump(tmp_path / "ref.kld", CONTEXT, _tokens(), _logits(20))
+    reference = read_dump(tmp_path / "ref.kld")
+    (tmp_path / "segments.json").write_text(content)
+    with pytest.raises(DumpError, match=message):
+        load_segments(tmp_path / "segments.json", reference)
+
+
+@pytest.mark.parametrize(("segment", "message"), [
+    ({"id": "a", "domain": "prose", "token_begin": 0}, "needs domain, token_begin and token_end"),
+    ({"id": "a", "token_begin": 0, "token_end": CONTEXT},
+     "needs domain, token_begin and token_end"),
+    ({"id": "a", "domain": "prose", "token_begin": True, "token_end": CONTEXT},
+     "needs domain, token_begin and token_end"),  # a bool is not an int here, on purpose
+    ({"id": "a", "domain": "prose", "token_begin": CONTEXT, "token_end": CONTEXT},
+     "empty segment"),
+    ({"id": "a", "domain": "prose", "token_begin": 5, "token_end": 2}, "empty segment"),
+])
+def test_load_segments_rejects_a_malformed_segment(tmp_path, segment: dict, message: str) -> None:
+    tokens = _tokens()
+    write_dump(tmp_path / "ref.kld", CONTEXT, tokens, _logits(21))
+    reference = read_dump(tmp_path / "ref.kld")
+    tokens.astype("<i4").tofile(tmp_path / "tokens.bin")
+    manifest = {"tokens_file": "tokens.bin", "segments": [segment]}
+    (tmp_path / "segments.json").write_text(json.dumps(manifest))
+    with pytest.raises(DumpError, match=message):
+        load_segments(tmp_path / "segments.json", reference)
+
+
 def _result(name: str, mean: float, p99: float, top1: float, ppl: float) -> dict:
     return {
         "name": name,
@@ -252,6 +286,38 @@ def test_gate_prefers_exact_perplexity_when_both_runs_have_it() -> None:
     assert not check["passed"] and "exact PPL" in check["detail"]
 
 
+def test_gate_rejects_invalid_kld_p99() -> None:
+    document = _document(_result("prod", 0.010, 0.10, 0.950, 6.00),
+                         _result("q4km", 0.030, 0.30, 0.930, 6.10),
+                         _result("stage", 0.011, math.nan, 0.945, 6.05))
+    with pytest.raises(DumpError, match="kld.p99 must be a finite number, got nan"):
+        gate([document], prod="prod", candidate="stage", ceiling="q4km")
+
+
+def test_gate_rejects_top1_agreement_out_of_range() -> None:
+    document = _document(_result("prod", 0.010, 0.10, 0.950, 6.00),
+                         _result("q4km", 0.030, 0.30, 0.930, 6.10),
+                         _result("stage", 0.011, 0.10, 1.5, 6.05))
+    with pytest.raises(DumpError, match=r"top1_agreement must be in \[0, 1\], got 1.5"):
+        gate([document], prod="prod", candidate="stage", ceiling="q4km")
+
+
+def test_gate_rejects_non_positive_ppl_candidate() -> None:
+    document = _document(_result("prod", 0.010, 0.10, 0.950, 6.00),
+                         _result("q4km", 0.030, 0.30, 0.930, 6.10),
+                         _result("stage", 0.011, 0.10, 0.945, -1.0))
+    with pytest.raises(DumpError, match="ppl_candidate must be positive, got -1.0"):
+        gate([document], prod="prod", candidate="stage", ceiling="q4km")
+
+
+def test_gate_rejects_unknown_limits() -> None:
+    document = _document(_result("prod", 0.010, 0.10, 0.950, 6.00),
+                         _result("q4km", 0.030, 0.30, 0.930, 6.10),
+                         _result("stage", 0.011, 0.10, 0.945, 6.05))
+    with pytest.raises(DumpError, match=r"unknown gate limits: \['bogus'\]"):
+        gate([document], prod="prod", candidate="stage", ceiling="q4km", limits={"bogus": 1.0})
+
+
 def _llama_log(path, chunks: int = 3, context: int = 4096) -> None:
     path.write_text(f"perplexity: calculating perplexity over {chunks} chunks, n_ctx={context}, "
                     "batch_size=2048, n_seq=1\n[1]4.1000,[2]4.0500,[3]4.0200,\n"
@@ -314,6 +380,60 @@ def test_exact_ppl_rejects_unusable_files(tmp_path) -> None:
     log.write_text("Final estimate: PPL = 4.0100 +/- 0.05\n")
     with pytest.raises(DumpError, match="n_ctx=C"):
         read_exact_ppl(str(log))
+
+
+def test_exact_ppl_rejects_a_non_finite_value_in_a_log(tmp_path) -> None:
+    log = tmp_path / "run.log"
+    log.write_text("perplexity: calculating perplexity over 3 chunks, n_ctx=4096, "
+                   "batch_size=2048, n_seq=1\n[1]4.1000,[2]nan,[3]4.0200,\n"
+                   "Final estimate: PPL = nan +/- 0.05\n")
+    with pytest.raises(DumpError, match="must be a finite number, got nan"):
+        read_exact_ppl(str(log))
+    with pytest.raises(DumpError, match="must be a finite number, got nan"):
+        read_exact_ppl(f"{log}@2")
+
+
+def test_exact_ppl_rejects_a_missing_window_value(tmp_path) -> None:
+    log = tmp_path / "run.log"
+    # Windows 1 and 3 are printed but 2 is missing, e.g. a log line lost to a truncated buffer.
+    log.write_text("perplexity: calculating perplexity over 3 chunks, n_ctx=4096, "
+                   "batch_size=2048, n_seq=1\n[1]4.1000,[3]4.0200,\n"
+                   "Final estimate: PPL = 4.0100 +/- 0.05\n")
+    with pytest.raises(DumpError, match="no running perplexity for window 2"):
+        read_exact_ppl(f"{log}@2")
+
+
+@pytest.mark.parametrize(("kwargs", "message"), [
+    ({"chunks": 0}, "must be a positive integer, got 0"),
+    ({"chunks": 1.5}, "must be a positive integer, got 1.5"),
+    ({"context": -1}, "must be a positive integer, got -1"),
+])
+def test_exact_ppl_rejects_non_integer_report_fields(tmp_path, kwargs: dict, message: str) -> None:
+    report = tmp_path / "report.json"
+    _report(report, **kwargs)
+    with pytest.raises(DumpError, match=message):
+        read_exact_ppl(str(report))
+
+
+def _multi_run_log(path) -> None:
+    """Two appended runs, as if stdout had been redirected across a resumed job."""
+    first = ("perplexity: calculating perplexity over 2 chunks, n_ctx=2048, batch_size=2048, "
+             "n_seq=1\n[1]9.0000,[2]9.0500,\nFinal estimate: PPL = 9.1000 +/- 0.09\n")
+    second = ("perplexity: calculating perplexity over 3 chunks, n_ctx=4096, batch_size=2048, "
+              "n_seq=1\n[1]4.1000,[2]4.0500,[3]4.0200,\nFinal estimate: PPL = 4.0100 +/- 0.05\n")
+    path.write_text(first + second)
+
+
+def test_exact_ppl_of_a_log_with_several_runs_uses_only_the_last_one(tmp_path) -> None:
+    log = tmp_path / "resumed.log"
+    _multi_run_log(log)
+    # Without scoping to the last run, LOG@2 would return the first run's [2] value (9.05)
+    # tagged with the last run's n_ctx (4096): a context-2048 number mislabelled as context 4096.
+    assert read_exact_ppl(str(log)) == ExactPpl(pytest.approx(4.01), 3, 4096)
+    assert read_exact_ppl(f"{log}@1") == ExactPpl(pytest.approx(4.1), 1, 4096)
+    assert read_exact_ppl(f"{log}@2") == ExactPpl(pytest.approx(4.05), 2, 4096)
+    with pytest.raises(DumpError, match="the run has 3 windows, not 4"):
+        read_exact_ppl(f"{log}@4")
 
 
 def test_exact_ppl_paths_may_contain_at_signs(tmp_path) -> None:
@@ -443,3 +563,39 @@ def test_cli_reports_internal_errors_with_exit_code_3(tmp_path, capsys, monkeypa
                      "--candidate", f"c={tmp_path / 'ref.kld'}"]) == 3
     error = capsys.readouterr().err
     assert "ZeroDivisionError: a bug" in error and "internal error" in error
+
+
+@pytest.mark.parametrize("option", ["--workers", "--block-rows"])
+@pytest.mark.parametrize("value", ["-1", "-4"])
+def test_cli_rejects_out_of_range_numeric_options_with_exit_code_2(
+        tmp_path, capsys, option: str, value: str) -> None:
+    write_dump(tmp_path / "ref.kld", CONTEXT, _tokens(), _logits(15))
+    # A bounded argparse type must reject the value before any tool code runs, so argparse's own
+    # usage error (exit code 2) fires; this is not the DumpError/OSError path main() catches.
+    with pytest.raises(SystemExit) as error:
+        kld.main(["compare", "--reference", str(tmp_path / "ref.kld"),
+                 "--candidate", f"c={tmp_path / 'ref.kld'}", option, value])
+    assert error.value.code == 2
+    assert "must be >=" in capsys.readouterr().err
+
+
+def test_cli_rejects_block_rows_zero_with_exit_code_2(tmp_path, capsys) -> None:
+    write_dump(tmp_path / "ref.kld", CONTEXT, _tokens(), _logits(17))
+    with pytest.raises(SystemExit) as error:
+        kld.main(["compare", "--reference", str(tmp_path / "ref.kld"),
+                 "--candidate", f"c={tmp_path / 'ref.kld'}", "--block-rows", "0"])
+    assert error.value.code == 2
+    assert "must be >= 1" in capsys.readouterr().err
+
+
+def test_negative_block_rows_can_never_produce_a_result(tmp_path) -> None:
+    tokens = _tokens()
+    write_dump(tmp_path / "ref.kld", CONTEXT, tokens, _logits(18))
+    write_dump(tmp_path / "cand.kld", CONTEXT, tokens, _logits(18) * 1.1)
+    # Bypassing the CLI (calling compare() as a library) must still be unable to reach
+    # _score_range with a step that makes range(begin, end, block_rows) empty: that path returns
+    # its pre-allocated arrays unfilled, i.e. a PASS-looking result built from garbage.
+    with pytest.raises(DumpError, match="block_rows must be a positive integer, got -4"):
+        compare(tmp_path / "ref.kld", [("cand", tmp_path / "cand.kld")], workers=1, block_rows=-4)
+    with pytest.raises(DumpError, match="block_rows must be a positive integer, got 0"):
+        compare(tmp_path / "ref.kld", [("cand", tmp_path / "cand.kld")], workers=1, block_rows=0)
