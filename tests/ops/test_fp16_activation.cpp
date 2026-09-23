@@ -1,6 +1,7 @@
 // The Volta fp16 activation domain: wherever linear_swiglu / linear_add report FP16 support, an
 // FP16 activation (the BF16 value converted to fp16) must give results bit-identical to the BF16
 // tensor, and an FP16 SwiGLU output must equal the BF16 output converted to fp16.
+#include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 
@@ -184,6 +185,59 @@ int run_linear_add(const std::string& label, QType qtype, std::int32_t k, std::i
     return compare(label, run(x_fp16_device, DType::FP16), run(x_bf16_device, DType::BF16));
 }
 
+// The fused 27B GDN norm/control kernel writes h itself: an FP16 h must be the BF16 h converted.
+int run_norm_gating(std::int32_t tokens) {
+    constexpr std::int32_t kHeads = 48;
+    const std::string label = "gdn_norm_gating_proj h T=" + std::to_string(tokens);
+    if (!ops::gdn_norm_gating_proj_fp16_hidden_supported(kHeads, kHidden, tokens)) {
+        std::cerr << label << ": fp16 hidden unexpectedly unsupported\n";
+        return 1;
+    }
+    const std::size_t count = static_cast<std::size_t>(kHidden) * tokens;
+    DeviceWords x(random_bf16(count, 3331U + tokens, 4.0F));
+    DeviceWords norm(random_bf16(kHidden, 3333U, 0.5F));
+    DeviceWords ab(random_bf16(static_cast<std::size_t>(2 * kHeads) * kHidden, 3335U, 0.05F));
+    std::vector<float> host_log(kHeads, -0.5F), host_bias(kHeads, 0.25F);
+    DeviceBuffer a_log(kHeads * sizeof(float)), dt_bias(kHeads * sizeof(float));
+    CUDA_CHECK(cudaMemcpy(a_log.p, host_log.data(), kHeads * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(dt_bias.p, host_bias.data(), kHeads * sizeof(float), cudaMemcpyHostToDevice));
+    DeviceBuffer g(kHeads * tokens * sizeof(float)), beta(kHeads * tokens * sizeof(float));
+    Weight ab_weight{};
+    ab_weight.payload         = ab.buffer.p;
+    ab_weight.payload_bytes   = static_cast<std::uint64_t>(2 * kHeads) * kHidden * 2;
+    ab_weight.qtype           = QType::BF16_CTRL;
+    ab_weight.layout          = QuantLayout::Contiguous;
+    ab_weight.ndim            = 2;
+    ab_weight.shape[0]        = 2 * kHeads;
+    ab_weight.shape[1]        = kHidden;
+    ab_weight.padded_shape[0] = 2 * kHeads;
+    ab_weight.padded_shape[1] = kHidden;
+    ab_weight.qdata           = ab.buffer.p;
+    ab_weight.n               = 2 * kHeads;
+    ab_weight.k               = kHidden;
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::gdn_norm_gating_proj_workspace_capacity_bytes(kHeads, kHidden, tokens, tokens), 256));
+    DeviceContext device;
+    const auto run = [&](DType dtype) {
+        DeviceWords h(count);
+        Tensor x_tensor(x.buffer.p, DType::BF16, {kHidden, tokens});
+        Tensor norm_tensor(norm.buffer.p, DType::BF16, {kHidden});
+        Tensor log_tensor(a_log.p, DType::FP32, {kHeads});
+        Tensor bias_tensor(dt_bias.p, DType::FP32, {kHeads});
+        Tensor h_tensor(h.buffer.p, dtype, {kHidden, tokens});
+        Tensor g_tensor(g.p, DType::FP32, {kHeads, tokens});
+        Tensor beta_tensor(beta.p, DType::FP32, {kHeads, tokens});
+        workspace.reset();
+        ops::gdn_norm_gating_proj(x_tensor, norm_tensor, 1.0e-6F, ab_weight, log_tensor,
+                                  bias_tensor, workspace, h_tensor, g_tensor, beta_tensor,
+                                  device.execution_view());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        return h.read(count);
+    };
+    return compare(label, run(DType::FP16), to_fp16(run(DType::BF16)));
+}
+
 } // namespace
 
 int main() {
@@ -209,6 +263,7 @@ int main() {
                     run_linear_add("linear_add FP8" + shape, QType::FP8_E4M3FN_ROW_BF16S, k, t);
             }
         }
+        for (const std::int32_t t : {1, 5, 32}) { failures += run_norm_gating(t); }
         // Past the QPN width the domain is closed: callers must keep BF16 there.
         DeviceWeight wide = make_weight(QType::NVFP4, 2 * kIntermediate, kHidden, 3399U,
                                         Layout::Nvfp4SwiGlu);

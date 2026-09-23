@@ -884,6 +884,11 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
     Tensor h           = control.hidden;
+    if (ph == Phase::Verify && active_sequence_batch_ > 0 && active_sequence_width_ > 0 &&
+        Variant::gdn_input_takes_fp16(*w.projection, active_sequence_width_,
+                                      active_sequence_batch_)) {
+        h = Tensor(h.data, DType::FP16, {h.ne[0], h.ne[1]});
+    }
     Tensor g           = control.g;
     Tensor beta        = control.beta;
     Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,

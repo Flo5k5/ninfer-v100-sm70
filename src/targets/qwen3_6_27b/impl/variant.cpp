@@ -305,6 +305,17 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               workspace, hidden, g, beta, execution);
 }
 
+bool Variant::gdn_input_takes_fp16(const GdnProjectionWeights& weights, std::int32_t width,
+                                   std::int32_t batch) {
+    const auto* fused = std::get_if<FusedGdnInputProjectionPayload>(&weights.input_projection);
+    if (fused == nullptr) { return false; }
+    const Weight& parent = fused->query_key_value_z;
+    return ops::gdn_input_proj_conv_fp16_activation_supported(parent, text_policy(parent), width,
+                                                              batch) &&
+           ops::gdn_norm_gating_proj_fp16_hidden_supported(TextConfig::gdn_value_heads,
+                                                           TextConfig::hidden, width * batch);
+}
+
 bool Variant::gdn_output_takes_fp16(const Weight& weight, std::int32_t tokens) {
     return ops::linear_add_fp16_activation_supported(weight, text_policy(weight), tokens);
 }
