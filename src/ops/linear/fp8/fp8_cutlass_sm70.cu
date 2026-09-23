@@ -18,7 +18,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
-__global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, int n, int k,
+// Reconstructs the represented FP16 weight code * row_scale (one rounding of an exact FP32 product),
+// so the GEMM output is rounded to BF16 once instead of once before and once after the row scale.
+__global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes,
+                                        const __nv_bfloat16* __restrict__ scales, int n, int k,
                                         bool prepacked,
                                         cutlass::half_t* __restrict__ out) {
     const int row      = static_cast<int>(blockIdx.y);
@@ -32,24 +35,17 @@ __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, 
         source = codes + static_cast<std::int64_t>(row) * k + k0;
     }
     const std::uint16_t packed = *reinterpret_cast<const std::uint16_t*>(source);
-    const float2 weight = decode_fp8_e4m3x2(packed);
-    cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
-    out_row[pair_idx * 2]     = cutlass::half_t(weight.x);
-    out_row[pair_idx * 2 + 1] = cutlass::half_t(weight.y);
+    const float2 weight        = decode_fp8_e4m3x2(packed);
+    const float scale          = __bfloat162float(scales[row]);
+    cutlass::half_t* out_row   = out + static_cast<std::int64_t>(row) * k;
+    out_row[pair_idx * 2]      = cutlass::half_t(weight.x * scale);
+    out_row[pair_idx * 2 + 1]  = cutlass::half_t(weight.y * scale);
 }
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
                                     cutlass::half_t* __restrict__ out, std::int64_t count) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
-}
-
-__global__ void scale_rows_kernel(__nv_bfloat16* __restrict__ data,
-                                  const __nv_bfloat16* __restrict__ scales, std::int64_t count,
-                                  int n) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= count) { return; }
-    data[i] = __float2bfloat16(__bfloat162float(data[i]) * __bfloat162float(scales[i % n]));
 }
 
 using ElementAccumulator     = float;
@@ -112,8 +108,8 @@ void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Work
     const dim3 block(256);
     const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256), static_cast<unsigned>(n), 1u);
     dequant_fp8_row_to_fp16<<<grid, block, 0, stream>>>(
-        static_cast<const std::uint8_t*>(w.qdata), n, k,
-        w.layout == QuantLayout::VoltaQpnPrepacked, weight);
+        static_cast<const std::uint8_t*>(w.qdata), static_cast<const __nv_bfloat16*>(w.scales), n,
+        k, w.layout == QuantLayout::VoltaQpnPrepacked, weight);
     CUDA_CHECK(cudaGetLastError());
     const std::int64_t input_count = static_cast<std::int64_t>(t) * k;
     bf16_to_fp16_kernel<<<static_cast<int>((input_count + 255) / 256), 256, 0, stream>>>(
@@ -137,12 +133,6 @@ void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Work
     if (status != cutlass::Status::kSuccess) {
         throw std::runtime_error("fp8_cutlass_sm70: CUTLASS gemm failed");
     }
-    CUDA_CHECK(cudaGetLastError());
-
-    const std::int64_t output_count = static_cast<std::int64_t>(t) * n;
-    scale_rows_kernel<<<static_cast<int>((output_count + 255) / 256), 256, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(out.data), static_cast<const __nv_bfloat16*>(w.scales),
-        output_count, n);
     CUDA_CHECK(cudaGetLastError());
 }
 
