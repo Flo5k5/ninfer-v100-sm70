@@ -19,6 +19,10 @@ namespace ninfer::ops {
  * with that result; output storage rounding belongs to the Op's numerical criterion, not the
  * oracle. Kernel reduction, staging, and accumulator precision are implementation choices. There
  * is no workspace or persistent state side effect.
+ *
+ * `out` may instead be FP16 for D=5120 (and gated D in 64..256, see gated_rmsnorm): it then holds
+ * the BF16-rounded result converted to fp16, which is exactly the activation copy the Volta QPN
+ * GEMVs stage from a BF16 output, so a caller that feeds them can skip that staging pass.
  */
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream);

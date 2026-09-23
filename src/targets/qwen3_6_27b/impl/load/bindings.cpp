@@ -164,11 +164,21 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
 DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                const artifact::MaterializedArtifact& materialized) {
     DensePostMixerPayload out;
-    out.gate_up = materialized_weight(materialized, plan.gate_up, 34816, 5120);
+    // gate_up is only ever consumed by linear_swiglu, so on Volta it is prepacked below with the
+    // SwiGLU interleave instead of the generic FP8 QPN layout.
+    out.gate_up = materialized_weight(materialized, plan.gate_up, 34816, 5120,
+                                      /*prepack_for_qpn=*/false);
     out.down    = materialized_weight(materialized, plan.down, 5120, 17408);
 #ifdef NINFER_VOLTA_BUILD
+    if (out.gate_up.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        ::ninfer::ops::detail::fp8_prepack_qpn_sm70(out.gate_up, nullptr,
+                                                    /*swiglu_interleave=*/true);
+    }
     if (out.gate_up.qtype == QType::NVFP4) {
-        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
+        // gate_up is only ever consumed by linear_swiglu: pair each gate row with its up row so
+        // the QPN2 epilogue applies SwiGLU without fp32 scratch or a combine launch.
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up, nullptr,
+                                                      /*swiglu_interleave=*/true);
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
     }
 #endif

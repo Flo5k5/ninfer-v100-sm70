@@ -21,6 +21,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/position.h"
+#include "ninfer/ops/qk_rmsnorm_rope.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
@@ -824,6 +825,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
+    if (Variant::attention_projection_takes_fp16(*w.projection, T)) {
+        h = Tensor(h.data, DType::FP16, {h.ne[0], h.ne[1]});
+    }
     ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -840,14 +844,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    // q/k RMSNorm then RoPE: one launch on the fixed text geometries, identical results.
+    ops::qk_rmsnorm_rope(q, k, *w.q_norm, *w.k_norm, kCfg.rms_eps, rope_for_op, kCfg.rotary_dim,
+                         kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
@@ -884,6 +888,11 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
     Tensor h           = control.hidden;
+    if (ph == Phase::Verify && active_sequence_batch_ > 0 && active_sequence_width_ > 0 &&
+        Variant::gdn_input_takes_fp16(*w.projection, active_sequence_width_,
+                                      active_sequence_batch_)) {
+        h = Tensor(h.data, DType::FP16, {h.ne[0], h.ne[1]});
+    }
     Tensor g           = control.g;
     Tensor beta        = control.beta;
     Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
@@ -981,6 +990,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    if (Variant::gdn_output_takes_fp16(*w.out_proj, T)) {
+        on = Tensor(on.data, DType::FP16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    }
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
@@ -1004,6 +1016,9 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
+    if (Variant::post_mixer_takes_fp16(*m.payload, T)) {
+        h = Tensor(h.data, DType::FP16, {h.ne[0], h.ne[1]});
+    }
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
     Variant::post_mixer(h, *m.payload, x, ph, hints, work_, s);

@@ -4,6 +4,8 @@
 #include "ops/kernel/rmsnorm.cuh"
 #include "core/device.h"
 
+#include <cuda_fp16.h>
+
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -19,10 +21,65 @@ namespace {
 // because nothing in the tree queries the device, so it is not portable.
 constexpr std::int64_t kRmsPrefetchBlocks = 170;
 
+bool aligned16(const Tensor& x, const Tensor& weight, const Tensor& out) {
+    const auto bits = reinterpret_cast<std::uintptr_t>(x.data) |
+                      reinterpret_cast<std::uintptr_t>(weight.data) |
+                      reinterpret_cast<std::uintptr_t>(out.data);
+    return (bits & 15U) == 0;
+}
+
+// FP16 output: the Volta QPN GEMVs' activation copy (see rmsnorm_pack). Only the geometries that
+// feed those GEMVs are instantiated -- the 5120-wide hidden row and the gated per-head rows.
+template <RmsEpilogue Epilogue>
+void launch_rmsnorm_fp16(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
+                         std::int32_t d, std::int64_t rows, float eps, bool aligned2,
+                         cudaStream_t stream) {
+    const auto* x2 = static_cast<const __nv_bfloat162*>(x.data);
+    const auto* w2 = static_cast<const __nv_bfloat162*>(weight.data);
+    const auto* z2 = z != nullptr ? static_cast<const __nv_bfloat162*>(z->data) : nullptr;
+    auto* out2     = static_cast<__half2*>(out.data);
+    if constexpr (Epilogue != RmsEpilogue::Gated) {
+        if (d == 5120 && aligned16(x, weight, out)) {
+            rmsnorm_row5120_vec8_kernel<Epilogue, __half2>
+                <<<static_cast<unsigned>(rows), 640, 0, stream>>>(
+                    static_cast<const uint4*>(x.data), static_cast<const uint4*>(weight.data),
+                    static_cast<uint4*>(out.data), eps);
+            return;
+        }
+        if (aligned2 && d == 5120) {
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 10, true, 5120, __half2>
+                <<<static_cast<unsigned>(rows), 256, 0, stream>>>(x2, w2, nullptr, out2, d, rows,
+                                                                  eps);
+            return;
+        }
+    } else {
+        if (aligned2 && d >= 64 && d <= 256 && d % 64 == 0) {
+            constexpr int kBlock         = 512;
+            constexpr int kWarpsPerBlock = kBlock / kWarpSize;
+            const auto blocks =
+                static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+            if (blocks > kRmsPrefetchBlocks) {
+                rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, false, 0, __half2>
+                    <<<blocks, kBlock, 0, stream>>>(x2, w2, z2, out2, d, rows, eps);
+            } else {
+                rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, true, 0, __half2>
+                    <<<blocks, kBlock, 0, stream>>>(x2, w2, z2, out2, d, rows, eps);
+            }
+            return;
+        }
+    }
+    throw std::invalid_argument(
+        "rmsnorm: FP16 output supports the aligned 5120-wide row and gated 64..256-wide rows");
+}
+
 template <RmsEpilogue Epilogue>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
                     std::int32_t d, std::int64_t rows, float eps, bool aligned2,
                     cudaStream_t stream) {
+    if (out.dtype == DType::FP16) {
+        launch_rmsnorm_fp16<Epilogue>(x, weight, z, out, d, rows, eps, aligned2, stream);
+        return;
+    }
     const auto* x_bf16 = static_cast<const __nv_bfloat16*>(x.data);
     const auto* w_bf16 = static_cast<const __nv_bfloat16*>(weight.data);
     const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;
@@ -35,6 +92,13 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     constexpr bool kGateOnGrid = Epilogue == RmsEpilogue::Gated;
 
     if constexpr (Epilogue != RmsEpilogue::Gated) {
+        if (d == 5120 && aligned16(x, weight, out)) {
+            rmsnorm_row5120_vec8_kernel<Epilogue, __nv_bfloat162>
+                <<<static_cast<unsigned>(rows), 640, 0, stream>>>(
+                    static_cast<const uint4*>(x.data), static_cast<const uint4*>(weight.data),
+                    static_cast<uint4*>(out.data), eps);
+            return;
+        }
         if (aligned2 && d == 5120) {
             // Fixed width removes the dynamic pair-count predicates. Ten pairs per thread
             // with hoisted gains wins the hidden-row sweep through prefill.

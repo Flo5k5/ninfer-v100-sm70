@@ -10,6 +10,8 @@
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
+#include <exception>
+
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -133,6 +135,27 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
+bool linear_add_fp16_activation_supported(const Weight& w, LinearPolicy policy,
+                                          std::int32_t tokens) noexcept {
+#ifdef NINFER_VOLTA_BUILD
+    try {
+        if (w.qtype == QType::NVFP4) {
+            return detail::nvfp4_linear_add_fp16_activation_supported(w, policy, tokens);
+        }
+        if (w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+            return detail::fp8_linear_add_fp16_activation_supported(w, policy, tokens);
+        }
+    } catch (const std::exception&) {
+        return false;
+    }
+#else
+    (void)w;
+    (void)policy;
+    (void)tokens;
+#endif
+    return false;
+}
+
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,
                 cudaStream_t stream) {
     linear_add(x, w, residual_out, LinearPolicy::A16Only, ws, stream);
@@ -143,7 +166,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     validate_policy(policy);
     const std::int32_t t = x.ne[1];
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
-    require_tensor(x, DType::BF16, w.k, t, "x");
+    const bool fp16_x = x.dtype == DType::FP16 && linear_add_fp16_activation_supported(w, policy, t);
+    require_tensor(x, fp16_x ? DType::FP16 : DType::BF16, w.k, t, "x");
     require_tensor(residual_out, DType::BF16, w.n, t, "residual_out");
     if (overlaps(x, residual_out)) {
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");

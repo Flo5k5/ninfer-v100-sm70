@@ -8,6 +8,7 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 
 #include <cstdint>
+#include <exception>
 #include <stdexcept>
 
 namespace ninfer::ops {
@@ -70,10 +71,15 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream) {
     validate_policy(policy);
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("linear_swiglu: x/out must be BF16");
+    const std::int32_t t = x.ne[1];
+    const bool fp16_io   = x.dtype == DType::FP16 || out.dtype == DType::FP16;
+    if ((x.dtype != DType::BF16 && x.dtype != DType::FP16) ||
+        (out.dtype != DType::BF16 && out.dtype != DType::FP16) ||
+        (fp16_io && !linear_swiglu_fp16_activation_supported(gate_up_weight, policy, t))) {
+        throw std::invalid_argument(
+            "linear_swiglu: x/out must be BF16 (FP16 only where the fp16 activation domain is "
+            "supported)");
     }
-    const std::int32_t t   = x.ne[1];
     const bool large_shape = x.ne[0] == 5120 && out.ne[0] == 17408 && gate_up_weight.n == 34816 &&
                              gate_up_weight.k == 5120 && gate_up_weight.padded_shape[0] == 34816 &&
                              gate_up_weight.padded_shape[1] == 5120;
@@ -135,6 +141,30 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     } else {
         detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream);
     }
+}
+
+bool linear_swiglu_fp16_activation_supported(const Weight& gate_up_weight, LinearPolicy policy,
+                                             std::int32_t tokens) noexcept {
+#ifdef NINFER_VOLTA_BUILD
+    if (gate_up_weight.n != 34816 || gate_up_weight.k != 5120 || tokens <= 0) { return false; }
+    try {
+        if (gate_up_weight.qtype == QType::NVFP4) {
+            return detail::nvfp4_linear_swiglu_fp16_activation_supported(gate_up_weight, policy,
+                                                                         tokens);
+        }
+        if (gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+            return detail::fp8_linear_swiglu_fp16_activation_supported(gate_up_weight, policy,
+                                                                       tokens);
+        }
+    } catch (const std::exception&) {
+        return false;
+    }
+#else
+    (void)gate_up_weight;
+    (void)policy;
+    (void)tokens;
+#endif
+    return false;
 }
 
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,

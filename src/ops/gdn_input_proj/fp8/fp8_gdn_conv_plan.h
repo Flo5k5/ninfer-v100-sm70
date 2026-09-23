@@ -32,6 +32,11 @@ void fp8_gdn_record_fused_launch(const Tensor& x, const Weight& weight, const Te
                                  const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
                                  Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream);
 
+#ifdef NINFER_VOLTA_BUILD
+// Record and snapshot take an FP16 x (the staged copy) where their route is one QPN pass.
+[[nodiscard]] bool fp8_gdn_conv_fp16_activation_supported(LinearPolicy policy, std::int32_t width,
+                                                          std::int32_t batch) noexcept;
+#endif
 void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                Tensor& conv_states, const Tensor& valid_columns,
                                const Tensor& initial_slot, const Tensor& snapshot_base_slot,

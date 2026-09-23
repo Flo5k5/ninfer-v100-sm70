@@ -9,13 +9,29 @@ int main() {
     using namespace ninfer::test::linear_swiglu;
 
     try {
+#ifdef NINFER_VOLTA_BUILD
+        // QPN split covers up to 32 tokens per pass: 5 is the K=4 verify width, 9/17/32 the
+        // two- and four-tile buckets, 33 the first CUTLASS width.
+        constexpr std::array<std::int32_t, 9> kA16Cases{1, 2, 4, 5, 8, 9, 17, 32, 33};
+#else
         constexpr std::array<std::int32_t, 2> kA16Cases{1, 2};
+#endif
         constexpr std::array<std::int32_t, 6> kA8Cases{1, 2, 3, 48, 65, 1024};
         int failures = 0;
         failures += run_profile(
             "LinearSwiGLU FP8_A16",
             {QType::FP8_E4M3FN_ROW_BF16S, 34816, 5120, 17408, 1811U, ActivationCompute::A16},
             kA16Cases);
+#ifdef NINFER_VOLTA_BUILD
+        // The generic (non-interleaved) prepacked layout keeps its two-launch fp32-scratch route.
+        // T=33 (CUTLASS, which rounds gate and up to BF16 before SiLU*up) is left to the
+        // production profile above: its margin against this tolerance is seed-dependent.
+        constexpr std::array<std::int32_t, 8> kPlainCases{1, 2, 4, 5, 8, 9, 17, 32};
+        Profile plain{QType::FP8_E4M3FN_ROW_BF16S, 34816, 5120, 17408, 1815U,
+                      ActivationCompute::A16};
+        plain.fp8_swiglu_interleave = false;
+        failures += run_profile("LinearSwiGLU FP8_A16 plain prepacked", plain, kPlainCases);
+#endif
 #ifndef NINFER_VOLTA_BUILD
         failures += run_profile(
             "LinearSwiGLU FP8_A8",

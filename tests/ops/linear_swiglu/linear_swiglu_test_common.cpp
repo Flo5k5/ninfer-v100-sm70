@@ -7,6 +7,7 @@
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 
 #include <cuda_runtime.h>
 
@@ -269,7 +270,8 @@ int run_profile(std::string_view label, const Profile& profile,
 
     quantized_weight::PatternedWeightOptions weight_options;
     if (profile.qtype == QType::NVFP4) {
-        weight_options.weight_scale_divisor = 0.125F;
+        weight_options.weight_scale_divisor =
+            profile.weight_scale_divisor != 0.0F ? profile.weight_scale_divisor : 0.125F;
         weight_options.input_scale_divisor  = 3.5F;
     }
     quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
@@ -294,7 +296,11 @@ int run_profile(std::string_view label, const Profile& profile,
     std::vector<std::uint8_t> expected_weight = host_weight.payload;
 #ifdef NINFER_VOLTA_BUILD
     if (profile.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        ops::detail::fp8_prepack_qpn_sm70(weight);
+        ops::detail::fp8_prepack_qpn_sm70(weight, nullptr, profile.fp8_swiglu_interleave);
+        device_weight.copy_to_host(expected_weight.data(), expected_weight.size());
+    }
+    if (profile.qtype == QType::NVFP4 && profile.nvfp4_prepack) {
+        ops::detail::nvfp4_prepack_qpn_sm70(weight, nullptr, profile.nvfp4_swiglu_interleave);
         device_weight.copy_to_host(expected_weight.data(), expected_weight.size());
     }
 #endif

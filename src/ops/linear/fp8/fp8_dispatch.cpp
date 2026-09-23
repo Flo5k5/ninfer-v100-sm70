@@ -156,6 +156,9 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   WorkspaceArena* workspace, cudaStream_t stream) {
     validate_fp8_weight(weight, "fp8 linear");
+    if (weight.layout == QuantLayout::VoltaQpnPrepackedSwiGlu) {
+        throw std::invalid_argument("fp8 linear: SwiGLU-interleaved weights are linear_swiglu-only");
+    }
     const Fp8LinearRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
     if (route == Fp8LinearRoute::A16) {
         launch_a16(x, weight, out, workspace, stream);

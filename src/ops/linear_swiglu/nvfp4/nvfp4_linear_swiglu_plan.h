@@ -34,6 +34,11 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
 [[nodiscard]] bool nvfp4_linear_swiglu_qpn_split_supported(std::int32_t k, std::int32_t t) noexcept;
 #endif
 
+#ifdef NINFER_VOLTA_BUILD
+[[nodiscard]] bool nvfp4_linear_swiglu_fp16_activation_supported(const Weight& weight,
+                                                                  LinearPolicy policy,
+                                                                  std::int32_t tokens);
+#endif
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream);

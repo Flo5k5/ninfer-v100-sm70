@@ -21,8 +21,31 @@ void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, T
                                         void* activation_scratch,
                                         cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
-    auto* x_fp16 = static_cast<half*>(activation_scratch);
-    fp8_stage_bf16_activation_sm70(x, x_fp16, stream);
+    // An FP16 x is already the staged copy (the fp16 activation domain).
+    const half* x_fp16 = static_cast<const half*>(x.data);
+    if (x.dtype != DType::FP16) {
+        fp8_stage_bf16_activation_sm70(x, activation_scratch, stream);
+        x_fp16 = static_cast<const half*>(activation_scratch);
+    }
+
+    if (weight.layout == QuantLayout::VoltaQpnPrepackedSwiGlu) {
+        // Gate and up of each feature share a CTA: one launch over the whole [gate; up] weight
+        // applies SwiGLU in its epilogue, with no fp32 scratch and no combine launch.
+        if (out.dtype == DType::FP16) {
+            launch_fp8_volta_qpn_with_fp16_activation(
+                x, weight, x_fp16,
+                Fp8SwiGluPairOutputT<half>{static_cast<half*>(out.data), kIntermediate},
+                2 * kIntermediate, stream);
+        } else {
+            launch_fp8_volta_qpn_with_fp16_activation(
+                x, weight, x_fp16,
+                Fp8SwiGluPairOutputT<__nv_bfloat16>{static_cast<__nv_bfloat16*>(out.data),
+                                                    kIntermediate},
+                2 * kIntermediate, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     Weight gate_weight = weight;
     gate_weight.n      = kIntermediate;
@@ -43,8 +66,13 @@ void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, T
     const std::int64_t elements = static_cast<std::int64_t>(kIntermediate) * t;
     const int threads           = 256;
     const int blocks = static_cast<int>(std::min<std::int64_t>((elements + threads - 1) / threads, 4096));
-    fp8_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
-        gate_scratch, up_scratch, static_cast<__nv_bfloat16*>(out.data), elements);
+    if (out.dtype == DType::FP16) {
+        fp8_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
+            gate_scratch, up_scratch, static_cast<half*>(out.data), elements);
+    } else {
+        fp8_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
+            gate_scratch, up_scratch, static_cast<__nv_bfloat16*>(out.data), elements);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -37,8 +37,9 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
 }
 
 void require_conv_tensor(const Tensor& tensor, std::int32_t rows, std::int32_t width,
-                         std::int32_t batch, const char* op, const char* label) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != width ||
+                         std::int32_t batch, const char* op, const char* label,
+                         DType dtype = DType::BF16) {
+    if (tensor.dtype != dtype || tensor.ne[0] != rows || tensor.ne[1] != width ||
         tensor.ne[2] != batch || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         !aligned_to(tensor.data, 16)) {
         throw std::invalid_argument(std::string(op) + ": invalid " + label);
@@ -63,7 +64,7 @@ struct ConvGeometry {
     std::int32_t aggregate_columns;
 };
 
-ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
+ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden, bool fp16_x = false) {
     constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMaximumWidth = 16;
     const std::int32_t width             = x.ne[1];
@@ -71,11 +72,12 @@ ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
     if (width <= 0 || batch <= 0 || batch > kMaximumBatch || (batch > 1 && width > kMaximumWidth)) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot: unsupported B/W domain");
     }
-    require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_snapshot", "x");
+    require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_snapshot", "x",
+                        fp16_x ? DType::FP16 : DType::BF16);
     return {width, batch, width * batch};
 }
 
-ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
+ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden, bool fp16_x = false) {
     constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 16;
@@ -84,7 +86,8 @@ ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
     if (width < kMinimumWidth || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch) {
         throw std::invalid_argument("gdn_input_proj_conv_record: unsupported B/T domain");
     }
-    require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_record", "x");
+    require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_record", "x",
+                        fp16_x ? DType::FP16 : DType::BF16);
     return {width, batch, width * batch};
 }
 
@@ -476,7 +479,10 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         constexpr std::int32_t kZRows      = 6144;
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
-        const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
+        const bool fp16_x = x.dtype == DType::FP16 &&
+                            gdn_input_proj_conv_fp16_activation_supported(weight, policy, x.ne[1],
+                                                                          x.ne[2]);
+        const ConvGeometry geometry = require_snapshot_input(x, kHidden, fp16_x);
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 gdn_input_proj_conv_snapshot admits only A16 or A8");
         }
@@ -640,7 +646,10 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         constexpr std::int32_t kZRows      = 6144;
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
-        const ConvGeometry geometry        = require_record_input(x, kHidden);
+        const bool fp16_x = x.dtype == DType::FP16 &&
+                            gdn_input_proj_conv_fp16_activation_supported(weight, policy, x.ne[1],
+                                                                          x.ne[2]);
+        const ConvGeometry geometry = require_record_input(x, kHidden, fp16_x);
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 gdn_input_proj_conv_record admits only A16 or A8");
         }
@@ -724,6 +733,22 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
 }
 
 } // namespace
+
+bool gdn_input_proj_conv_fp16_activation_supported(const Weight& weight, LinearPolicy policy,
+                                                   std::int32_t width,
+                                                   std::int32_t batch) noexcept {
+#ifdef NINFER_VOLTA_BUILD
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S && weight.n == 16384 && weight.k == 5120) {
+        return detail::fp8_gdn_conv_fp16_activation_supported(policy, width, batch);
+    }
+#else
+    (void)weight;
+    (void)policy;
+    (void)width;
+    (void)batch;
+#endif
+    return false;
+}
 
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {

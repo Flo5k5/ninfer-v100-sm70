@@ -305,11 +305,44 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               workspace, hidden, g, beta, execution);
 }
 
+bool Variant::gdn_input_takes_fp16(const GdnProjectionWeights& weights, std::int32_t width,
+                                   std::int32_t batch) {
+    const auto* fused = std::get_if<FusedGdnInputProjectionPayload>(&weights.input_projection);
+    if (fused == nullptr) { return false; }
+    const Weight& parent = fused->query_key_value_z;
+    return ops::gdn_input_proj_conv_fp16_activation_supported(parent, text_policy(parent), width,
+                                                              batch) &&
+           ops::gdn_norm_gating_proj_fp16_hidden_supported(TextConfig::gdn_value_heads,
+                                                           TextConfig::hidden, width * batch);
+}
+
+bool Variant::attention_projection_takes_fp16(const FullAttentionProjectionWeights& weights,
+                                              std::int32_t tokens) {
+    const auto* fused = std::get_if<FusedAttentionProjectionPayload>(&weights);
+    if (fused == nullptr) { return false; }
+    const Weight& parent = fused->query_key_gate_value;
+    return ops::attn_input_proj_fp16_activation_supported(parent, text_policy(parent), tokens);
+}
+
+bool Variant::gdn_output_takes_fp16(const Weight& weight, std::int32_t tokens) {
+    return ops::linear_add_fp16_activation_supported(weight, text_policy(weight), tokens);
+}
+
+bool Variant::post_mixer_takes_fp16(const PostMixerWeights& weights, std::int32_t tokens) {
+    return ops::linear_swiglu_fp16_activation_supported(weights.gate_up,
+                                                        text_policy(weights.gate_up), tokens) &&
+           ops::linear_add_fp16_activation_supported(weights.down, text_policy(weights.down),
+                                                     tokens);
+}
+
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints&,
                          WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope        = workspace.scope();
-    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
+    auto scope = workspace.scope();
+    // An FP16 hidden (post_mixer_takes_fp16) keeps the SwiGLU activation in fp16 as well, so the
+    // gate/up epilogue writes the copy the down projection's QPN GEMV reads: three launches for
+    // the MLP instead of five.
+    Tensor activation = workspace.alloc(hidden.dtype, {TextConfig::intermediate, hidden.ne[1]});
     ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
                        stream);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,

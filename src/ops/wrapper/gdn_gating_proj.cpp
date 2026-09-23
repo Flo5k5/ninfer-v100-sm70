@@ -3,6 +3,7 @@
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include <cmath>
+#include <exception>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -134,6 +135,19 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, execution);
 }
 
+bool gdn_norm_gating_proj_fp16_hidden_supported(std::int32_t heads, std::int32_t input_rows,
+                                                std::int32_t tokens) noexcept {
+    if (heads <= 0 || input_rows <= 0 || tokens <= 0) { return false; }
+    try {
+        // Only the fused 27B kernel writes h itself; the composed route's h comes from rmsnorm
+        // and feeds the BF16 control projection.
+        return detail::bf16_gdn_norm_gating_resolve_plan({heads, input_rows, tokens}).schedule ==
+               detail::Bf16GdnNormGatingScheduleId::FusedSimt27;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
@@ -145,7 +159,12 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     }
     require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
     require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
-    require_sequence_tensor(h, DType::BF16, 5120, tokens, op, "h");
+    require_sequence_tensor(h,
+                            h.dtype == DType::FP16 &&
+                                    gdn_norm_gating_proj_fp16_hidden_supported(48, 5120, tokens)
+                                ? DType::FP16
+                                : DType::BF16,
+                            5120, tokens, op, "h");
     require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
     require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
     require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
@@ -170,7 +189,13 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     const GdnControlParentGeometry geometry = require_bf16_parent(ab_weight);
     require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
     require_vector_tensor(norm_weight, DType::BF16, geometry.input_rows, op, "norm_weight");
-    require_sequence_tensor(h, DType::BF16, geometry.input_rows, tokens, op, "h");
+    require_sequence_tensor(h,
+                            h.dtype == DType::FP16 &&
+                                    gdn_norm_gating_proj_fp16_hidden_supported(
+                                        geometry.heads, geometry.input_rows, tokens)
+                                ? DType::FP16
+                                : DType::BF16,
+                            geometry.input_rows, tokens, op, "h");
     require_vector_tensor(A_log, DType::FP32, geometry.heads, op, "A_log");
     require_vector_tensor(dt_bias, DType::FP32, geometry.heads, op, "dt_bias");
     require_sequence_tensor(g, DType::FP32, geometry.heads, tokens, op, "g");
