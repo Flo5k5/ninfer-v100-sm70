@@ -89,7 +89,8 @@ protocol so that NInfer and llama.cpp dumps are position-for-position comparable
   tokens; the tail after the last full window is not evaluated;
 - each window starts from empty State and KV and scores only its last `context-1-context/2`
   targets, so every scored token sees between `context/2` and `context-1` tokens of history;
-- with `--context 4096` that is 2,047 scored positions per window.
+- with `--context 4096` that is 2,047 scored positions per window;
+- `--chunks N` keeps the first N windows, like `llama-perplexity --chunks N`.
 
 The file layout is the one written by `llama-perplexity --kl-divergence-base`, so one reader handles
 both engines and `llama-perplexity --kl-divergence` can also use an NInfer dump as its base
@@ -159,6 +160,8 @@ The gate refuses results computed against different references or corpora.
 `eval/corpora/kld-v1/manifest.json` defines `ninfer-kld-v1`: the four `--quick` streams of
 `ninfer-ppl-1m-v1` plus an original French text and an original chat/reasoning transcript, cut to
 token budgets that fill 32 windows of 4,096 tokens (131,072 evaluated tokens, 65,504 scored positions).
+The budgets are interleaved in four rounds, so `--chunks 8` on every run (16,376 scored positions)
+is a proportional sample of all six domains and a prefix of the full comparison.
 `tools/kld/build_corpus.py` builds it with the reference GGUF tokenizer through llama.cpp's
 `llama-tokenize`:
 
@@ -226,6 +229,28 @@ this `ninfer-perplexity`, and the corpus above. `$LLAMA` is the llama.cpp `bin` 
    can be passed to `gate --results` alongside) and pass `--previous stage1 --candidate stage2`.
    A comparison of three 32.5 GB candidates takes a few minutes with 16 worker processes; it is
    bounded by reading the dumps.
+
+### Weight-only comparison without a GPU
+
+`tools/kld/artifact_to_hf.py` isolates the weight-format effect of an artifact from NInfer kernels
+and KV formats. It decodes every `text/` parameter of a Qwen3.8-27B artifact from its stored words
+(NVFP4, row-scaled FP8, grouped integer, direct) into the Hugging Face layout of the BF16 source
+checkpoint, which supplies the remaining tensors, the config and the tokenizer. llama.cpp then
+converts and scores that checkpoint like any other model, on CPU if needed:
+
+```bash
+python3 -m tools.kld.artifact_to_hf --artifact candidate.ninfer \
+  --source /path/to/Qwen3.8-27B-BF16 --out $K/candidate-hf
+python3 /path/to/llama.cpp/convert_hf_to_gguf.py $K/candidate-hf --outtype f16 \
+  --outfile $K/candidate-F16.gguf
+$LLAMA/llama-perplexity -m $K/candidate-F16.gguf -f $K/corpus-v1/corpus.txt --no-escape \
+  -c 4096 --chunks 8 -ngl 0 --kl-divergence-base $K/dumps/candidate.kld
+```
+
+The reference is then the BF16 GGUF of the source checkpoint scored the same way. F16 storage keeps
+FP8 row-scaled values nearly exact and rounds NVFP4 values to 11 significant bits, far below their
+own quantization error. `artifact_to_hf.json` records the relative RMS difference of every decoded
+tensor to the source.
 
 The comparison is only meaningful with identical corpus, context and KV settings on the NInfer
 side; the llama.cpp runs use their default F16 KV cache. Delete candidate dumps once their compare
