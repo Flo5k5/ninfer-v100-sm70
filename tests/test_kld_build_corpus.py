@@ -13,10 +13,10 @@ def _tokenize(text: str) -> list[int]:
     return [hash(piece) % 1000 for piece in re.findall(r"\S+|\s+", text)]
 
 
-def _manifest(tmp_path, sources: list[dict]) -> object:
+def _manifest(tmp_path, sources: list[dict], rounds: int = 1) -> object:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"corpus_id": "test", "context": 8, "chunks": 4,
-                                    "slack_tokens": 2, "sources": sources}))
+                                    "rounds": rounds, "slack_tokens": 2, "sources": sources}))
     return manifest
 
 
@@ -62,3 +62,22 @@ def test_rejects_a_source_shorter_than_its_budget(tmp_path) -> None:
     ])
     with pytest.raises(ValueError, match="fewer than 50 tokens"):
         build_corpus.build(manifest, _tokenize)
+
+
+def test_rounds_interleave_every_source(tmp_path) -> None:
+    (tmp_path / "a.txt").write_text("".join(f"alpha {i} beta\n" for i in range(20)))
+    (tmp_path / "b.txt").write_text("".join(f"one {i} two\n" for i in range(20)))
+    (tmp_path / "c.txt").write_text("".join(f"code {i} line\n" for i in range(40)))
+    manifest = _manifest(tmp_path, [
+        {"id": "a", "domain": "prose", "path": "a.txt", "tokens": 8},
+        {"id": "b", "domain": "list", "path": "b.txt", "tokens": 8},
+        {"id": "c", "domain": "code", "path": "c.txt", "tokens": "rest"},
+    ], rounds=2)
+    corpus, tokens, metadata = build_corpus.build(manifest, _tokenize)
+    segments = metadata["segments"]
+    assert [(s["id"], s["round"]) for s in segments] == [
+        ("a", 0), ("b", 0), ("c", 0), ("a", 1), ("b", 1), ("c", 1)]
+    # Each round continues its source where the previous round stopped.
+    assert corpus.startswith("alpha 0 beta\n\none 0 two\n\ncode 0 line\n\nalpha 1 beta\n\n")
+    # The first round fills the first half of the evaluated windows.
+    assert segments[2]["token_end"] >= 16 and tokens == _tokenize(corpus)

@@ -14,9 +14,11 @@ compared run evaluates the same token ids.
 | `data/chat/00.txt` | `chat_reasoning` | 6,144 |
 | `perplexity-1m/data/ninfer/00.txt` | `ninfer_code` | remainder |
 
-`manifest.json` fixes the order and budgets for 32 windows of 4,096 tokens. `tools/kld/build_corpus.py`
-cuts each source at the first line boundary that reaches its budget, joins the sources with a blank
-line, and records the resulting token range of every source. Budgets are in reference-tokenizer
+`manifest.json` fixes the order and budgets for 32 windows of 4,096 tokens, split into four
+interleaved rounds: each round takes a quarter of every budget, so the first 8 windows are a
+proportional sample of all domains. `tools/kld/build_corpus.py` cuts each source at the first line
+boundary that reaches its per-round budget, joins the pieces with a blank line, and records the
+resulting token range of every piece. Budgets are in reference-tokenizer
 tokens; the built corpus and its `tokens.bin` are outputs, not committed data.
 
 The French text (essays, a short story, a letter, a recipe, technical explanations, a dialogue) and
