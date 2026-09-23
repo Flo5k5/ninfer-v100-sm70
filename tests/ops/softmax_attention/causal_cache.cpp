@@ -1886,6 +1886,71 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     return failures;
 }
 
+// Width invariance: the output of one query token must be bit-identical whether it is attended
+// alone or as the last column of a wider call over the same cache. sm_70 speculative verify
+// relies on it to stay greedy bit-exact against --spec none.
+int run_width_invariance_case(const Geometry& geometry, KvCacheStorage storage,
+                              std::int32_t last_position, std::int32_t max_width,
+                              std::uint32_t seed) {
+    const std::int32_t max_context = last_position + 4;
+    const ops::CausalAttentionExecutionEnvelope envelope{
+        static_cast<std::uint32_t>(last_position + 1), static_cast<std::uint32_t>(max_context)};
+    const std::size_t column_elements =
+        static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(geometry.q_heads);
+    const std::vector<float> q_all = make_bf16_values(
+        column_elements * static_cast<std::size_t>(max_width), seed, -36.0f, 36.0f);
+    const HostCache cache_host = make_cache(geometry, storage, max_context, seed + 10u);
+    DeviceCache cache(cache_host, MappingPattern::Fragmented);
+
+    int failures = 0;
+    std::vector<std::uint16_t> reference;
+    for (std::int32_t width = 1; width <= max_width; ++width) {
+        const auto columns = static_cast<std::ptrdiff_t>(width * column_elements);
+        const std::vector<float> q(q_all.end() - columns, q_all.end());
+        std::vector<std::int32_t> positions(static_cast<std::size_t>(width));
+        for (std::int32_t token = 0; token < width; ++token) {
+            positions[static_cast<std::size_t>(token)] = last_position - width + 1 + token;
+        }
+        const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+        GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+        GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+        dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+        dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+        Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+        Tensor tp(dp.data(), DType::I32, {width});
+        Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
+        const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+            op_geometry(geometry), storage, envelope, 1, width, width);
+        GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+        WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+        launch_attention_case(
+            [&](cudaStream_t stream) {
+                ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry),
+                                                     kAttentionScale, cache.view(), envelope,
+                                                     workspace, tout, stream);
+            },
+            false);
+        const std::vector<std::uint16_t> output =
+            copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+        const std::vector<std::uint16_t> last(
+            output.end() - static_cast<std::ptrdiff_t>(column_elements), output.end());
+        if (width == 1) {
+            reference = last;
+            continue;
+        }
+        std::size_t mismatches = 0;
+        for (std::size_t i = 0; i < column_elements; ++i) mismatches += last[i] != reference[i];
+        if (mismatches != 0) {
+            std::cerr << "width invariance " << geometry.name << " position " << last_position
+                      << ": width " << width << " differs from width 1 in " << mismatches << "/"
+                      << column_elements << " values\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 struct BatchAttentionCase {
     std::int32_t width;
     std::vector<std::int32_t> contexts;
@@ -2298,6 +2363,21 @@ int run_batch_cases() {
                             {5, 3000, 4096, 524u, false, false, 36.0f}, MappingPattern::Fragmented);
     failures += run_a1_case(kGeometries[1], KvCacheStorage::Int8Group64,
                             {2, 9000, 16384, 525u, false, true, 36.0f}, MappingPattern::Fragmented);
+    // Wide verify widths (DFlash2 draft window 7): row-split key-major route at long context.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {8, 25992, 32768, 526u, false, true, 36.0f}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                            {7, 25993, 32768, 527u, false, false}, MappingPattern::Identity);
+    failures += run_a3_case(kGeometries[1], KvCacheStorage::Int8Group64,
+                            {6, 9000, 16384, 528u, false, true, 36.0f}, MappingPattern::Fragmented);
+#ifdef NINFER_VOLTA_BUILD
+    failures +=
+        run_width_invariance_case(kGeometries[0], KvCacheStorage::Int8Group64, 9000, 8, 530u);
+    failures +=
+        run_width_invariance_case(kGeometries[0], KvCacheStorage::Int8Group64, 25999, 8, 531u);
+    failures +=
+        run_width_invariance_case(kGeometries[1], KvCacheStorage::Int8Group64, 9000, 6, 532u);
+#endif
     return failures;
 }
 

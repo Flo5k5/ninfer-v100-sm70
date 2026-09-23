@@ -92,10 +92,10 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_volta_part
     // converted in place to fp16 immediately after staging -- see the conversion passes
     // below. Q is converted inline at the point of load, since it's read scalar-wise
     // rather than via cp.async.
-    // Padded row stride -- see the identical note in small_t_i8_volta.cuh. The
-    // mma feed reads down a column of these tiles, so an unpadded 512-byte row stride puts every
-    // row on the same shared-memory bank and serializes the load ~21 ways. Worth 2.56x on the
-    // int8 sibling; this kernel had the same layout and the same bug.
+    // Padded row stride. The mma feed reads down a column of these tiles, so an unpadded
+    // 512-byte row stride puts every row on the same shared-memory bank and serializes the load
+    // ~21 ways. It was worth 2.56x on the former query-major int8 sibling, which had the same
+    // layout and the same bug.
     constexpr int SmemPad    = 8;
     constexpr int SmemStride = D + SmemPad;
     static_assert(SmemPad % 8 == 0, "pad must preserve 16-byte alignment of the staged copies");

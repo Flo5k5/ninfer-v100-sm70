@@ -50,8 +50,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         std::int32_t column_begin, std::int32_t logical_capacity, float scale, float* partial_acc,
         float* partial_m, float* partial_l) {
 // ldmatrix (sm_75+) and mma.s8 m16n8k16 (sm_80+) have no Volta equivalent; on sm_70 the INT8
-// small-T route uses the separate SIMT body in small_t_i8_volta.cuh and this kernel is never
-// launched. Compile it away below sm_80 so an unreachable instantiation cannot emit illegal ops.
+// small-T route uses the key-major tensor-core kernel in small_t_i8_volta_kt.cuh and this kernel
+// is never launched. Compile it away below sm_80 so an unreachable instantiation cannot emit
+// illegal ops.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
