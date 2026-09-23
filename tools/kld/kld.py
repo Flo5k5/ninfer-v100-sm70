@@ -78,6 +78,7 @@ class Dump:
     vocab: int
     chunks: int
     tokens: np.ndarray
+    stored_chunks: int = 0  # chunks in the file; `chunks` may select a prefix of them
 
     @property
     def first(self) -> int:
@@ -97,11 +98,20 @@ class Dump:
 
     @property
     def data_offset(self) -> int:
-        return HEADER_FIXED_BYTES + 4 * self.context * self.chunks
+        return HEADER_FIXED_BYTES + 4 * self.context * (self.stored_chunks or self.chunks)
 
     @property
     def expected_bytes(self) -> int:
-        return self.data_offset + 2 * self.words * self.positions
+        stored = (self.stored_chunks or self.chunks) * self.positions_per_chunk
+        return self.data_offset + 2 * self.words * stored
+
+    def prefix(self, chunks: int) -> "Dump":
+        """The first `chunks` windows, like a run with llama-perplexity --chunks."""
+        if not 0 < chunks <= self.chunks:
+            raise DumpError(f"{self.path}: cannot select {chunks} of {self.chunks} chunks")
+        return Dump(path=self.path, context=self.context, vocab=self.vocab, chunks=chunks,
+                    tokens=self.tokens[:chunks * self.context],
+                    stored_chunks=self.stored_chunks or self.chunks)
 
     def tokens_sha256(self) -> str:
         return hashlib.sha256(self.tokens.astype("<i4").tobytes()).hexdigest()
@@ -301,13 +311,17 @@ def load_segments(path: Path, reference: Dump) -> list[dict[str, Any]]:
 def compare(reference_path: Path, candidates: Sequence[tuple[str, Path]], *,
             segments_path: Path | None = None, workers: int = 0, block_rows: int = 32,
             per_token_dir: Path | None = None,
-            exact_ppl: dict[str, float] | None = None) -> dict[str, Any]:
+            exact_ppl: dict[str, float] | None = None,
+            chunks: int | None = None) -> dict[str, Any]:
     exact_ppl = exact_ppl or {}
     unknown = set(exact_ppl) - {name for name, _ in candidates} - {"reference"}
     if unknown:
         raise DumpError(f"--exact-ppl names no compared run: {sorted(unknown)}")
     reference = read_dump(reference_path)
     candidate_dumps = [read_dump(path) for _, path in candidates]
+    if chunks is not None:
+        reference = reference.prefix(chunks)
+        candidate_dumps = [dump.prefix(chunks) for dump in candidate_dumps]
     for candidate in candidate_dumps:
         check_comparable(reference, candidate)
     segments = load_segments(segments_path, reference) if segments_path else None
@@ -546,6 +560,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     compare_parser.add_argument("--workers", type=int, default=0,
                                 help="worker processes (default min(16, CPUs))")
     compare_parser.add_argument("--block-rows", type=int, default=32)
+    compare_parser.add_argument("--chunks", type=int,
+                                help="compare only the first N windows of every dump")
     compare_parser.add_argument("--exact-ppl", action="append", default=[],
                                 metavar="NAME=SOURCE",
                                 help="unclamped PPL of a run (NAME 'reference' or a candidate): "
@@ -584,7 +600,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 exact_ppl[name] = read_exact_ppl(source)
             document = compare(args.reference, args.candidate, segments_path=args.segments,
                                workers=args.workers, block_rows=args.block_rows,
-                               per_token_dir=args.per_token_dir, exact_ppl=exact_ppl)
+                               per_token_dir=args.per_token_dir, exact_ppl=exact_ppl,
+                               chunks=args.chunks)
             _print_compare(document)
             _write_json(args.json, document)
             return 0

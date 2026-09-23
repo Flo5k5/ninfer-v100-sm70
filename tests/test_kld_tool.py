@@ -108,6 +108,26 @@ def test_compare_matches_exact_fp64_metrics(tmp_path, workers: int) -> None:
     assert result["reference"]["tokens_sha256"] == reference.tokens_sha256()
 
 
+def test_prefix_of_a_longer_dump_matches_a_shorter_run(tmp_path) -> None:
+    tokens = _tokens()
+    reference_logits = _logits(11)
+    candidate_logits = reference_logits * 1.1
+    per_chunk = POSITIONS // CHUNKS
+    kld.write_dump(tmp_path / "ref.kld", CONTEXT, tokens, reference_logits)
+    kld.write_dump(tmp_path / "cand.kld", CONTEXT, tokens, candidate_logits)
+    kld.write_dump(tmp_path / "short.kld", CONTEXT, tokens[:2 * CONTEXT],
+                   candidate_logits[:2 * per_chunk])
+    full_prefix = kld.compare(tmp_path / "ref.kld", [("cand", tmp_path / "cand.kld")],
+                              workers=1, chunks=2)
+    mixed = kld.compare(tmp_path / "ref.kld", [("short", tmp_path / "short.kld")],
+                        workers=1, chunks=2)
+    assert full_prefix["candidates"][0]["positions"] == 2 * per_chunk
+    assert full_prefix["candidates"][0]["kld"] == mixed["candidates"][0]["kld"]
+    with pytest.raises(kld.DumpError, match="cannot select 3"):
+        kld.compare(tmp_path / "ref.kld", [("short", tmp_path / "short.kld")], workers=1,
+                    chunks=3)
+
+
 def test_token_mismatch_is_rejected(tmp_path) -> None:
     tokens = _tokens()
     other = tokens.copy()
