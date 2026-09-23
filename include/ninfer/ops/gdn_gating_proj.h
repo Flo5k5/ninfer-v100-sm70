@@ -87,6 +87,15 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
                           Tensor& beta, DeviceExecutionView execution);
 
+/**
+ * Volta fp16 activation domain. True when gdn_norm_gating_proj at `tokens` columns of this
+ * [heads, input_rows] geometry also accepts an FP16 `h`, which then receives the BF16-rounded h
+ * converted to fp16 -- the copy a downstream Volta QPN GEMV would otherwise stage.
+ */
+[[nodiscard]] bool gdn_norm_gating_proj_fp16_hidden_supported(std::int32_t heads,
+                                                               std::int32_t input_rows,
+                                                               std::int32_t tokens) noexcept;
+
 /** The Qwen3.8-27B and Qwen3.6-35B-A3B contiguous-parent storage forms described above. */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,

@@ -1,5 +1,6 @@
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 #include "core/device.h"
+#include "ops/common/fp16_activation.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -10,10 +11,11 @@ namespace ninfer::ops::detail {
 namespace {
 // Each head computes both control dots and the complete norm. RMS scaling can be
 // applied after the dots; h is independently rounded from the full normalized input.
-template <int Tile, int Threads>
+// `HOut` is BF16, or FP16 carrying the BF16-rounded h (the fp16 activation domain).
+template <int Tile, int Threads, class HOut>
 __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
-    const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
+    const __nv_bfloat16* bw, const float* alog, const float* bias, HOut* h, float* g,
     float* beta, int tokens, float eps) {
     constexpr int D = 5120, H = 48, Warps = Threads / 32;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.x,
@@ -84,8 +86,8 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
             if (first + t < tokens) {
                 const auto i   = std::int64_t(first + t) * (D / 2) + pair;
                 const float2 v = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(x)[i]);
-                reinterpret_cast<__nv_bfloat162*>(h)[i] = __floats2bfloat162_rn(
-                    v.x * inverse[t] * (1 + n.x), v.y * inverse[t] * (1 + n.y));
+                h[2 * i]     = round_activation<HOut>(v.x * inverse[t] * (1 + n.x));
+                h[2 * i + 1] = round_activation<HOut>(v.y * inverse[t] * (1 + n.y));
             }
     }
 }
@@ -95,16 +97,23 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
                                          Tensor& beta, cudaStream_t stream) {
-    const auto launch = [&]<int T, int Threads>() {
-        gdn_norm_gating_27_simt<T, Threads>
+    const auto launch_typed = [&]<int T, int Threads, class HOut>() {
+        gdn_norm_gating_27_simt<T, Threads, HOut>
             <<<dim3(48, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const __nv_bfloat16*>(norm_weight.data),
                 static_cast<const __nv_bfloat16*>(a_weight.qdata),
                 static_cast<const __nv_bfloat16*>(b_weight.qdata),
                 static_cast<const float*>(alog.data), static_cast<const float*>(bias.data),
-                static_cast<__nv_bfloat16*>(h.data), static_cast<float*>(g.data),
+                static_cast<HOut*>(h.data), static_cast<float*>(g.data),
                 static_cast<float*>(beta.data), x.ne[1], eps);
+    };
+    const auto launch = [&]<int T, int Threads>() {
+        if (h.dtype == DType::FP16) {
+            launch_typed.template operator()<T, Threads, __half>();
+        } else {
+            launch_typed.template operator()<T, Threads, __nv_bfloat16>();
+        }
     };
     const int tokens = x.ne[1];
     if (tokens <= 2)

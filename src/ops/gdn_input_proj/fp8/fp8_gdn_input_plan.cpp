@@ -66,6 +66,15 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
         return;
     }
     const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
+    if (x.dtype == DType::FP16) {
+        // The fp16 activation domain: x is already the staged copy (callers admit it only up to
+        // one QPN pass).
+        if (!qpn || x.ne[1] > kFp8VoltaQpnMaxTokens) {
+            throw std::logic_error("fp8 GDN input: FP16 x needs a single QPN pass");
+        }
+        launch_fp8_gdn_input_volta_qpn(x, weight, qkv, z, x.data, stream);
+        return;
+    }
     const std::int32_t kChunk =
         qpn ? kFp8VoltaQpnMaxTokens : kFp8LinearSmallTMax<Fp8GdnInputGeometry>;
     if (!qpn) { throw std::logic_error("fp8 Volta GDN problem has no QPN route"); }
