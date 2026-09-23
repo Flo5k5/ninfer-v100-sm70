@@ -74,13 +74,14 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
         }};
 }
 
-void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle) {
+void validate_draft_ids(artifact::Binder& binder, artifact::ObjectHandle handle) {
     constexpr std::size_t kDraftVocab     = 131072;
     constexpr std::size_t kTokenizerVocab = 248077;
-    const auto bytes                      = binder.payload(handle).data;
+    const auto bytes_span = binder.host_object(handle);
+    const std::byte* bytes = bytes_span.data();
     std::vector<bool> seen(kTokenizerVocab, false);
     for (std::size_t i = 0; i < kDraftVocab; ++i) {
-        const std::byte* value = bytes.data() + i * sizeof(std::uint32_t);
+        const std::byte* value = bytes + i * sizeof(std::uint32_t);
         const std::uint32_t id = std::to_integer<std::uint32_t>(value[0]) |
                                  (std::to_integer<std::uint32_t>(value[1]) << 8U) |
                                  (std::to_integer<std::uint32_t>(value[2]) << 16U) |
@@ -219,7 +220,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     }
     out.dflash.final_norm = bind_dflash("dflash/final_norm", NumericFormat::BF16, {2048});
 
-    load_plan.materialization = binder.finish();
+    load_plan.materialization = std::move(binder).finish();
     return load_plan;
 }
 
@@ -227,6 +228,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     : backing(std::move(materialized)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
+    // v3: arena via MaterializedArtifact
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;

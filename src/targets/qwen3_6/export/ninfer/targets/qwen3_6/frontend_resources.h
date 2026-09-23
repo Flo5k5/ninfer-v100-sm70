@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/binder.h"
+#include "artifact/typed_binding.h"
 
 #include <ninfer/targets/qwen3_6/frontend.h>
 

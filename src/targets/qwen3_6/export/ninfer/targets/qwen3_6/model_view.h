@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <optional>
+#include "artifact/typed_binding.h"
 
 namespace ninfer {
 
