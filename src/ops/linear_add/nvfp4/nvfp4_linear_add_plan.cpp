@@ -109,6 +109,11 @@ void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& resid
         launch_nvfp4_volta_qpn_residual(x, weight, activation.data, residual, stream);
         return;
     }
+    if (residual.dtype == DType::FP32 && x.ne[1] >= 33) {
+        // An FP32 residual stream takes the GEMM's FP32 accumulators directly.
+        nvfp4_cutlass_sm70_residual_launch(x, weight, residual, workspace, stream);
+        return;
+    }
     Tensor projected    = allocate_projected(workspace, weight.n, x.ne[1]);
     if (x.ne[1] >= 33) {
         nvfp4_cutlass_sm70_launch(x, weight, projected, workspace, stream);

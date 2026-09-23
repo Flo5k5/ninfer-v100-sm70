@@ -15,6 +15,20 @@ void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaS
     const int vision           = src.ne[1];
     const auto src_addr        = reinterpret_cast<std::uintptr_t>(src.data);
     const auto dst_addr        = reinterpret_cast<std::uintptr_t>(dst.data);
+    if (dst.dtype == DType::FP32) {
+        if ((d & 1) == 0 && (src_addr & 0x3u) == 0 && (dst_addr & 0x7u) == 0) {
+            scatter_bf16_to_f32x2_kernel<<<vision, block, 0, stream>>>(
+                static_cast<const __nv_bfloat162*>(src.data),
+                static_cast<const std::int32_t*>(indices.data), static_cast<float2*>(dst.data),
+                d / 2);
+        } else {
+            scatter_bf16_to_f32_kernel<<<vision, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(src.data),
+                static_cast<const std::int32_t*>(indices.data), static_cast<float*>(dst.data), d);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if ((d % 8) == 0 && ((src_addr | dst_addr) & 0xfu) == 0) {
         scatter_bf16x8_kernel<<<vision, vector_block, 0, stream>>>(
             static_cast<const uint4*>(src.data), static_cast<const std::int32_t*>(indices.data),

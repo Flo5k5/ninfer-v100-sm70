@@ -1,6 +1,7 @@
 // Implements: include/ninfer/ops/residual_add.h
 // Finite dispatch: aligned BF16x8 production route, BF16x2 fallback, then
-// scalar fallback for two-byte-aligned sliced storage.
+// scalar fallback for two-byte-aligned sliced storage. An FP32 x (FP32 residual
+// stream) takes a 16-byte aligned BF16x4 route for a BF16 y, else a scalar route.
 #include "ops/launcher/residual_add.h"
 
 #include "ops/common/math.h"
@@ -16,6 +17,29 @@ void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     const std::int64_t n   = x.numel();
     constexpr int kBlock   = 256;
     constexpr int kMaxGrid = 4096;
+    if (x.dtype == DType::FP32) {
+        const auto addresses = reinterpret_cast<std::uintptr_t>(y.data) |
+                               reinterpret_cast<std::uintptr_t>(x.data);
+        if (y.dtype == DType::BF16 && (addresses & 15U) == 0 && n % 4 == 0) {
+            const std::int64_t packs = n / 4;
+            const int grid           = static_cast<int>(std::min<std::int64_t>(
+                kMaxGrid, std::max<std::int64_t>(1, div_up(packs, std::int64_t{kBlock}))));
+            residual_add_f32_bf16x4_kernel<<<grid, kBlock, 0, stream>>>(
+                static_cast<const uint2*>(y.data), static_cast<float4*>(x.data), packs);
+        } else {
+            const int grid = static_cast<int>(std::min<std::int64_t>(
+                kMaxGrid, std::max<std::int64_t>(1, div_up(n, std::int64_t{kBlock}))));
+            if (y.dtype == DType::FP32) {
+                residual_add_f32_kernel<float><<<grid, kBlock, 0, stream>>>(
+                    static_cast<const float*>(y.data), static_cast<float*>(x.data), n);
+            } else {
+                residual_add_f32_kernel<__nv_bfloat16><<<grid, kBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(y.data), static_cast<float*>(x.data), n);
+            }
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const auto y_addr      = reinterpret_cast<std::uintptr_t>(y.data);
     const auto x_addr      = reinterpret_cast<std::uintptr_t>(x.data);
     if (((y_addr | x_addr) & (alignof(Bf16x8Pack) - 1)) == 0 && (n % 8) == 0) {

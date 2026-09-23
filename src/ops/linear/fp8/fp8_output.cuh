@@ -44,6 +44,17 @@ struct Fp8ResidualOutput {
     }
 };
 
+// The same fused residual update into an FP32 residual stream: one rounding, to FP32.
+struct Fp8ResidualOutputF32 {
+    float* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        data[static_cast<std::int64_t>(token) * rows + parent_row] += value;
+    }
+};
+
 // SwiGLU straight out of the QPN epilogue, for a gate/up weight prepacked with
 // QuantLayout::VoltaQpnPrepackedSwiGlu: every CTA's 32 columns are 16 gate features and the same
 // 16 up features, already row-scaled, and the fp32 SiLU(gate) * up gets its single rounding here.

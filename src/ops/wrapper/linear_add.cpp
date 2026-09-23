@@ -168,7 +168,22 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
     const bool fp16_x = x.dtype == DType::FP16 && linear_add_fp16_activation_supported(w, policy, t);
     require_tensor(x, fp16_x ? DType::FP16 : DType::BF16, w.k, t, "x");
-    require_tensor(residual_out, DType::BF16, w.n, t, "residual_out");
+#ifdef NINFER_VOLTA_BUILD
+    // The Volta FP8 and NVFP4 routes also update an FP32 residual stream.
+    const bool fp32_residual = residual_out.dtype == DType::FP32 &&
+                               (w.qtype == QType::FP8_E4M3FN_ROW_BF16S || w.qtype == QType::NVFP4);
+#else
+    constexpr bool fp32_residual = false;
+#endif
+    if (residual_out.dtype == DType::FP32 && !fp32_residual) {
+        throw std::invalid_argument(
+            "linear_add: an FP32 residual requires an FP8 or NVFP4 weight on a Volta build");
+    }
+    require_tensor(residual_out, fp32_residual ? DType::FP32 : DType::BF16, w.n, t,
+                   "residual_out");
+    if (fp32_residual && !aligned_to(residual_out.data, 16)) {
+        throw std::invalid_argument("linear_add: an FP32 residual must be 16-byte aligned");
+    }
     if (overlaps(x, residual_out)) {
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
     }
