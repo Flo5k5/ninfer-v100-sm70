@@ -100,8 +100,8 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
         {static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns)},
         artifact::TensorPlacement::Device);
 
-    // v3 : le diviseur de poids est le mot FP32 en queue d'objet (lu seul, sans rapatrier les
-    // 100 Mo du poids côté hôte) ; le diviseur d'entrée est l'auxiliaire du Use v3.
+    // v3: the weight divisor is the FP32 word at the end of the object (read alone, without
+    // bringing the ~100 MB weight to the host); the input divisor is the v3 Use auxiliary.
     const artifact::ObjectHandle input_divisor =
         artifact::bind_tensor(binder, input_divisor_name, NumericFormat::FP32, {},
                               artifact::TensorPlacement::Host);
@@ -136,8 +136,8 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
     }
     (void)prepack_for_qpn;
 
-    // v3 : le parent device porte déjà le diviseur de poids lu par le matérialiseur ; on
-    // vérifie qu'il est celui validé au binding avant de le laisser sortir vers le kernel.
+    // v3: the device parent already carries the weight divisor read by the materializer; check
+    // it is the one validated at binding before handing it to the kernels.
     Weight out = artifact::materialized_nvfp4_weight(
         materialized, plan.object, rows, columns,
         std::bit_cast<float>(plan.input_scale_divisor_bits));
@@ -499,11 +499,22 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.features     = features;
 
     const NumericFormat head_format = output_head_format(weights_profile);
-    if (head_format == NumericFormat::NVFP4 && features.dflash2()) {
-        // DFlash2 ranks its full-head candidates with linear_topk, which has W8 and FP8 vocabulary
-        // routes only. MTP reads the head through linear() and is unaffected.
+#ifndef NINFER_VOLTA_BUILD
+    if (head_format == NumericFormat::NVFP4) {
+        // Only the sm_70 QPN2 route serves the [248320,5120] NVFP4 linear; other builds have no
+        // kernel for that shape.
         throw std::invalid_argument(
-            "DFlash2 is not supported with the NVFP4 output head of this artifact; use --spec mtp");
+            "an NVFP4 output head is supported on sm_70 (Volta) builds only");
+    }
+#endif
+    if (head_format == NumericFormat::NVFP4 && features.dflash2()) {
+        // Refused as a precaution, not validated with an NVFP4 head. With the full proposal head,
+        // DFlash2 ranks candidates with linear_topk, which has no NVFP4 route; with the optimized
+        // proposal head it ranks on the Q4 head and reads the full head only through linear(),
+        // which works but has not been exercised. MTP reads the head through linear().
+        throw std::invalid_argument(
+            "DFlash2 is refused as a precaution with the NVFP4 output head of this artifact (not "
+            "validated); use --spec mtp");
     }
     out.token_embedding = bind_weight(binder, "text/token_embedding",
                                       token_embedding_format(weights_profile), {248320, 5120});

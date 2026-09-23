@@ -1,12 +1,12 @@
-// Compat v2 -> v3 : surface de l'API artifact v2 consommée par les porteurs Volta
-// (src/targets/**), réimplémentée par-dessus le module artifact v3 de l'amont.
+// v2 -> v3 compatibility: the v2 artifact API surface consumed by the Volta targets
+// (src/targets/**), reimplemented on top of the upstream v3 artifact module.
 //
-// Principe : un nom plat v2 ("text/layers/3/mlp/gate_up") est résolu vers l'objet physique
-// v3 unique que couvrent, bout à bout, les bindings logiques v3 correspondants
-// ("text/layers/3/mlp/gate" + ".../mlp/up"). Les diviseurs d'entrée NVFP4 v2
-// (".../gate_up_projection/input_scale_divisor") sont résolus via les auxiliaires
-// `activation_input_divisor` des Uses v3. La matérialisation délègue à core/weight_view
-// (native_weight / weight_tensor), qui produit l'ABI Weight/Tensor existante.
+// A flat v2 name ("text/layers/3/mlp/gate_up") resolves to the single v3 physical object that
+// the matching v3 logical bindings cover end to end ("text/layers/3/mlp/gate" + ".../mlp/up").
+// v2 NVFP4 input divisors (".../gate_up_projection/input_scale_divisor") resolve through the
+// `activation_input_divisor` auxiliaries of the v3 Uses. Materialization delegates to
+// core/weight_view (native_weight / weight_tensor), which produces the existing Weight/Tensor
+// ABI.
 #pragma once
 
 #include "artifact/binder.h"
@@ -35,7 +35,7 @@ enum class TensorPlacement : std::uint8_t { Device = 0, Host = 1, Any = 2, Valid
 std::string_view format_name(NumericFormat format) noexcept;
 [[nodiscard]] QType qtype_for(NumericFormat format);
 
-// Binding typé v2 : résolution du nom plat, validation format/forme, demande de résidence.
+// Typed v2 binding: resolves the flat name, validates format and shape, requests residency.
 [[nodiscard]] ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat format,
                                        std::initializer_list<std::uint64_t> shape,
                                        TensorPlacement placement = TensorPlacement::Device);
@@ -44,12 +44,12 @@ std::string_view format_name(NumericFormat format) noexcept;
                                               std::initializer_list<std::uint64_t> shape);
 [[nodiscard]] ObjectHandle bind_raw_resource(Binder& binder, std::string_view name);
 
-// Octets hôte d'un objet déjà lié (petits objets : ids de draft, diviseurs). L'objet reste
-// retenu côté hôte jusqu'à la matérialisation.
+// Host bytes of an already bound object (small objects: draft ids, divisors). The object stays
+// held on the host until materialization.
 [[nodiscard]] std::span<const std::byte> host_bytes(Binder& binder, ObjectHandle handle);
 
-// Diviseur de poids NVFP4 : lu directement dans le fichier (4 octets en queue d'objet),
-// sans rapatrier l'objet entier côté hôte.
+// NVFP4 weight divisor, read directly from the file (the last 4 bytes of the object) without
+// bringing the whole object to the host.
 [[nodiscard]] std::uint32_t nvfp4_weight_divisor_bits(Binder& binder, ObjectHandle handle);
 
 [[nodiscard]] Tensor materialized_tensor(const MaterializedArtifact& materialized,
@@ -60,7 +60,7 @@ std::string_view format_name(NumericFormat format) noexcept;
                                                    ObjectHandle handle, NumericFormat format,
                                                    std::int32_t rows, std::int32_t columns);
 
-// NVFP4 : Weight complet (codes, scales swizzlés, diviseurs) depuis le parent device.
+// NVFP4: complete Weight (codes, swizzled scales, divisors) from the device parent.
 [[nodiscard]] ::ninfer::Weight materialized_nvfp4_weight(const MaterializedArtifact& materialized,
                                                          ObjectHandle handle, std::int32_t rows,
                                                          std::int32_t columns,
