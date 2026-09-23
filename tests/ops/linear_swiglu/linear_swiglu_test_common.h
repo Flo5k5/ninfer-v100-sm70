@@ -26,6 +26,7 @@ struct Profile {
     bool nvfp4_prepack           = false;
     float weight_scale_divisor   = 0.0F;
     bool nvfp4_swiglu_interleave = true; // with nvfp4_prepack: the production gate/up layout
+    bool fp8_swiglu_interleave   = true; // FP8 is always prepacked on Volta; production layout
 };
 
 int run_profile(std::string_view label, const Profile& profile,

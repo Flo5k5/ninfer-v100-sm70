@@ -33,7 +33,7 @@ namespace {
 constexpr std::int32_t kHidden       = 5120;
 constexpr std::int32_t kIntermediate = 17408;
 
-enum class Layout { Fp8, Nvfp4Plain, Nvfp4SwiGlu };
+enum class Layout { Fp8, Fp8SwiGlu, Nvfp4Plain, Nvfp4SwiGlu };
 
 std::uint16_t fp16_of_bf16(std::uint16_t bf16_bits) {
     const std::uint32_t widened = static_cast<std::uint32_t>(bf16_bits) << 16;
@@ -107,8 +107,8 @@ DeviceWeight make_weight(QType qtype, std::int32_t n, std::int32_t k, std::uint3
                           cudaMemcpyHostToDevice));
     result.weight = host.device_weight(result.payload.p);
 #ifdef NINFER_VOLTA_BUILD
-    if (layout == Layout::Fp8) {
-        ops::detail::fp8_prepack_qpn_sm70(result.weight);
+    if (layout == Layout::Fp8 || layout == Layout::Fp8SwiGlu) {
+        ops::detail::fp8_prepack_qpn_sm70(result.weight, nullptr, layout == Layout::Fp8SwiGlu);
     } else {
         ops::detail::nvfp4_prepack_qpn_sm70(result.weight, nullptr,
                                             layout == Layout::Nvfp4SwiGlu);
@@ -299,6 +299,8 @@ int main() {
                 run_swiglu("swiglu NVFP4 plain" + suffix, QType::NVFP4, Layout::Nvfp4Plain, t);
             failures += run_swiglu("swiglu FP8" + suffix, QType::FP8_E4M3FN_ROW_BF16S,
                                    Layout::Fp8, t);
+            failures += run_swiglu("swiglu FP8 interleaved" + suffix, QType::FP8_E4M3FN_ROW_BF16S,
+                                   Layout::Fp8SwiGlu, t);
             for (const std::int32_t k : {6144, 17408}) {
                 const std::string shape = " K=" + std::to_string(k) + suffix;
                 failures += run_linear_add("linear_add NVFP4" + shape, QType::NVFP4, k, t);

@@ -119,7 +119,12 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
-        bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kGateUpRows, kHidden);
+        bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(
+            kGateUpRows, kHidden,
+            // Production prepacks FP8 gate/up SwiGLU-interleaved; NINFER_BENCH_PREPACK=plain keeps
+            // the generic prepacked layout.
+            std::getenv("NINFER_BENCH_PREPACK") != nullptr &&
+                std::string_view(std::getenv("NINFER_BENCH_PREPACK")) != "plain");
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, kGateUpRows, kHidden, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));

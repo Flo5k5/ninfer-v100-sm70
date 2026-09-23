@@ -28,6 +28,25 @@ void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, T
         x_fp16 = static_cast<const half*>(activation_scratch);
     }
 
+    if (weight.layout == QuantLayout::VoltaQpnPrepackedSwiGlu) {
+        // Gate and up of each feature share a CTA: one launch over the whole [gate; up] weight
+        // applies SwiGLU in its epilogue, with no fp32 scratch and no combine launch.
+        if (out.dtype == DType::FP16) {
+            launch_fp8_volta_qpn_with_fp16_activation(
+                x, weight, x_fp16,
+                Fp8SwiGluPairOutputT<half>{static_cast<half*>(out.data), kIntermediate},
+                2 * kIntermediate, stream);
+        } else {
+            launch_fp8_volta_qpn_with_fp16_activation(
+                x, weight, x_fp16,
+                Fp8SwiGluPairOutputT<__nv_bfloat16>{static_cast<__nv_bfloat16*>(out.data),
+                                                    kIntermediate},
+                2 * kIntermediate, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     Weight gate_weight = weight;
     gate_weight.n      = kIntermediate;
 
