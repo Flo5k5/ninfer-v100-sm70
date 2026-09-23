@@ -88,7 +88,7 @@ protocol so that NInfer and llama.cpp dumps are position-for-position comparable
 - the stream is cut into `floor(tokens/context)` non-overlapping windows of exactly `context`
   tokens; the tail after the last full window is not evaluated;
 - each window starts from empty State and KV and scores only its last `context-1-context/2`
-  targets, so every scored token sees between `context/2` and `context-1` tokens of history;
+  targets, so every scored token sees between `context/2+1` and `context-1` tokens of history;
 - with `--context 4096` that is 2,047 scored positions per window;
 - `--chunks N` keeps the first N windows, like `llama-perplexity --chunks N`.
 
@@ -108,11 +108,15 @@ NInfer writes the output-head row width (248,320 for Qwen3.8, the GGUF vocabular
 normalizes over the 248,077-token domain; padding rows encode as the floor and carry no mass. The
 dump holds the evaluated token ids, so a comparison verifies tokenization equality. A dump is
 written as `FILE.partial` and renamed only when every position is present; `report.json` records it
-under `logits_dump`. For 32 windows of 4,096 tokens (65,504 positions) a dump is 32.5 GB.
+under `logits_dump`. The partial file is created before scoring, so a missing or unwritable
+directory fails immediately, and a `FILE.partial` left by an interrupted run is refused rather than
+overwritten. For 32 windows of 4,096 tokens (65,504 positions) a dump is 32.5 GB.
 
 `--logits-reference REF` reads the token block of an existing dump and aborts before scoring if the
-artifact tokenizer produced different ids, a different chunk count, or a different context. It
-also rejects a logits row width that differs from the reference vocabulary.
+artifact tokenizer produced different ids, a different chunk count, or a different context. With
+`--chunks N` the reference may hold more windows: the run must match its first N windows, the
+prefix that `kld.py compare --chunks N` compares. It also rejects a logits row width that differs
+from the reference vocabulary.
 
 Because of the 16-nat window, a target less likely than `max_prob*e^-16` is counted at the floor, so
 perplexity recomputed from dumps slightly under-counts very surprising tokens (llama.cpp's
@@ -128,7 +132,8 @@ perplexity recomputed from dumps slightly under-counts very surprising tokens (l
   every token id match, then reports per candidate the mean (with standard error), median, p90,
   p95, p99, p99.9 and max KLD, the top-1 agreement, the reference and candidate perplexities and
   their delta, and the target-probability difference. `--segments` adds the same statistics per
-  corpus domain, `--exact-ppl NAME=SOURCE` attaches the unclamped perplexity of a run, `--json`
+  corpus domain, `--exact-ppl NAME=SOURCE` attaches the unclamped perplexity of a run (it must
+  cover the compared windows: `--chunks` needs the perplexity of the same prefix), `--json`
   writes the machine-readable result;
 - `gate --results JSON... --candidate NAME --prod NAME --ceiling NAME [--previous NAME]` applies the
   quantization gate and exits 0 on pass, 1 on failure, 2 on unusable input.
