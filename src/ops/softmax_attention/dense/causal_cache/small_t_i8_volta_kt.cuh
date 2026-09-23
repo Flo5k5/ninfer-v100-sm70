@@ -126,6 +126,39 @@ __device__ __forceinline__ std::uint32_t volta_kt_bits(half2 value) {
     return *reinterpret_cast<const std::uint32_t*>(&value);
 }
 
+// The five lane levels of a Sylvester butterfly. peer + sign * value rounds exactly like the
+// __fadd_rn / __fsub_rn pair of hadamard_d32_columns_inplace (a product by +-1 is exact), so the
+// result is bit-identical, but it compiles to one FFMA per value instead of a predicated pair
+// behind a saved predicate, which serialized every shuffle of the transform.
+__device__ __forceinline__ void volta_kt_hadamard_lanes(float (&values)[8], int lane) {
+#pragma unroll
+    for (int stride = 1; stride <= 16; stride <<= 1) {
+        const float sign = (lane & stride) == 0 ? 1.0f : -1.0f;
+        float peer[8];
+#pragma unroll
+        for (int c = 0; c < 8; ++c) { peer[c] = __shfl_xor_sync(0xffffffffu, values[c], stride); }
+#pragma unroll
+        for (int c = 0; c < 8; ++c) { values[c] = __fmaf_rn(sign, values[c], peer[c]); }
+    }
+}
+
+// The three register levels of the same butterfly (values[c] and values[c ^ span]).
+__device__ __forceinline__ void volta_kt_hadamard_registers(float (&values)[8]) {
+#pragma unroll
+    for (int span = 1; span < 8; span <<= 1) {
+#pragma unroll
+        for (int base = 0; base < 8; base += 2 * span) {
+#pragma unroll
+            for (int offset = 0; offset < span; ++offset) {
+                const float low              = values[base + offset];
+                const float high             = values[base + offset + span];
+                values[base + offset]        = __fadd_rn(low, high);
+                values[base + offset + span] = __fsub_rn(low, high);
+            }
+        }
+    }
+}
+
 template <typename Geometry, int TokenTile, int RowSplits, bool MultiBatch, bool Masked,
           typename CacheInput>
 __launch_bounds__(kKtWarps * 32, 2) __global__
@@ -209,6 +242,25 @@ __launch_bounds__(kKtWarps * 32, 2) __global__
         partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
     }
 
+    // Q rows are loaded first: their addresses depend only on the CTA, so this round of loads
+    // overlaps the positions -> split -> page chain below. Lane l holds dims 8l..8l+7 of a row.
+    constexpr int RowsPerWarp = Rows / Warps;
+    uint4 q_raw[RowsPerWarp];
+#    pragma unroll
+    for (int i = 0; i < RowsPerWarp; ++i) {
+        const int row = warp + Warps * i;
+        q_raw[i]      = make_uint4(0u, 0u, 0u, 0u);
+        if (row < row_count) {
+            int q_head = 0;
+            int token  = 0;
+            causal_small_t_tc_row_to_qt<Geometry>(row_begin + row, tokens, kv_head, q_head, token);
+            if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
+                q_raw[i] = *reinterpret_cast<const uint4*>(
+                    &q[causal_q_index<Geometry>(q_head, 8 * lane, token)]);
+            }
+        }
+    }
+
     auto write_neutral = [&]() {
         for (int row = tid; row < row_count; row += Threads) {
             int q_head = 0;
@@ -279,6 +331,85 @@ __launch_bounds__(kKtWarps * 32, 2) __global__
         physical_pages_s[page] = block_table[first_page + page];
     }
 
+    const int slice      = warp; // this warp's head-dim slice == quant group
+    const int slice0     = slice * Slice;
+    const int q_frag_n   = volta_k_get_i(); // B-fragment row (N index) held by this lane
+    const float qk_scale = scale * Log2E;
+
+    // Raw codes of one step. K: this lane's key (M row = lane), 64 bytes of the slice.
+    // V: key 4u + (lane & 3) for u = 0..7, bytes slice0 + 8 * (lane >> 2) + 0..7 (M tile 0 takes
+    // the first word, M tile 1 the second).
+    // Masked keys of an edge step still load real codes: they are clamped into the split, whose
+    // cache slots this CTA owns (neighbouring slots may be mid-append in another CTA, and a stale
+    // fp16 scale there could be NaN, which a zero probability would not cancel).
+    const auto clamp_key = [&](int key) { return min(max(key, split_start), split_end - 1); };
+    // ptxas drains every load still in flight at a loop back-edge, so the next step's codes are
+    // loaded into *_next early in the body and copied into the current registers at its end:
+    // the copy is where the prefetch is waited for, one whole step after its issue. (Relying on
+    // occupancy instead, 8-warp CTAs at <= 128 registers without the prefetch, measured slower.)
+    uint4 k_raw[4];
+    uint2 v_raw[8];
+    uint4 k_next[4];
+    uint2 v_next[8];
+    // Scales stay raw until their step consumes them: converting at load time would make the
+    // prefetch wait for its own data.
+    __half k_scale_lane = __ushort_as_half(0);
+    __half v_scale_lane = __ushort_as_half(0);
+    __half k_scale_next = __ushort_as_half(0);
+    __half v_scale_next = __ushort_as_half(0);
+    // Only a step that straddles a split edge needs the per-key clamp; every other step reads
+    // 32 consecutive keys of one page, one base pointer plus immediate offsets.
+    const auto step_needs_clamp = [&](int k0) {
+        return k0 < split_start || k0 + StepKeys > split_end;
+    };
+    const auto load_k = [&](int step, int page, uint4(&dst)[4], __half& dst_scale) {
+        const int k0     = first_key + step * StepKeys;
+        const int key    = step_needs_clamp(k0) ? clamp_key(k0 + lane) : k0 + lane;
+        const int offset = key & kPagedKVPageMask;
+        const uint4* src = reinterpret_cast<const uint4*>(
+            &cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(page, kv_head, slice0, offset)]);
+#    pragma unroll
+        for (int j = 0; j < 4; ++j) { dst[j] = src[j]; }
+        dst_scale =
+            cache_k_scale[kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, slice, offset)];
+    };
+    const auto load_v = [&](int step, int page, uint2(&dst)[8], __half& dst_scale) {
+        const int k0            = first_key + step * StepKeys;
+        const std::int8_t* base = &cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(
+            page, kv_head, slice0 + 8 * (lane >> 2), 0)];
+        if (step_needs_clamp(k0)) {
+#    pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int offset = clamp_key(k0 + 4 * u + (lane & 3)) & kPagedKVPageMask;
+                dst[u]           = *reinterpret_cast<const uint2*>(base + offset * D);
+            }
+            const int offset = clamp_key(k0 + lane) & kPagedKVPageMask;
+            dst_scale = cache_v_scale[kv_cache_int8_quant_scale_index<Geometry>(page, kv_head,
+                                                                                slice, offset)];
+        } else {
+            const std::int8_t* first = base + ((k0 & kPagedKVPageMask) + (lane & 3)) * D;
+#    pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                dst[u] = *reinterpret_cast<const uint2*>(first + 4 * u * D);
+            }
+            dst_scale = cache_v_scale[kv_cache_int8_quant_scale_index<Geometry>(
+                page, kv_head, slice, (k0 & kPagedKVPageMask) + lane)];
+        }
+    };
+
+    // Step 0 is loaded before the Q transform when it cannot contain a key appended below (keys
+    // this CTA writes are only visible after the append barrier), so its latency overlaps the
+    // transform; otherwise it is loaded after the barrier.
+    const auto page_of_step = [&](int step) {
+        return physical_pages_s[((first_key + step * StepKeys) >> kPagedKVPageShift) - first_page];
+    };
+    const bool early_first_step = !CacheInput::writes_cache || first_key + StepKeys <= min_pos;
+    if (early_first_step) {
+        const int first_physical_page = block_table[first_page];
+        load_k(0, first_physical_page, k_raw, k_scale_lane);
+        load_v(0, first_physical_page, v_raw, v_scale_lane);
+    }
+
     if constexpr (CacheInput::writes_cache) {
         // One warp owns a D256 row, applies the registered normalized transform to K, and then
         // emits all four G64 groups. V remains in its native coordinates.
@@ -297,7 +428,11 @@ __launch_bounds__(kKtWarps * 32, 2) __global__
                 k_values[part]            = __bfloat162float(input.k[source]);
                 v_values[part]            = __bfloat162float(input.v[source]);
             }
-            normalized_hadamard_d256_inplace(k_values, lane);
+            // Same order as normalized_hadamard_d256_inplace: lane levels, register levels, 2^-4.
+            volta_kt_hadamard_lanes(k_values, lane);
+            volta_kt_hadamard_registers(k_values);
+#    pragma unroll
+            for (float& value : k_values) { value = __fmul_rn(value, 0x1p-4f); }
 
             int physical_page     = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
             physical_page         = __shfl_sync(Full, physical_page, 0);
@@ -334,70 +469,39 @@ __launch_bounds__(kKtWarps * 32, 2) __global__
         }
     }
 
-    // Q rows in the rotated basis, fp16, zero past the real rows. Lane l holds dims 8l..8l+7 of a
-    // row, so each row is one 16-byte load per lane, and all of a warp's rows are in flight
-    // before the first transform. The Sylvester matrix is invariant under a common permutation of
-    // the index bits, so the butterflies run over the three register bits and then the five
-    // lane bits, and produce the same normalized transform as normalized_hadamard_d256_inplace.
-    {
-        constexpr int RowsPerWarp = Rows / Warps;
-        uint4 q_raw[RowsPerWarp];
+    // Q rows in the rotated basis, fp16, zero past the real rows. The rows loaded at entry are
+    // parked raw (bf16) in their own q_s row and transformed in place by a rolled loop: the
+    // unrolled transform of every row was ~2800 instructions of cold code that every SM fetched
+    // at kernel start. The Sylvester matrix is invariant under a common permutation of the index
+    // bits, so the butterflies run over the three register bits (dims 8l..8l+7) and then the
+    // five lane bits, and give the same normalized transform as normalized_hadamard_d256_inplace.
 #    pragma unroll
-        for (int i = 0; i < RowsPerWarp; ++i) {
-            const int row = warp + Warps * i;
-            q_raw[i]      = make_uint4(0u, 0u, 0u, 0u);
-            if (row < row_count) {
-                int q_head = 0;
-                int token  = 0;
-                causal_small_t_tc_row_to_qt<Geometry>(row_begin + row, tokens, kv_head, q_head,
-                                                      token);
-                if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
-                    q_raw[i] = *reinterpret_cast<const uint4*>(
-                        &q[causal_q_index<Geometry>(q_head, 8 * lane, token)]);
-                }
-            }
+    for (int i = 0; i < RowsPerWarp; ++i) {
+        *reinterpret_cast<uint4*>(&q_s[(warp + Warps * i) * QStride + 8 * lane]) = q_raw[i];
+    }
+#    pragma unroll 1
+    for (int row = warp; row < Rows; row += Warps) {
+        half* q_row                 = &q_s[row * QStride + 8 * lane];
+        const uint4 raw             = *reinterpret_cast<const uint4*>(q_row);
+        const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        float values[8];
+#    pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f    = __bfloat1622float2(pairs[j]);
+            values[2 * j]     = f.x;
+            values[2 * j + 1] = f.y;
         }
+        volta_kt_hadamard_registers(values);
+        volta_kt_hadamard_lanes(values, lane);
+        half2 packed[4];
 #    pragma unroll
-        for (int i = 0; i < RowsPerWarp; ++i) {
-            const int row = warp + Warps * i;
-            float values[8];
-            const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&q_raw[i]);
-#    pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 f    = __bfloat1622float2(pairs[j]);
-                values[2 * j]     = f.x;
-                values[2 * j + 1] = f.y;
-            }
-#    pragma unroll
-            for (int span = 1; span < 8; span <<= 1) {
-#    pragma unroll
-                for (int base = 0; base < 8; base += 2 * span) {
-#    pragma unroll
-                    for (int offset = 0; offset < span; ++offset) {
-                        const float low              = values[base + offset];
-                        const float high             = values[base + offset + span];
-                        values[base + offset]        = __fadd_rn(low, high);
-                        values[base + offset + span] = __fsub_rn(low, high);
-                    }
-                }
-            }
-            hadamard_d32_columns_inplace(values, lane);
-            half2 packed[4];
-#    pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                packed[j] = __floats2half2_rn(__fmul_rn(values[2 * j], 0x1p-4f),
-                                              __fmul_rn(values[2 * j + 1], 0x1p-4f));
-            }
-            *reinterpret_cast<uint4*>(&q_s[row * QStride + 8 * lane]) =
-                *reinterpret_cast<const uint4*>(packed);
+        for (int j = 0; j < 4; ++j) {
+            packed[j] = __floats2half2_rn(__fmul_rn(values[2 * j], 0x1p-4f),
+                                          __fmul_rn(values[2 * j + 1], 0x1p-4f));
         }
+        *reinterpret_cast<uint4*>(q_row) = *reinterpret_cast<const uint4*>(packed);
     }
     __syncthreads();
-
-    const int slice      = warp; // this warp's head-dim slice == quant group
-    const int slice0     = slice * Slice;
-    const int q_frag_n   = volta_k_get_i(); // B-fragment row (N index) held by this lane
-    const float qk_scale = scale * Log2E;
 
     const auto load_q_frag = [&](half2(&dst)[4], int row_tile, int pair) {
         const int4 raw = *reinterpret_cast<const int4*>(
@@ -441,71 +545,10 @@ __launch_bounds__(kKtWarps * 32, 2) __global__
     }
     const auto slot_of = [](int l) { return (l & 1) | ((l >> 1) & 2); };
 
-    // Raw codes of one step. K: this lane's key (M row = lane), 64 bytes of the slice.
-    // V: key 4u + (lane & 3) for u = 0..7, bytes slice0 + 8 * (lane >> 2) + 0..7 (M tile 0 takes
-    // the first word, M tile 1 the second).
-    // Masked keys of an edge step still load real codes: they are clamped into the split, whose
-    // cache slots this CTA owns (neighbouring slots may be mid-append in another CTA, and a stale
-    // fp16 scale there could be NaN, which a zero probability would not cancel).
-    const auto clamp_key = [&](int key) { return min(max(key, split_start), split_end - 1); };
-    // ptxas drains every load still in flight at a loop back-edge, so the next step's codes are
-    // loaded into *_next early in the body and copied into the current registers at its end:
-    // the copy is where the prefetch is waited for, one whole step after its issue. (Relying on
-    // occupancy instead, 8-warp CTAs at <= 128 registers without the prefetch, measured slower.)
-    uint4 k_raw[4];
-    uint2 v_raw[8];
-    uint4 k_next[4];
-    uint2 v_next[8];
-    // Scales stay raw until their step consumes them: converting at load time would make the
-    // prefetch wait for its own data.
-    __half k_scale_lane = __ushort_as_half(0);
-    __half v_scale_lane = __ushort_as_half(0);
-    __half k_scale_next = __ushort_as_half(0);
-    __half v_scale_next = __ushort_as_half(0);
-    // Only a step that straddles a split edge needs the per-key clamp; every other step reads
-    // 32 consecutive keys of one page, one base pointer plus immediate offsets.
-    const auto step_needs_clamp = [&](int k0) {
-        return k0 < split_start || k0 + StepKeys > split_end;
-    };
-    const auto load_k = [&](int step, uint4(&dst)[4], __half& dst_scale) {
-        const int k0     = first_key + step * StepKeys;
-        const int page   = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
-        const int key    = step_needs_clamp(k0) ? clamp_key(k0 + lane) : k0 + lane;
-        const int offset = key & kPagedKVPageMask;
-        const uint4* src = reinterpret_cast<const uint4*>(
-            &cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(page, kv_head, slice0, offset)]);
-#    pragma unroll
-        for (int j = 0; j < 4; ++j) { dst[j] = src[j]; }
-        dst_scale =
-            cache_k_scale[kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, slice, offset)];
-    };
-    const auto load_v = [&](int step, uint2(&dst)[8], __half& dst_scale) {
-        const int k0            = first_key + step * StepKeys;
-        const int page          = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
-        const std::int8_t* base = &cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(
-            page, kv_head, slice0 + 8 * (lane >> 2), 0)];
-        if (step_needs_clamp(k0)) {
-#    pragma unroll
-            for (int u = 0; u < 8; ++u) {
-                const int offset = clamp_key(k0 + 4 * u + (lane & 3)) & kPagedKVPageMask;
-                dst[u]           = *reinterpret_cast<const uint2*>(base + offset * D);
-            }
-            const int offset = clamp_key(k0 + lane) & kPagedKVPageMask;
-            dst_scale = cache_v_scale[kv_cache_int8_quant_scale_index<Geometry>(page, kv_head,
-                                                                                slice, offset)];
-        } else {
-            const std::int8_t* first = base + ((k0 & kPagedKVPageMask) + (lane & 3)) * D;
-#    pragma unroll
-            for (int u = 0; u < 8; ++u) {
-                dst[u] = *reinterpret_cast<const uint2*>(first + 4 * u * D);
-            }
-            dst_scale = cache_v_scale[kv_cache_int8_quant_scale_index<Geometry>(
-                page, kv_head, slice, (k0 & kPagedKVPageMask) + lane)];
-        }
-    };
-
-    load_k(0, k_raw, k_scale_lane);
-    load_v(0, v_raw, v_scale_lane);
+    if (!early_first_step) {
+        load_k(0, page_of_step(0), k_raw, k_scale_lane);
+        load_v(0, page_of_step(0), v_raw, v_scale_lane);
+    }
 
 #    pragma unroll 1
     for (int step = 0; step < steps; ++step) {
@@ -514,7 +557,7 @@ __launch_bounds__(kKtWarps * 32, 2) __global__
             k0 < split_start || k0 + StepKeys > split_end || k0 + StepKeys - 1 > min_pos;
         float* x_buf        = &x_s[(Redundant ? (step & 1) : 0) * Slices * NT * 256];
         const bool has_next = step + 1 < steps;
-        if (has_next) { load_k(step + 1, k_next, k_scale_next); }
+        if (has_next) { load_k(step + 1, page_of_step(step + 1), k_next, k_scale_next); }
 
         // --- S^T partial over this warp's slice: A = K codes (M = key), B = Q (N = row). ---
         {
@@ -561,7 +604,7 @@ __launch_bounds__(kKtWarps * 32, 2) __global__
             const float ks_own = __half2float(k_scale_lane) * qk_scale;
             const float ks_lo  = __shfl_sync(Full, ks_own, lane & ~2);
             const float ks_hi  = __shfl_sync(Full, ks_own, (lane & ~2) + 2);
-            if (has_next) { load_v(step + 1, v_next, v_scale_next); }
+            if (has_next) { load_v(step + 1, page_of_step(step + 1), v_next, v_scale_next); }
 #    pragma unroll
             for (int nt = 0; nt < NT; ++nt) {
                 float v[8];
