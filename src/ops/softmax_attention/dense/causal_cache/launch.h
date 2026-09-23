@@ -131,6 +131,47 @@ inline constexpr std::int32_t kVoltaFlashMinimumWidth = 64;
 inline constexpr std::int32_t kVoltaFlashMaskRowPad   = 64;
 inline constexpr std::int32_t kVoltaFlashKeyPad       = 256;
 
+inline constexpr std::int32_t kVoltaSplitDBlockRows       = 64;
+inline constexpr std::int32_t kVoltaSplitDKeySplitMinimum = 2048;
+
+// Kernel behind the wide BF16/INT8 prompt route, selected once per process by
+// NINFER_VOLTA_PREFILL_ATTENTION (any other value is rejected):
+//   splitd    (default) vendored Split-D kernel, FP32 Q.K^T and P.V accumulators; an inexact
+//             envelope keeps the direct kernel;
+//   flash     vendored llama.cpp MMA kernel, FP32 Q.K^T but FP16 P.V accumulators;
+//   reference the direct FP32 kernel (slow; for numerical A/B only).
+enum class VoltaPrefillAttention : std::uint8_t { SplitD, Flash, Reference };
+VoltaPrefillAttention volta_prefill_attention();
+
+struct VoltaSplitDWorkspaceShape {
+    std::int64_t staged_q_halves;
+    std::int64_t output_floats;
+    std::int64_t partial_floats;
+};
+
+VoltaSplitDWorkspaceShape causal_attention_volta_splitd_workspace_shape(std::int32_t q_heads,
+                                                                        std::int32_t tokens);
+
+// Appends a prompt width's K/V to the paged cache and gathers the visible key range into
+// contiguous FP16 [key][kv_head][256] (dequantized for INT8, zero past the visible keys).
+void causal_attention_volta_stage_kv(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                     const Tensor& table_rows, PagedKVBatchLayerView cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     std::int32_t kv_heads, std::int32_t width, Tensor& k_gathered,
+                                     Tensor& v_gathered, cudaStream_t stream);
+
+// Split-D prompt attention. Precondition: an exact envelope (min == max visible keys) and
+// sequential positions, token t of the width at max_visible_keys - width + t; every row's causal
+// limit is derived from that layout rather than read from `positions`.
+void causal_attention_volta_splitd_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                          const Tensor& positions, const Tensor& table_rows,
+                                          float scale, PagedKVBatchLayerView cache,
+                                          CausalAttentionExecutionEnvelope envelope,
+                                          std::int32_t kv_heads, Tensor& k_gathered,
+                                          Tensor& v_gathered, Tensor& staged_q,
+                                          Tensor& staged_out, Tensor& partials, Tensor& out,
+                                          cudaStream_t stream);
+
 std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens);
 
 void causal_attention_volta_flash_launch(

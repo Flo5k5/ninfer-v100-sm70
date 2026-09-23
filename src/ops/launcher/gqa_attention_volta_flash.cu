@@ -468,17 +468,11 @@ std::size_t meta_elements_impl(std::int32_t tokens) {
     return static_cast<std::size_t>(nblocks) * P::kNcols * (2 + kDV / 2);
 }
 
-template <typename Geometry>
-void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
-                             const Tensor& positions, const Tensor& table_rows, float scale,
-                             PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
-                             std::int32_t q_block_tokens, Tensor& k_gathered, Tensor& v_gathered,
-                             Tensor& mask, Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta,
-                             Tensor& out, cudaStream_t stream) {
-    using P                          = VoltaFlashParams<Geometry>;
-    constexpr int kQHeads            = P::kQHeads;
-    constexpr int kKVHeads           = P::kKVHeads;
-    const std::int32_t width         = q.ne[2];
+template <int kKVHeads>
+void volta_stage_kv_impl(const Tensor& k, const Tensor& v, const Tensor& positions,
+                         const Tensor& table_rows, PagedKVBatchLayerView cache,
+                         CausalAttentionExecutionEnvelope envelope, std::int32_t width,
+                         Tensor& k_gathered, Tensor& v_gathered, cudaStream_t stream) {
     const std::int32_t n_kv_total    = static_cast<std::int32_t>(envelope.max_visible_keys);
     const std::int32_t logical_pages = cache.block_tables.ne[0];
 
@@ -526,6 +520,24 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                 static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename Geometry>
+void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
+                             const Tensor& positions, const Tensor& table_rows, float scale,
+                             PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
+                             std::int32_t q_block_tokens, Tensor& k_gathered, Tensor& v_gathered,
+                             Tensor& mask, Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta,
+                             Tensor& out, cudaStream_t stream) {
+    using P                       = VoltaFlashParams<Geometry>;
+    constexpr int kQHeads         = P::kQHeads;
+    const std::int32_t width      = q.ne[2];
+    const std::int32_t n_kv_total = static_cast<std::int32_t>(envelope.max_visible_keys);
+    auto* position_ptr            = static_cast<const std::int32_t*>(positions.data);
+
+    // 1-2. Append this call's K/V and gather the visible key range to contiguous FP16.
+    volta_stage_kv_impl<P::kKVHeads>(k, v, positions, table_rows, cache, envelope, width,
+                                     k_gathered, v_gathered, stream);
 
     // 3. Q-blocks. Bounding the block bounds mask memory, and lets earlier blocks
     //    attend over a shorter key range than later ones.
@@ -577,6 +589,26 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 }
 
 } // namespace
+
+void causal_attention_volta_stage_kv(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                     const Tensor& table_rows, PagedKVBatchLayerView cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     std::int32_t kv_heads, std::int32_t width, Tensor& k_gathered,
+                                     Tensor& v_gathered, cudaStream_t stream) {
+    if (kv_heads == CausalD256H24Kv4::KVHeads) {
+        volta_stage_kv_impl<CausalD256H24Kv4::KVHeads>(k, v, positions, table_rows, cache,
+                                                        envelope, width, k_gathered, v_gathered,
+                                                        stream);
+        return;
+    }
+    if (kv_heads == CausalD256H16Kv2::KVHeads) {
+        volta_stage_kv_impl<CausalD256H16Kv2::KVHeads>(k, v, positions, table_rows, cache,
+                                                        envelope, width, k_gathered, v_gathered,
+                                                        stream);
+        return;
+    }
+    throw std::invalid_argument("gqa_attention volta: unsupported KV head geometry");
+}
 
 // The two registered geometries differ only in tiling; both are instantiated so
 // the route can serve 27B (24q/4kv) and 35B-A3B (16q/2kv) from one launcher.

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -272,11 +273,34 @@ struct SmallTWorkspace {
 };
 
 #ifdef NINFER_VOLTA_BUILD
+} // namespace
+
+namespace detail {
+VoltaPrefillAttention volta_prefill_attention() {
+    static const VoltaPrefillAttention selected = [] {
+        const char* value = std::getenv("NINFER_VOLTA_PREFILL_ATTENTION");
+        const std::string name = value != nullptr ? value : "";
+        if (name.empty() || name == "splitd") { return VoltaPrefillAttention::SplitD; }
+        if (name == "flash") { return VoltaPrefillAttention::Flash; }
+        if (name == "reference") { return VoltaPrefillAttention::Reference; }
+        throw std::invalid_argument(
+            "NINFER_VOLTA_PREFILL_ATTENTION must be splitd, flash or reference");
+    }();
+    return selected;
+}
+
+} // namespace detail
+
+namespace {
+
+// Wide BF16/INT8 prompts take a staged tensor-core route (split-D or flash); the reference
+// selection and every other storage keep the direct FP32 kernel.
 bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
                                 std::int32_t batch_size, KvCacheStorage cache_storage) {
     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
                                     q_heads == CausalD256H16Kv2::QHeads;
-    return supported_geometry && batch_size == 1 &&
+    return detail::volta_prefill_attention() != detail::VoltaPrefillAttention::Reference &&
+           supported_geometry && batch_size == 1 &&
            (cache_storage == KvCacheStorage::BFloat16 ||
             cache_storage == KvCacheStorage::Int8Group64) &&
            width >= detail::kVoltaFlashMinimumWidth;
@@ -291,19 +315,50 @@ struct VoltaFlashWorkspace {
     Tensor dst_meta;
 };
 
+struct VoltaSplitDWorkspace {
+    Tensor k_gathered;
+    Tensor v_gathered;
+    Tensor staged_q;
+    Tensor staged_out;
+    Tensor partials;
+};
+
+std::int32_t volta_kv_heads(std::int32_t q_heads) {
+    return q_heads == CausalD256H24Kv4::QHeads ? CausalD256H24Kv4::KVHeads
+                                               : CausalD256H16Kv2::KVHeads;
+}
+
+std::int32_t volta_gathered_keys(CausalAttentionExecutionEnvelope envelope) {
+    const auto visible = static_cast<std::int32_t>(envelope.max_visible_keys);
+    return ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
+           detail::kVoltaFlashKeyPad;
+}
+
+template <class Allocator>
+VoltaSplitDWorkspace allocate_volta_splitd_workspace(Allocator& workspace, std::int32_t q_heads,
+                                                     std::int32_t width,
+                                                     CausalAttentionExecutionEnvelope envelope) {
+    const std::int32_t kv_heads = volta_kv_heads(q_heads);
+    const std::int32_t n_kv     = volta_gathered_keys(envelope);
+    const detail::VoltaSplitDWorkspaceShape shape =
+        detail::causal_attention_volta_splitd_workspace_shape(q_heads, width);
+    return {
+        workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
+        workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
+        workspace.alloc(DType::FP16, {static_cast<std::int32_t>(shape.staged_q_halves), 1, 1, 1}),
+        workspace.alloc(DType::FP32, {static_cast<std::int32_t>(shape.output_floats), 1, 1, 1}),
+        workspace.alloc(DType::FP32, {static_cast<std::int32_t>(shape.partial_floats), 1, 1, 1}),
+    };
+}
+
 template <class Allocator>
 VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace,
                                                    std::int32_t q_heads,
                                                    std::int32_t width,
                                                    CausalAttentionExecutionEnvelope envelope) {
-    const std::int32_t kv_heads = q_heads == CausalD256H24Kv4::QHeads
-                                      ? CausalD256H24Kv4::KVHeads
-                                      : CausalD256H16Kv2::KVHeads;
-    const auto visible          = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const std::int32_t n_kv =
-        ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
-        detail::kVoltaFlashKeyPad;
-    const std::int32_t tokens = std::min(width, detail::kVoltaFlashQBlockTokens);
+    const std::int32_t kv_heads = volta_kv_heads(q_heads);
+    const std::int32_t n_kv     = volta_gathered_keys(envelope);
+    const std::int32_t tokens   = std::min(width, detail::kVoltaFlashQBlockTokens);
 
     return {
         workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
@@ -476,8 +531,14 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         if (route == detail::CausalAttentionRoute::Prompt) {
 #ifdef NINFER_VOLTA_BUILD
             if (volta_flash_route_possible(q_heads, width, batch_size, cache_storage)) {
+                // A split-D selection reserves its staging even when an inexact envelope sends
+                // the launch to the direct kernel, so its staged workspace alone bounds the route.
                 WorkspaceLayoutBuilder layout;
-                (void)allocate_volta_flash_workspace(layout, q_heads, width, envelope);
+                if (detail::volta_prefill_attention() == detail::VoltaPrefillAttention::SplitD) {
+                    (void)allocate_volta_splitd_workspace(layout, q_heads, width, envelope);
+                } else {
+                    (void)allocate_volta_flash_workspace(layout, q_heads, width, envelope);
+                }
                 return layout.peak_bytes(1);
             }
 #endif
@@ -549,13 +610,28 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 #ifdef NINFER_VOLTA_BUILD
     if (route == detail::CausalAttentionRoute::Prompt && valid_columns.data == nullptr &&
         volta_flash_route_possible(q.ne[1], width, batch, cache.storage)) {
-        VoltaFlashWorkspace staging =
-            allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
-        detail::causal_attention_volta_flash_launch(
-            q, k, v, positions, kv_table_rows, scale, cache, envelope,
-            detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered,
-            staging.mask, staging.q_f32, staging.out_f32, staging.dst_meta, out, stream);
-        return;
+        if (detail::volta_prefill_attention() == detail::VoltaPrefillAttention::Flash) {
+            VoltaFlashWorkspace staging =
+                allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
+            detail::causal_attention_volta_flash_launch(
+                q, k, v, positions, kv_table_rows, scale, cache, envelope,
+                detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered,
+                staging.mask, staging.q_f32, staging.out_f32, staging.dst_meta, out, stream);
+            return;
+        }
+        // Split-D derives every row's causal limit from an exact envelope rather than from the
+        // positions; any other envelope keeps the direct kernel below, which masks from them. The
+        // staging is reserved either way, so the high-water matches the capacity query, which
+        // covers every exact launch within the envelope.
+        VoltaSplitDWorkspace staging =
+            allocate_volta_splitd_workspace(workspace, q.ne[1], width, envelope);
+        if (envelope.min_visible_keys == envelope.max_visible_keys) {
+            detail::causal_attention_volta_splitd_launch(
+                q, k, v, positions, kv_table_rows, scale, cache, envelope,
+                volta_kv_heads(q.ne[1]), staging.k_gathered, staging.v_gathered,
+                staging.staged_q, staging.staged_out, staging.partials, out, stream);
+            return;
+        }
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows,
