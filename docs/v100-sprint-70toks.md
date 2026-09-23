@@ -18,9 +18,13 @@ over >= 9 probes. Draft-quality changes are compared on a paired greedy benchmar
 | + attention split-K, NVFP4 batching, fp16 staging, Q4 pipeline, K=4 | 43.5 | 2.96 | 68 |
 | + draft-path GEMVs (W8 T=1, Q4 head, W8 catch-up) | 41.9 | 2.96 | 70.6 |
 | + verify-path fusions (gemv track) | **38.9** | 3.01 | **77.4** |
-| same build, second checkpoint of the same architecture | **37.8** | 2.96 | **78.5** |
+| same build, second checkpoint of the same architecture | 37.8 | 2.96 | 78.5 |
+| + key-major int8 attention kernel (second checkpoint) | **35.0** | 2.83 | **80.8** |
+| same, DFlash2 K=7 (second checkpoint; best at short context: 96-122 tok/s) | 47.4 | 3.74 | 78.8 |
 
 ## Changes (branch `integration`)
+- Attention: key-major Volta int8 kernel (keys/head dims on the 32-wide mma axis, one int8 quant group per
+  warp loaded straight to registers, overlapping prefetch, lazy per-row max). 26k: W1 264 -> 93 us, W5 290 -> 128, W8 554 -> 207.
 - Attention (small_t_i8_volta): split-K QK^T across the dim-split warps, quadpair-split tail QK^T,
   16-byte fragment loads, device-side wave alignment, magic-bias int8 dequant, fp32 PV accumulation
   with lazy rescale. 26k: W=6 935 -> 390 us, W=1 543 -> 266 us.
