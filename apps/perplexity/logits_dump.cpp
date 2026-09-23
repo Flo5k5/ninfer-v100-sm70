@@ -115,6 +115,32 @@ KldBaseHeader read_kld_base_header(const std::filesystem::path& path) {
     return header;
 }
 
+void check_reference_tokens(const KldBaseHeader& reference, std::uint32_t context,
+                            std::size_t chunks, std::span<const TokenId> tokens, bool prefix) {
+    if (reference.context != context) {
+        throw std::runtime_error("reference dump context " + std::to_string(reference.context) +
+                                 " differs from --context " + std::to_string(context));
+    }
+    const std::size_t evaluated = chunks * context;
+    if (tokens.size() < evaluated) {
+        throw std::logic_error("reference check received fewer tokens than the window plan");
+    }
+    const std::size_t compared = std::min(evaluated, reference.tokens.size());
+    for (std::size_t i = 0; i < compared; ++i) {
+        if (tokens[i] != reference.tokens[i]) {
+            throw std::runtime_error("tokenization differs from the reference dump at token " +
+                                     std::to_string(i) + " (ours " + std::to_string(tokens[i]) +
+                                     ", reference " + std::to_string(reference.tokens[i]) + ")");
+        }
+    }
+    if (prefix ? reference.chunks < chunks : reference.chunks != chunks) {
+        throw std::runtime_error(
+            "reference dump has " + std::to_string(reference.chunks) + " chunks, this run " +
+            (prefix ? "scores the first " : "yields ") + std::to_string(chunks) +
+            (prefix ? "" : " (use --chunks to compare with a prefix of a longer reference)"));
+    }
+}
+
 KldBaseWriter::KldBaseWriter(std::filesystem::path path, std::uint32_t context,
                              std::uint32_t chunks, std::span<const TokenId> tokens,
                              std::optional<std::uint32_t> expected_vocab)
@@ -131,6 +157,32 @@ KldBaseWriter::KldBaseWriter(std::filesystem::path path, std::uint32_t context,
     partial_path_ += ".partial";
     if (std::filesystem::exists(path_)) {
         throw std::runtime_error("logits output already exists: " + path_.string());
+    }
+    if (std::filesystem::exists(partial_path_)) {
+        throw std::runtime_error(
+            "a partial logits dump from an interrupted run exists: " + partial_path_.string() +
+            "; delete it or choose another --logits-out");
+    }
+    const std::filesystem::path directory = std::filesystem::absolute(path_).parent_path();
+    if (!std::filesystem::is_directory(directory)) {
+        throw std::runtime_error("logits output directory does not exist: " + directory.string());
+    }
+    if (expected_vocab_) { require_space(*expected_vocab_); }
+    // Created now so an unwritable destination fails before scoring; the header is written by
+    // the first consume(), when the logits row width is known.
+    output_.open(partial_path_, std::ios::binary | std::ios::trunc);
+    if (!output_) { throw std::runtime_error("cannot create " + partial_path_.string()); }
+}
+
+void KldBaseWriter::require_space(std::uint32_t vocab) const {
+    const std::uint64_t bytes =
+        kld_base_header_bytes(context_, chunks_) +
+        expected_positions_ * kld_base_words_per_position(vocab) * sizeof(std::uint16_t);
+    const std::filesystem::path directory   = std::filesystem::absolute(path_).parent_path();
+    const std::filesystem::space_info space = std::filesystem::space(directory);
+    if (space.available < bytes) {
+        throw std::runtime_error("logits dump needs " + std::to_string(bytes) + " bytes but " +
+                                 directory.string() + " has " + std::to_string(space.available));
     }
 }
 
@@ -149,17 +201,7 @@ void KldBaseWriter::open(std::uint32_t vocab, std::uint32_t valid_rows) {
     }
     vocab_      = vocab;
     valid_rows_ = valid_rows;
-    const std::uint64_t bytes =
-        kld_base_header_bytes(context_, chunks_) +
-        expected_positions_ * kld_base_words_per_position(vocab_) * sizeof(std::uint16_t);
-    std::filesystem::path directory         = std::filesystem::absolute(path_).parent_path();
-    const std::filesystem::space_info space = std::filesystem::space(directory);
-    if (space.available < bytes) {
-        throw std::runtime_error("logits dump needs " + std::to_string(bytes) + " bytes but " +
-                                 directory.string() + " has " + std::to_string(space.available));
-    }
-    output_.open(partial_path_, std::ios::binary | std::ios::trunc);
-    if (!output_) { throw std::runtime_error("cannot create " + partial_path_.string()); }
+    require_space(vocab_);
     output_.write(kMagic, sizeof(kMagic));
     write_value(output_, context_);
     write_value(output_, static_cast<std::int32_t>(vocab_));
@@ -175,7 +217,7 @@ void KldBaseWriter::consume(const std::uint16_t* bf16_logits, std::uint32_t colu
     if (columns == 0 || row_stride == 0 || valid_rows == 0 || valid_rows > row_stride) {
         throw std::invalid_argument("logits block has an invalid shape");
     }
-    if (!output_.is_open()) {
+    if (vocab_ == 0) {
         open(row_stride, valid_rows);
     } else if (row_stride != vocab_ || valid_rows != valid_rows_) {
         throw std::logic_error("logits row shape changed during a dump");
@@ -204,13 +246,15 @@ void KldBaseWriter::consume(const std::uint16_t* bf16_logits, std::uint32_t colu
             }
         } catch (...) { errors[worker] = std::current_exception(); }
     };
-    std::vector<std::thread> threads;
-    threads.reserve(workers - 1);
-    for (unsigned worker = 1; worker < workers; ++worker) {
-        threads.emplace_back(encode_range, worker);
+    {
+        // jthread joins on destruction: a failed thread creation cannot std::terminate.
+        std::vector<std::jthread> threads;
+        threads.reserve(workers - 1);
+        for (unsigned worker = 1; worker < workers; ++worker) {
+            threads.emplace_back(encode_range, worker);
+        }
+        encode_range(0);
     }
-    encode_range(0);
-    for (std::thread& thread : threads) { thread.join(); }
     for (const std::exception_ptr& error : errors) {
         if (error) { std::rethrow_exception(error); }
     }
@@ -223,7 +267,7 @@ void KldBaseWriter::consume(const std::uint16_t* bf16_logits, std::uint32_t colu
 
 std::uint64_t KldBaseWriter::finish() {
     if (finished_) { throw std::logic_error("KLD base writer is already finished"); }
-    if (!output_.is_open() || written_positions_ != expected_positions_) {
+    if (vocab_ == 0 || written_positions_ != expected_positions_) {
         throw std::logic_error("logits dump holds " + std::to_string(written_positions_) + " of " +
                                std::to_string(expected_positions_) + " scored positions");
     }

@@ -1,6 +1,7 @@
 #include "corpus.h"
 #include "evaluation.h"
 #include "logits_dump.h"
+#include "options.h"
 
 #include "ninfer/engine.h"
 #include "product/logging/logging.h"
@@ -11,7 +12,6 @@
 #include <spdlog/logger.h>
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -20,7 +20,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -29,7 +28,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -40,145 +38,9 @@ using json  = nlohmann::json;
 using ninfer::perplexity::CorpusSelection;
 using ninfer::perplexity::KldBaseHeader;
 using ninfer::perplexity::KldBaseWriter;
+using ninfer::perplexity::Options;
 using ninfer::perplexity::ScoreAggregate;
 using ninfer::perplexity::WindowPlan;
-
-struct Options {
-    bool help_requested = false;
-    std::filesystem::path artifact;
-    std::optional<std::filesystem::path> corpus;
-    std::optional<std::filesystem::path> text;
-    std::optional<std::filesystem::path> output;
-    std::optional<std::filesystem::path> logits_out;
-    std::optional<std::filesystem::path> logits_reference;
-    std::optional<std::uint32_t> chunks;
-    std::uint32_t context               = 4096;
-    std::uint32_t stride                = 2048;
-    bool stride_set                     = false;
-    int device                          = 0;
-    ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    bool quick                          = false;
-    ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
-};
-
-std::string usage_text() {
-    return "usage: ninfer-perplexity <model.ninfer> "
-           "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
-           "       [--logits-out <file> [--logits-reference <file>] [--chunks N]]\n"
-           "       [--log-level trace|debug|info|warning|error|critical|off]\n";
-}
-
-[[noreturn]] void usage_error(std::string_view message) {
-    throw std::invalid_argument(std::string(message));
-}
-
-template <class Integer>
-Integer parse_integer(std::string_view text, const char* label) {
-    Integer value{};
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (error != std::errc{} || end != text.data() + text.size()) {
-        usage_error(std::string("invalid ") + label + ": " + std::string(text));
-    }
-    return value;
-}
-
-Options parse_options(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        return Options{.help_requested = true};
-    }
-    if (argc < 2 || std::string_view(argv[1]).starts_with("--")) {
-        usage_error("artifact path is required");
-    }
-    Options out;
-    out.artifact = argv[1];
-    for (int i = 2; i < argc; ++i) {
-        const std::string_view option = argv[i];
-        const auto value              = [&](const char* label) -> std::string_view {
-            if (++i >= argc) { usage_error(std::string(label) + " requires a value"); }
-            return argv[i];
-        };
-        if (option == "--corpus") {
-            out.corpus = std::filesystem::path(value("--corpus"));
-        } else if (option == "--text") {
-            out.text = std::filesystem::path(value("--text"));
-        } else if (option == "--quick") {
-            out.quick = true;
-        } else if (option == "--context") {
-            out.context = parse_integer<std::uint32_t>(value("--context"), "context");
-        } else if (option == "--stride") {
-            out.stride     = parse_integer<std::uint32_t>(value("--stride"), "stride");
-            out.stride_set = true;
-        } else if (option == "--device") {
-            out.device = parse_integer<int>(value("--device"), "device");
-        } else if (option == "--kv-dtype") {
-            const std::string_view dtype = value("--kv-dtype");
-            if (dtype == "bf16") {
-                out.kv = ninfer::KvCacheStorage::BFloat16;
-            } else if (dtype == "int8") {
-                out.kv = ninfer::KvCacheStorage::Int8Group64;
-            } else if (dtype == "fp8") {
-                out.kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
-            } else if (dtype == "nvfp4") {
-                out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
-            } else if (dtype == "k8v4") {
-                out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
-            } else {
-                usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
-            }
-        } else if (option == "--output") {
-            out.output = std::filesystem::path(value("--output"));
-        } else if (option == "--logits-out") {
-            out.logits_out = std::filesystem::path(value("--logits-out"));
-        } else if (option == "--logits-reference") {
-            out.logits_reference = std::filesystem::path(value("--logits-reference"));
-        } else if (option == "--chunks") {
-            out.chunks = parse_integer<std::uint32_t>(value("--chunks"), "chunks");
-        } else if (option == "--log-level") {
-            out.log_level = ninfer::product::parse_log_level(value("--log-level"));
-        } else {
-            usage_error("unknown option: " + std::string(option));
-        }
-    }
-    if (out.corpus.has_value() == out.text.has_value()) {
-        usage_error("exactly one of --corpus and --text is required");
-    }
-    if (out.quick && !out.corpus) { usage_error("--quick requires --corpus"); }
-    if (out.context < 2 || out.stride == 0 || out.stride >= out.context) {
-        usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
-    }
-    if ((out.logits_reference || out.chunks) && !out.logits_out) {
-        usage_error("--logits-reference and --chunks require --logits-out");
-    }
-    if (out.chunks && *out.chunks == 0) { usage_error("--chunks must be positive"); }
-    if (out.logits_out) {
-        if (!out.text) { usage_error("--logits-out requires --text (one token stream)"); }
-        if (out.context < 4) { usage_error("--logits-out requires --context >= 4"); }
-        if (out.stride_set && out.stride != out.context / 2) {
-            usage_error("--logits-out scores the second half of non-overlapping context windows; "
-                        "--stride must be omitted or equal context/2");
-        }
-        out.stride = out.context / 2;
-    }
-    return out;
-}
-
-std::string kv_name(ninfer::KvCacheStorage value) {
-    switch (value) {
-    case ninfer::KvCacheStorage::BFloat16:
-        return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
-        return "int8-g64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8-e4m3-r256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    throw std::logic_error("unknown KV dtype");
-}
 
 std::string safe_component(std::string_view value) {
     std::string out;
@@ -204,8 +66,8 @@ std::filesystem::path prepare_output_directory(const Options& options,
                                                const CorpusSelection& corpus) {
     std::filesystem::path output = options.output.value_or(
         std::filesystem::path("profiles/perplexity") / safe_component(load.model_id) /
-        safe_component(load.weights_id) / kv_name(options.kv) / safe_component(corpus.corpus_id) /
-        safe_component(corpus.mode) / timestamp());
+        safe_component(load.weights_id) / ninfer::perplexity::kv_dtype_name(options.kv) /
+        safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp());
     if (std::filesystem::exists(output)) {
         if (!std::filesystem::is_directory(output) ||
             std::filesystem::directory_iterator(output) != std::filesystem::directory_iterator()) {
@@ -233,27 +95,6 @@ std::uint64_t scored_targets(const std::vector<WindowPlan>& windows) {
     std::uint64_t out = 0;
     for (const WindowPlan& window : windows) { out += window.target_end - window.target_begin; }
     return out;
-}
-
-// Rejects a tokenization that differs from the reference dump before any GPU scoring time is spent.
-void check_reference_tokens(const KldBaseHeader& reference, std::uint32_t context,
-                            std::size_t chunks, const std::vector<ninfer::TokenId>& tokens) {
-    if (reference.context != context) {
-        throw std::runtime_error("reference dump context " + std::to_string(reference.context) +
-                                 " differs from --context " + std::to_string(context));
-    }
-    const std::size_t compared = std::min(tokens.size(), reference.tokens.size());
-    for (std::size_t i = 0; i < compared; ++i) {
-        if (tokens[i] != reference.tokens[i]) {
-            throw std::runtime_error("tokenization differs from the reference dump at token " +
-                                     std::to_string(i) + " (ours " + std::to_string(tokens[i]) +
-                                     ", reference " + std::to_string(reference.tokens[i]) + ")");
-        }
-    }
-    if (reference.chunks != chunks) {
-        throw std::runtime_error("reference dump has " + std::to_string(reference.chunks) +
-                                 " chunks, this stream yields " + std::to_string(chunks));
-    }
 }
 
 struct EvaluationStream {
@@ -327,7 +168,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         const std::size_t chunks       = stream.windows.size();
         if (options.logits_reference) {
             reference = ninfer::perplexity::read_kld_base_header(*options.logits_reference);
-            check_reference_tokens(*reference, options.context, chunks, stream.tokens);
+            ninfer::perplexity::check_reference_tokens(*reference, options.context, chunks,
+                                                       stream.tokens, options.chunks.has_value());
             logger->info("tokenization matches the reference dump | {} chunks | {} tokens", chunks,
                          ninfer::product::format_pretty_count(reference->tokens.size()));
         }
@@ -495,7 +337,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"window_plan", options.logits_out ? "kld-chunks" : "sliding"},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
-          {"kv_dtype", kv_name(options.kv)}}},
+          {"kv_dtype", ninfer::perplexity::kv_dtype_name(options.kv)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"read_and_tokenize_seconds", preflight_seconds},
@@ -522,9 +364,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
     std::cout << "Perplexity result\n"
               << "artifact: " << load.model_id << " / " << load.weights_id << '\n'
-              << "kv: " << kv_name(options.kv) << ", corpus: " << corpus.corpus_id << " / "
-              << corpus.mode << ", context/stride: " << options.context << '/' << options.stride
-              << "\n\n";
+              << "kv: " << ninfer::perplexity::kv_dtype_name(options.kv)
+              << ", corpus: " << corpus.corpus_id << " / " << corpus.mode
+              << ", context/stride: " << options.context << '/' << options.stride << "\n\n";
     std::cout << std::left << std::setw(24) << "domain" << std::right << std::setw(16) << "tokens"
               << std::setw(16) << "mean_nll" << std::setw(16) << "ppl" << '\n';
     for (const auto& [domain, aggregate] : domains) {
@@ -546,14 +388,14 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 int main(int argc, char** argv) {
     Options options;
     try {
-        options = parse_options(argc, argv);
+        options = ninfer::perplexity::parse_options(argc, argv);
     } catch (const std::exception& error) {
         std::cerr << "ninfer-perplexity: " << error.what() << '\n';
-        std::cerr << usage_text();
+        std::cerr << ninfer::perplexity::usage_text();
         return 1;
     }
     if (options.help_requested) {
-        std::cout << usage_text();
+        std::cout << ninfer::perplexity::usage_text();
         return 0;
     }
 

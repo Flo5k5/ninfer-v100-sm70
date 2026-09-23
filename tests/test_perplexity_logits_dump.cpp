@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <random>
@@ -154,6 +155,86 @@ int check_writer_rejections(const std::filesystem::path& directory) {
     return failures;
 }
 
+std::string rejection_message(const std::function<void()>& operation) {
+    try {
+        operation();
+    } catch (const std::exception& error) { return error.what(); }
+    return {};
+}
+
+int check_reference_checks() {
+    using ninfer::perplexity::check_reference_tokens;
+    int failures = 0;
+    ninfer::perplexity::KldBaseHeader reference;
+    reference.context = 8;
+    reference.chunks  = 3;
+    reference.vocab   = 6;
+    for (int i = 0; i < 24; ++i) { reference.tokens.push_back(100 + i); }
+    std::vector<ninfer::TokenId> ours(reference.tokens);
+    ours.push_back(7); // tokens after the last full window are not evaluated
+
+    failures += require(
+        rejection_message([&] { check_reference_tokens(reference, 8, 3, ours, false); }).empty(),
+        "an identical stream passes the reference check");
+    failures += require(
+        rejection_message([&] { check_reference_tokens(reference, 8, 2, ours, true); }).empty(),
+        "a --chunks run may use a prefix of a longer reference");
+
+    std::vector<ninfer::TokenId> diverging(ours);
+    diverging[13] = 5;
+    const std::string divergence =
+        rejection_message([&] { check_reference_tokens(reference, 8, 3, diverging, false); });
+    failures += require(divergence.find("at token 13 (ours 5, reference 113)") != std::string::npos,
+                        "a token divergence names its position and both ids");
+    failures += require(rejection_message([&] {
+                            check_reference_tokens(reference, 16, 1, ours, false);
+                        }).find("context 8 differs from --context 16") != std::string::npos,
+                        "a different context is rejected");
+    failures +=
+        require(rejection_message([&] {
+                    check_reference_tokens(reference, 8, 2, ours, false);
+                }).find("has 3 chunks, this run yields 2") != std::string::npos,
+                "without --chunks the chunk counts must be equal even with an equal prefix");
+    std::vector<ninfer::TokenId> longer(ours);
+    for (int i = 0; i < 8; ++i) { longer.insert(longer.end() - 1, 124 + i); }
+    failures += require(rejection_message([&] {
+                            check_reference_tokens(reference, 8, 4, longer, true);
+                        }).find("has 3 chunks, this run scores the first 4") != std::string::npos,
+                        "a --chunks run cannot score more windows than the reference holds");
+    return failures;
+}
+
+int check_writer_preflight(const std::filesystem::path& directory) {
+    int failures = 0;
+    std::vector<ninfer::TokenId> tokens(16, 1);
+    const std::filesystem::path path = directory / "preflight.kld";
+    std::filesystem::path partial    = path;
+    partial += ".partial";
+    {
+        ninfer::perplexity::KldBaseWriter writer(path, 8, 2, tokens, std::nullopt);
+        failures += require(std::filesystem::exists(partial),
+                            "the partial file exists before the first logits block");
+    }
+    failures += require(!std::filesystem::exists(partial), "an unused writer removes its file");
+
+    std::ofstream(partial) << "stale";
+    const std::string stale = rejection_message(
+        [&] { ninfer::perplexity::KldBaseWriter writer(path, 8, 2, tokens, std::nullopt); });
+    failures += require(stale.find(partial.string()) != std::string::npos,
+                        "a stale partial dump is refused and named");
+    failures += require(std::filesystem::exists(partial),
+                        "a refused writer leaves another run's partial file alone");
+    std::filesystem::remove(partial);
+
+    const std::string missing = rejection_message([&] {
+        ninfer::perplexity::KldBaseWriter writer(directory / "absent" / "dump.kld", 8, 2, tokens,
+                                                 std::nullopt);
+    });
+    failures += require(missing.find("directory does not exist") != std::string::npos,
+                        "a missing output directory is refused before scoring");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -166,6 +247,8 @@ int main() {
         failures += check_encoding_against_oracle();
         failures += check_writer_round_trip(directory);
         failures += check_writer_rejections(directory);
+        failures += check_reference_checks();
+        failures += check_writer_preflight(directory);
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
         ++failures;
