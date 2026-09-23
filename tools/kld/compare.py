@@ -26,7 +26,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from tools.kld.dump import Dump, DumpError, decode, read_dump
+from tools.kld.dump import Dump, DumpError, decode, positive_integer, read_dump
 from tools.kld.exact_ppl import ExactPpl, check_exact_ppl
 
 COMPARE_SCHEMA = "ninfer-kld-compare/1"
@@ -156,6 +156,10 @@ def compare(reference_path: Path, candidates: Sequence[tuple[str, Path]], *,
             exact_ppl: dict[str, ExactPpl] | None = None,
             chunks: int | None = None) -> dict[str, Any]:
     exact_ppl = exact_ppl or {}
+    # A block size below 1 would make range(begin, end, block_rows) empty for begin < end, so
+    # _score_range would return its pre-allocated (uninitialized) arrays without ever filling
+    # them: a silent wrong answer rather than a loud failure.
+    block_rows = positive_integer(block_rows, "block_rows")
     reference = read_dump(reference_path)
     candidate_dumps = [read_dump(path) for _, path in candidates]
     if chunks is not None:
