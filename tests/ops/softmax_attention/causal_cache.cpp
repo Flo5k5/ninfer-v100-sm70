@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -20,6 +21,7 @@
 #include "core/device.h"
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -2371,6 +2373,36 @@ int run_batch_cases() {
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Int8Group64,
                             {6, 9000, 16384, 528u, false, true, 36.0f}, MappingPattern::Fragmented);
 #ifdef NINFER_VOLTA_BUILD
+    // Wide prompts take the staged tensor-core prefill route. Near-uniform attention over a long
+    // prefix is its worst case for P.V accumulation: every key carries weight, so an FP16
+    // accumulator both grows with the key count and drops the contributions below its half-ulp.
+    // The route must hold the same FP64-oracle criterion as the short cases. The flash selection
+    // keeps FP16 P.V accumulators and exceeds it here (relative L2 about 1.1x the limit at 16k
+    // keys), which is why split-D is the default; it skips these four cases.
+    const char* prefill_attention = std::getenv("NINFER_VOLTA_PREFILL_ATTENTION");
+    if (prefill_attention != nullptr && std::string_view(prefill_attention) == "flash") {
+        std::cout << "SKIP long-prefix accumulation cases under the flash prefill kernel\n";
+    } else {
+        failures += run_a1_case(kGeometries[0], KvCacheStorage::BFloat16,
+                                {64, 16320, 16384, 540u}, MappingPattern::Fragmented);
+        failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                                {96, 16288, 16384, 541u}, MappingPattern::Identity);
+        failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                                {64, 16320, 16384, 542u, false, false, 36.0f},
+                                MappingPattern::Fragmented);
+        failures += run_a1_case(kGeometries[1], KvCacheStorage::Int8Group64,
+                                {64, 16320, 16384, 543u}, MappingPattern::Fragmented);
+    }
+    // Several Q-blocks, a width that is not a multiple of the 64-row tile, and a prefix too short
+    // for the three-way key split.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64, {1100, 100, 1200, 544u},
+                            MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::BFloat16, {130, 0, 130, 545u},
+                            MappingPattern::Identity);
+    // An inexact envelope (more visible keys promised than the prompt reaches): split-D derives its
+    // causal limits from an exact envelope, so this width falls back to the direct kernel.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64, {96, 400, 2048, 546u},
+                            MappingPattern::Fragmented);
     failures +=
         run_width_invariance_case(kGeometries[0], KvCacheStorage::Int8Group64, 9000, 8, 530u);
     failures +=

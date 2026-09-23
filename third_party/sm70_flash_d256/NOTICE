@@ -1,0 +1,12 @@
+SM70 D256 Split-D flash attention (vendored)
+
+fattn-sm70-d256-kernel.cuh
+  Copyright (c) 2026 1CatAI.
+  From the 1Cat-vLLM project (https://github.com/1CatAI/1Cat-vLLM, tag v1.3.0,
+  csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu). Distributed under the
+  BSD 3-Clause License reproduced in LICENSE.
+
+flash/*
+  Copyright (c) 2023-2024, Tri Dao and the FlashAttention contributors, as
+  carried by the Volta fork https://github.com/zhinianqin/flash-attention-v100
+  (commit c2eda5e6). Distributed under the BSD 3-Clause License in LICENSE.
