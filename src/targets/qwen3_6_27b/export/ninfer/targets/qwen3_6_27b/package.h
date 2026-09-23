@@ -33,6 +33,8 @@ enum class WeightsProfile : std::uint8_t {
     Qwen38GroupwiseInt,
     Qwen36Nvfp4,
     Qwen38Nvfp4,
+    // Qwen38Nvfp4 with MLP 56-63 and the output head moved from FP8 to NVFP4.
+    Qwen38Nvfp4FullA,
 };
 
 using Frontend        = qwen3_6::Frontend;

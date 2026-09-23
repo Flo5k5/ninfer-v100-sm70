@@ -204,10 +204,19 @@ ObjectHandle resolve_input_divisor(Binder& binder, std::string_view v2_name) {
                 found.push_back(whole_object_of(directory, aux->second, v2_name));
             }
         }
-        if (found.size() != 1) {
-            throw ArtifactError(quote_name(v2_name) + ": expected exactly one Use of " + quote_name(leaf) +
-                                " with an activation input divisor, found " +
-                                std::to_string(found.size()));
+        // A parameter read from several inputs (the output head: text, MTP and DFlash2 hidden
+        // states) may carry one divisor per Use, provided they all name the same object.
+        if (found.empty()) {
+            throw ArtifactError(quote_name(v2_name) + ": no Use of " + quote_name(leaf) +
+                                " carries an activation input divisor");
+        }
+        const bool shared =
+            std::all_of(found.begin(), found.end(),
+                        [&](const ObjectHandle& handle) { return handle == found.front(); });
+        if (!shared) {
+            throw ArtifactError(quote_name(v2_name) + ": the " + std::to_string(found.size()) +
+                                " Uses of " + quote_name(leaf) +
+                                " name different activation input divisor objects");
         }
         divisors.push_back(found.front());
     }
