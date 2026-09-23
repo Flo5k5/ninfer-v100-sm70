@@ -316,6 +316,14 @@ bool Variant::gdn_input_takes_fp16(const GdnProjectionWeights& weights, std::int
                                                            TextConfig::hidden, width * batch);
 }
 
+bool Variant::attention_projection_takes_fp16(const FullAttentionProjectionWeights& weights,
+                                              std::int32_t tokens) {
+    const auto* fused = std::get_if<FusedAttentionProjectionPayload>(&weights);
+    if (fused == nullptr) { return false; }
+    const Weight& parent = fused->query_key_gate_value;
+    return ops::attn_input_proj_fp16_activation_supported(parent, text_policy(parent), tokens);
+}
+
 bool Variant::gdn_output_takes_fp16(const Weight& weight, std::int32_t tokens) {
     return ops::linear_add_fp16_activation_supported(weight, text_policy(weight), tokens);
 }
