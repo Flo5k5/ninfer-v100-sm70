@@ -77,6 +77,10 @@ enum class RequestFailureClass : std::uint8_t {
     Internal,
 };
 
+// Log-safe failure description shared by the operational and JSONL sinks. It deliberately has no
+// free-text message: API error messages and exception text can quote prompts, generated output,
+// tool arguments, or media locations, so no log record may carry them. Type, code, and parameter
+// are server-defined identifiers; the complete message is returned only to the client.
 struct RequestFailure {
     RequestFailurePhase phase          = RequestFailurePhase::Generation;
     RequestFailureClass classification = RequestFailureClass::Internal;
@@ -84,9 +88,6 @@ struct RequestFailure {
     std::string error_type;
     std::string error_code;
     std::string param;
-    // Used only by the independent JSONL measurement writer. Operational rendering never consumes
-    // this field.
-    std::string machine_message;
 };
 
 struct ThroughputReport {
@@ -111,8 +112,7 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
 
 [[nodiscard]] RequestFailure make_request_failure(RequestFailurePhase phase, const ApiError& error);
 [[nodiscard]] RequestFailure make_generation_request_failure(const ApiError& error);
-[[nodiscard]] RequestFailure make_internal_request_failure(RequestFailurePhase phase,
-                                                           std::string machine_message);
+[[nodiscard]] RequestFailure make_internal_request_failure(RequestFailurePhase phase);
 [[nodiscard]] RequestFailure make_client_disconnected_failure(RequestFailurePhase phase);
 
 } // namespace ninfer::serve

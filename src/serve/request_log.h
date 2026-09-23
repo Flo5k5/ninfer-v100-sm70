@@ -1,7 +1,9 @@
 #pragma once
 
 // Optional full-precision JSONL measurement log. Human operational rendering is owned separately
-// by operational_log.* and never consumes these serialized records.
+// by operational_log.* and never consumes these serialized records. Records hold identifiers,
+// shapes, counts, timings, and error classifications only; prompt text, generated text, tool
+// definitions or arguments, and free-text error messages are never written.
 
 #include "serve/request_events.h"
 #include "serve/serve_options.h"
@@ -20,7 +22,7 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 20;
+inline constexpr int kRequestLogSchemaVersion        = 21;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
@@ -55,7 +57,8 @@ std::string format_request_done_json(const std::string& server_instance_id,
                                      const GenerationOutcome& outcome);
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
-                                      const RequestLogContext& context, const std::string& message);
+                                      const RequestLogContext& context,
+                                      const RequestFailure& failure);
 std::string format_throughput_json(const std::string& server_instance_id,
                                    std::uint64_t timestamp_unix_ms, const ThroughputReport& report);
 
@@ -86,7 +89,7 @@ public:
     void write_request_start(const RequestLogContext& context);
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
-    void write_request_error(const RequestLogContext& context, const std::string& message);
+    void write_request_error(const RequestLogContext& context, const RequestFailure& failure);
     void write_throughput(const ThroughputReport& report);
 
 private:

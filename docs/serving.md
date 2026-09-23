@@ -830,8 +830,10 @@ readiness, request lifecycle, fixed-interval throughput, and shutdown; `--log-le
 internal startup and resource-planning detail. A terminal may use one transient line during startup,
 but Serve throughput is always a persistent record. Redirected stderr contains no terminal control
 sequences. Pretty values use readable units and rounded rates; use the independent request JSONL for
-complete fields and full precision. Operational records never contain prompts, generated text,
-request bodies, credentials, or arbitrary client error messages.
+complete fields and full precision. At every `--log-level`, operational records never contain
+prompts, generated text, tool names or arguments, request bodies, credentials, or error messages;
+failures are reported by phase, HTTP status, and error code. `debug` and `trace` add only startup
+and resource-planning detail.
 If a tool marker is returned to text because its structure or tool identity cannot be represented,
 Serve emits one warning with only the failure classification, never the generated markup.
 
@@ -842,7 +844,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v20 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -852,9 +854,9 @@ they do not infer request behavior from process-global counter deltas.
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
-| `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
+| `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the HTTP status/type/code/parameter of a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
-| `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
+| `request_error` | the resolved request configuration and the failure `phase` (`generation`, `response_render`, or `transport`) with its HTTP status/type/code/parameter |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 
 `requested_reasoning_effort` is the client value or `null` when omitted.
@@ -894,8 +896,10 @@ round count; `units` reports its prefill/control unit counts. In a compact batch
 request is delayed by the full round, so these values explain request latency but **must not be
 summed across concurrent requests**.
 
-The JSONL file contains no generated response text and never records an API-key value; `argv`
-replaces that value with `<redacted>`. Operational stderr summaries are rounded and are not the
+The JSONL file contains no prompt or generated text, tool definitions or arguments, media locations,
+or error messages, and never records an API-key value; `argv` replaces that value with
+`<redacted>`. Error messages can quote client input or model output, so they reach only the HTTP
+client. Operational stderr summaries are rounded and are not the
 aggregation source. OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a
 request ID when they enter synchronous preparation. Successful preparation produces
 `request_start`; a preparation failure produces `request_rejected` without a matching start. Each

@@ -71,13 +71,12 @@ RequestFailure make_request_failure(RequestFailurePhase phase, const ApiError& e
         classification = RequestFailureClass::ClientInput;
     }
     return RequestFailure{
-        .phase           = phase,
-        .classification  = classification,
-        .http_status     = error.status,
-        .error_type      = error.type,
-        .error_code      = error.code,
-        .param           = error.param,
-        .machine_message = error.message,
+        .phase          = phase,
+        .classification = classification,
+        .http_status    = error.status,
+        .error_type     = error.type,
+        .error_code     = error.code,
+        .param          = error.param,
     };
 }
 
@@ -89,25 +88,22 @@ RequestFailure make_generation_request_failure(const ApiError& error) {
     return failure;
 }
 
-RequestFailure make_internal_request_failure(RequestFailurePhase phase,
-                                             std::string machine_message) {
+RequestFailure make_internal_request_failure(RequestFailurePhase phase) {
     return RequestFailure{
-        .phase           = phase,
-        .classification  = RequestFailureClass::Internal,
-        .http_status     = 500,
-        .error_type      = "internal_error",
-        .machine_message = std::move(machine_message),
+        .phase          = phase,
+        .classification = RequestFailureClass::Internal,
+        .http_status    = 500,
+        .error_type     = "internal_error",
     };
 }
 
 RequestFailure make_client_disconnected_failure(RequestFailurePhase phase) {
     return RequestFailure{
-        .phase           = phase,
-        .classification  = RequestFailureClass::ClientDisconnected,
-        .http_status     = 499,
-        .error_type      = "request_cancelled",
-        .error_code      = "client_disconnected",
-        .machine_message = "client disconnected",
+        .phase          = phase,
+        .classification = RequestFailureClass::ClientDisconnected,
+        .http_status    = 499,
+        .error_type     = "request_cancelled",
+        .error_code     = "client_disconnected",
     };
 }
 
