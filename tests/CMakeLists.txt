@@ -81,6 +81,11 @@ ninfer_add_test(ninfer_perplexity_evaluation_test
           ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp)
 target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/perplexity)
+ninfer_add_test(ninfer_perplexity_logits_dump_test
+  SOURCES test_perplexity_logits_dump.cpp
+          ${PROJECT_SOURCE_DIR}/apps/perplexity/logits_dump.cpp)
+target_include_directories(ninfer_perplexity_logits_dump_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/apps/perplexity)
 ninfer_add_test(ninfer_cli_options_test
   SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)

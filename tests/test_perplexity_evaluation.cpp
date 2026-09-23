@@ -61,6 +61,22 @@ int main() {
                             "window boundaries match the protocol");
     }
 
+    const auto chunks = ninfer::perplexity::plan_kld_chunks(8 * 3 + 5, 8);
+    failures += require(chunks.size() == 3, "KLD chunks drop the partial tail window");
+    for (std::size_t index = 0; index < chunks.size(); ++index) {
+        const auto& chunk = chunks[index];
+        failures += require(chunk.input_begin == index * 8 && chunk.input_end == index * 8 + 8,
+                            "KLD chunks are non-overlapping full windows");
+        failures += require(chunk.first_target == 5 && chunk.target_begin == index * 8 + 5 &&
+                                chunk.target_end == index * 8 + 8,
+                            "KLD chunks score llama.cpp's context-1-context/2 targets");
+    }
+    bool rejected_short = false;
+    try {
+        (void)ninfer::perplexity::plan_kld_chunks(15, 8);
+    } catch (const std::invalid_argument&) { rejected_short = true; }
+    failures += require(rejected_short, "KLD chunks require two full windows");
+
     const std::vector<float> first{-1.0F, -2.0F};
     const std::vector<float> second{-3.0F};
     ninfer::perplexity::ScoreAggregate a;
