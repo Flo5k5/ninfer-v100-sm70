@@ -85,6 +85,8 @@ OpenAIResponsesStore::OpenAIResponsesStore(std::size_t max_records, std::size_t 
     }
 }
 
+OpenAIResponsesStore OpenAIResponsesStore::disabled() { return OpenAIResponsesStore(); }
+
 std::shared_ptr<const StoredOpenAIResponse> OpenAIResponsesStore::get(const std::string& id) {
     std::lock_guard lock(mutex_);
     const auto found = records_.find(id);
@@ -94,6 +96,10 @@ std::shared_ptr<const StoredOpenAIResponse> OpenAIResponsesStore::get(const std:
 }
 
 void OpenAIResponsesStore::put(StoredOpenAIResponse response) {
+    if (!enabled()) {
+        throw std::logic_error(
+            "Responses storage is disabled; store=true must be rejected earlier");
+    }
     if (response.id.empty() || response.session_key.empty() ||
         response.session_key.size() > kMaximumContextCacheSessionKeyBytes ||
         !response.response.is_object()) {

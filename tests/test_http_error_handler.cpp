@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -16,12 +17,27 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
+ServeOptions parse_options(std::vector<std::string> arguments) {
+    std::vector<char*> argv;
+    for (std::string& argument : arguments) { argv.push_back(argument.data()); }
+    return ninfer::serve::parse_serve_options(static_cast<int>(argv.size()), argv.data());
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     ServeOptions options;
     options.max_request_bytes = 1234;
+
+    failures += check(
+        ninfer::serve::make_openai_responses_store(parse_options({"ninfer-serve", "model.ninfer"}))
+            .enabled(),
+        "default server options did not build a Responses store");
+    failures += check(!ninfer::serve::make_openai_responses_store(
+                           parse_options({"ninfer-serve", "model.ninfer", "--no-response-store"}))
+                           .enabled(),
+                      "--no-response-store built a Responses store that retains content");
 
     const ninfer::serve::ApiError media_budget = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::MediaBudgetExceeded,

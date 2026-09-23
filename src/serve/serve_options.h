@@ -43,6 +43,9 @@ struct ServeOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    // --no-response-store: keep no Responses objects, input Items, or continuation contexts, so no
+    // request content outlives its HTTP exchange. The two limits below then have no effect.
+    bool enable_response_store             = true;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;

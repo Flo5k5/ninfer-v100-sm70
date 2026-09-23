@@ -53,7 +53,8 @@ int main() {
                       "Host context-cache defaults mismatch");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
-    failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
+    failures += check(defaults.enable_response_store &&
+                          defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
     failures += check(!defaults.model_id_override.has_value(),
@@ -215,9 +216,34 @@ int main() {
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
                "--response-store-max-mib", "8"});
-    failures += check(response_store.response_store_max_records == 42 &&
+    failures += check(response_store.enable_response_store &&
+                          response_store.response_store_max_records == 42 &&
                           response_store.response_store_max_bytes == (8ULL << 20),
                       "Responses store limits did not reach serving options");
+    failures +=
+        check(!parse({"ninfer-serve", "model.ninfer", "--no-response-store"}).enable_response_store,
+              "--no-response-store did not disable Responses storage");
+    for (const std::vector<std::string>& limit :
+         {std::vector<std::string>{"--response-store-max-records", "42"},
+          std::vector<std::string>{"--response-store-max-mib", "8"}}) {
+        for (const bool disable_first : {true, false}) {
+            std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+            if (disable_first) { arguments.emplace_back("--no-response-store"); }
+            arguments.insert(arguments.end(), limit.begin(), limit.end());
+            if (!disable_first) { arguments.emplace_back("--no-response-store"); }
+            bool rejected = false;
+            try {
+                (void)parse(arguments);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "--no-response-store accepted a Responses store limit");
+        }
+    }
+    bool zero_response_records_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "0"});
+    } catch (const std::invalid_argument&) { zero_response_records_rejected = true; }
+    failures += check(zero_response_records_rejected,
+                      "zero Responses store records was accepted as a storage mode");
 
     const ServeOptions sampling =
         parse({"ninfer-serve", "model.ninfer", "--temperature", "0", "--top-p", "0.9", "--top-k",
@@ -425,6 +451,9 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
                       "serve help omits Responses store limits");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--no-response-store") != std::string::npos,
+              "serve help omits --no-response-store");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--context-cost-presets") != std::string::npos,
               "serve help omits external context-cost presets");

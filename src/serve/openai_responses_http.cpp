@@ -57,13 +57,14 @@ ApiError internal_error(const std::exception& exception) {
     return error;
 }
 
-ApiError response_not_found(const std::string& id) {
+ApiError response_not_found(const std::string& id, const OpenAIResponsesStore& store) {
     ApiError error;
     error.status  = 404;
     error.type    = "invalid_request_error";
     error.param   = "response_id";
     error.code    = "response_not_found";
     error.message = "response '" + id + "' not found";
+    if (!store.enabled()) { error.message += "; this server does not retain Responses"; }
     return error;
 }
 
@@ -243,7 +244,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     const std::string id = new_openai_response_id();
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
+        limits.default_max_tokens     = options_.default_max_tokens;
+        limits.response_store_enabled = openai_responses_store_.enabled();
         request = parse_openai_responses_create_request(parse_json_body(req), limits);
         validate_openai_model(request.prompt.model, public_model_id_);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
@@ -536,7 +538,7 @@ void HttpServer::handle_response_get(const httplib::Request& req, httplib::Respo
     const std::string id                                     = path_response_id(req);
     const std::shared_ptr<const StoredOpenAIResponse> stored = openai_responses_store_.get(id);
     if (!stored) {
-        write_openai_error(res, response_not_found(id));
+        write_openai_error(res, response_not_found(id, openai_responses_store_));
         return;
     }
     res.set_content(stored->response.dump(), "application/json");
@@ -545,7 +547,7 @@ void HttpServer::handle_response_get(const httplib::Request& req, httplib::Respo
 void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
     if (!openai_responses_store_.erase(id)) {
-        write_openai_error(res, response_not_found(id));
+        write_openai_error(res, response_not_found(id, openai_responses_store_));
         return;
     }
     res.set_content(Json{{"id", id}, {"object", "response.deleted"}, {"deleted", true}}.dump(),
@@ -556,7 +558,7 @@ void HttpServer::handle_response_input_items(const httplib::Request& req, httpli
     const std::string id                                     = path_response_id(req);
     const std::shared_ptr<const StoredOpenAIResponse> stored = openai_responses_store_.get(id);
     if (!stored) {
-        write_openai_error(res, response_not_found(id));
+        write_openai_error(res, response_not_found(id, openai_responses_store_));
         return;
     }
     try {
@@ -567,7 +569,7 @@ void HttpServer::handle_response_input_items(const httplib::Request& req, httpli
 void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
     if (!openai_responses_store_.get(id)) {
-        write_openai_error(res, response_not_found(id));
+        write_openai_error(res, response_not_found(id, openai_responses_store_));
         return;
     }
     ApiError error;
