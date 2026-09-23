@@ -78,6 +78,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
+           "[--no-response-store] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--default-reasoning-effort LEVEL] [--reasoning-effort-alias FROM=TO] "
@@ -101,6 +102,8 @@ std::string serve_usage_text(const char* argv0) {
            "the process arguments\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
+           "       --no-response-store retains no Responses: store defaults to false, store=true "
+           "and previous_response_id are rejected, and stored-Response lookups return 404\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --kv-capacity auto leaves " +
@@ -137,9 +140,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.startup_argv.emplace_back(argv[i] == nullptr ? "" : argv[i]);
         redact_next = options.startup_argv.back() == "--api-key";
     }
-    bool default_max_tokens_explicit = false;
-    bool kv_capacity_explicit        = false;
-    bool context_capacity_explicit   = false;
+    bool default_max_tokens_explicit      = false;
+    bool kv_capacity_explicit             = false;
+    bool context_capacity_explicit        = false;
+    bool response_store_capacity_explicit = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -256,9 +260,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");
             if (records == 0) {
-                throw std::invalid_argument("--response-store-max-records must be positive");
+                throw std::invalid_argument("--response-store-max-records must be positive; use "
+                                            "--no-response-store to disable Responses storage");
             }
             options.response_store_max_records = static_cast<std::size_t>(records);
+            response_store_capacity_explicit   = true;
         } else if (arg == "--response-store-max-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--response-store-max-mib"), "response-store-max-mib");
@@ -266,6 +272,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--response-store-max-mib is out of range");
             }
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
+            response_store_capacity_explicit = true;
+        } else if (arg == "--no-response-store") {
+            options.enable_response_store = false;
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
@@ -369,6 +378,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.context_cache.enabled                = false;
         options.context_cache.host_state_slots       = 0;
         options.context_cache.host_kv_capacity_bytes = 0;
+    }
+    if (!options.enable_response_store && response_store_capacity_explicit) {
+        throw std::invalid_argument("--no-response-store cannot be combined with "
+                                    "--response-store-max-records or --response-store-max-mib");
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

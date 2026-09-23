@@ -48,6 +48,9 @@ struct RequestLimits {
     // Serve Anthropic thinking.display='omitted' as 'summarized'. Clients echo the visible
     // Thinking back, which restores it without encrypted reasoning state.
     bool omitted_thinking_as_summarized = false;
+    // Whether this server retains OpenAI Responses. Without a store, an omitted Responses `store`
+    // means false and an explicit true is rejected instead of being silently downgraded.
+    bool response_store_enabled = true;
 };
 
 enum class ContentKind {

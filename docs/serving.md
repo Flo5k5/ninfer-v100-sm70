@@ -405,10 +405,10 @@ wire response contains typed `output` Items.
 | `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
-| `previous_response_id` | optional ID of a retained local Response |
+| `previous_response_id` | optional ID of a retained local Response; `previous_response_not_supported` with `--no-response-store` |
 | `max_output_tokens` | non-negative integer; omission executes with `--default-max-tokens` but remains `null` in the Response object |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
-| `store` | boolean, default `true`; controls local retrieval and continuation state |
+| `store` | boolean, default `true`; controls local retrieval and continuation state; with `--no-response-store` it defaults to `false` and `true` fails with `store_not_supported` |
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
@@ -618,11 +618,30 @@ explicit deletion also make an ID unavailable. A single Response larger than the
 capacity fails with `response_store_capacity_exceeded` rather than silently pretending it was
 stored.
 
+`--no-response-store` starts the server without a Responses store, so no Response object, input
+Item, or continuation context outlives its request:
+
+- `store` defaults to `false`, and JSON bodies and stream events report `"store": false`;
+- an explicit `store: true` fails before generation with HTTP 400 `store_not_supported`;
+- `previous_response_id` fails with HTTP 400 `previous_response_not_supported` on Create and on
+  input-token counting, so clients resend the complete conversation as `input`;
+- `GET`, `DELETE`, `input_items`, and `cancel` on `/v1/responses/{id}` return 404
+  `response_not_found`;
+- no Engine session key is derived from a response ID; compatible-prefix reuse is unaffected.
+
+OpenAI treats `store` as `false` for Zero Data Retention organizations. NInfer rejects an explicit
+`store: true` instead, matching its Chat Completions contract: the client asked for retrievable
+state that this server will not keep, and failing before generation is clearer than a later 404. A
+gateway that wants OpenAI's behavior can rewrite `store` to `false` before forwarding. The option
+cannot be combined with `--response-store-max-records` or `--response-store-max-mib`. See
+[Zero data retention](#zero-data-retention) for the complete retention contract.
+
 ### Responses input token count
 
 `POST /v1/responses/input_tokens` uses the same prompt path as Create and does not run generation.
-It accepts `model`, `input`, `instructions`, `previous_response_id`, reasoning, function tools and
-tool choice, supported text/truncation values, and the `preserve_thinking` extension. Parent lookup,
+It accepts `model`, `input`, `instructions`, `previous_response_id` (rejected with
+`--no-response-store`), reasoning, function tools and tool choice, supported text/truncation
+values, and the `preserve_thinking` extension. Parent lookup,
 call-ID normalization, template rendering, and media expansion are therefore identical to the
 corresponding Create request:
 
@@ -776,6 +795,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
+| `--no-response-store` | retain no Responses; see [Zero data retention](#zero-data-retention) | store on |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
@@ -938,6 +958,27 @@ complete measurement analysis.
 Intervals with context materialization or retention activity are retained even when they contain no
 token execution; only fully idle intervals are omitted. Downstream measurement should prefer the
 raw counters and seconds over rounded stderr rates.
+
+## Zero data retention
+
+Start the server with `--no-response-store` to keep no prompt or completion content beyond the HTTP
+exchange that carries it. The remaining retention surfaces hold technical data or volatile model
+state only:
+
+| Surface | Retained data |
+|---|---|
+| Responses store | nothing with `--no-response-store`; see [Local response state and resources](#local-response-state-and-resources) |
+| Chat Completions and Anthropic Messages | nothing; Chat Completions rejects `store: true` |
+| Operational stderr log, every `--log-level` | request IDs, protocol, message/tool/media counts, token counts, timings, HTTP status and error codes |
+| `--request-log-jsonl FILE` | the same classes of fields at full precision, the redacted `argv`, and the requested model name, which Anthropic clients may choose freely |
+| Engine context cache | token IDs, KV, and model state of reusable prefixes in Device and pinned Host memory; bounded, evicted under pressure, and lost at exit; `--no-prefix-reuse` disables it |
+| Media cache | prepared image and video tensors keyed by a content digest in Host memory; bounded and lost at exit; `--media-cache-mib 0` disables it |
+
+Error messages can quote client input or model output, so they are returned only in the HTTP
+response and never logged. The server writes no dumps, traces, or crash reports of its own. Process
+memory can still reach disk through the host: disable core dumps (for example `ulimit -c 0`, or
+`--ulimit core=0` for a container) and use no swap or encrypted swap where zero retention is
+required.
 
 ## Execution behavior
 

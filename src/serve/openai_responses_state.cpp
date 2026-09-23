@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <iterator>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,6 +30,14 @@ namespace {
                    .param   = "previous_response_id",
                    .code    = "response_not_found"};
     throw ApiException(std::move(error));
+}
+
+// Without a store no ID can ever resolve, so this is a request contract error rather than a
+// missing resource: the client must resend the complete conversation as input.
+[[noreturn]] void previous_response_not_supported() {
+    bad_request("previous_response_id requires a stored Response, which this server does not "
+                "retain; send the complete conversation as input instead",
+                "previous_response_id", "previous_response_not_supported");
 }
 
 bool has_user_query(const std::vector<ChatTurn>& turns) {
@@ -146,11 +155,15 @@ OpenAIResponsesResolvedPrompt
 resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
                                 OpenAIResponsesStore& store, std::optional<std::string> response_id,
                                 bool store_response) {
+    if (store_response && !store.enabled()) {
+        throw std::logic_error("store=true reached prompt resolution without a Responses store");
+    }
     OpenAIResponsesResolvedPrompt resolved;
     resolved.generation = request.generation;
 
     std::shared_ptr<const StoredOpenAIResponse> parent_record;
     if (request.previous_response_id) {
+        if (!store.enabled()) { previous_response_not_supported(); }
         parent_record = store.get(*request.previous_response_id);
         if (!parent_record) { response_not_found(*request.previous_response_id); }
         resolved.parent = parent_record->context;

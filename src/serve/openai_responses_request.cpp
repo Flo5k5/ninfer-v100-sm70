@@ -1172,8 +1172,13 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     out.tool_choice         = std::move(parsed.wire_tool_choice);
     out.tool_identities     = std::move(parsed.tool_identities);
     out.parallel_tool_calls = parsed.parallel_tool_calls;
-    out.store               = optional_bool(body, "store", true);
-    out.stream              = optional_bool(body, "stream", false);
+    out.store               = optional_bool(body, "store", limits.response_store_enabled);
+    if (out.store && !limits.response_store_enabled) {
+        bad_request("store=true requires a retrievable stored Response, which this server does not "
+                    "retain; omit store or set it to false",
+                    "store", "store_not_supported");
+    }
+    out.stream = optional_bool(body, "stream", false);
     validate_metadata(body, out.metadata);
 
     // Codex attaches per-request tracing information here. It is an opaque client hint and has no

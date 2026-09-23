@@ -34,6 +34,10 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 
+// The Responses store a server built from these options uses. --no-response-store selects the
+// disabled store, which is what guarantees that no Responses content outlives its request.
+[[nodiscard]] OpenAIResponsesStore make_openai_responses_store(const ServeOptions& options);
+
 class HttpServer {
 public:
     HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);
