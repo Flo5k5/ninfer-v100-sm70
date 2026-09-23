@@ -170,6 +170,7 @@ def test_stage_a_rewrites_fp8_roles_and_copies_the_rest(tmp_path) -> None:
             for name in ("gate_proj", "up_proj")
         ]
         expected = nvfp4_quantize.quantize_fused(fp32)
+        assert struct.unpack("<I", expected.divisor_word)[0] & 0xFFFF == 0
         assert float(divisor) == float(expected.divisor)
         assert torch.equal(codes, expected.packed)
         assert torch.equal(scales, expected.scales)
@@ -177,3 +178,22 @@ def test_stage_a_rewrites_fp8_roles_and_copies_the_rest(tmp_path) -> None:
     report = json.loads((tmp_path / "out.ninfer.rewrite.json").read_text())
     assert len(report["objects"]) == 2 * (len(LAYERS) - 1) + 1
     assert all(item["relative_rms_error"] < 0.15 for item in report["objects"])
+
+
+def test_verify_rejects_a_corrupted_copied_object(tmp_path) -> None:
+    base_path, source_dir, _ = _build(tmp_path)
+    out_path = tmp_path / "out.ninfer"
+    arguments = ["--base", str(base_path), "--source", str(source_dir), "--out", str(out_path)]
+    assert rewrite_nvfp4.main(arguments) == 0
+    stage = rewrite_nvfp4.STAGES["a"]
+    assert rewrite_nvfp4.verify_output(base_path, out_path, stage) == 0
+
+    with Artifact(out_path) as out:
+        # Layer 55 gate/up stays NVFP4 and is copied from the base.
+        offset = out.payload_offset + out.object("weight/000000").offset + 17
+    with out_path.open("r+b") as handle:
+        handle.seek(offset)
+        byte = handle.read(1)[0]
+        handle.seek(offset)
+        handle.write(bytes([byte ^ 0x01]))
+    assert rewrite_nvfp4.verify_output(base_path, out_path, stage) == 1

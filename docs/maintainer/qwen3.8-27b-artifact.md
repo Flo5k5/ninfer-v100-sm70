@@ -939,13 +939,14 @@ hidden states) share one divisor object. These input divisors are not calibrated
 repeat the nearest calibrated layer (55) and the output head uses 1.0. sm_70 runs every NVFP4
 matrix with 16-bit activations and never scales by them.
 
-The new matrices use the round-to-nearest quantizer of `tools/convert/common/nvfp4_quantize.py`:
-one FP32 divisor `448 * 6 / amax` per parent (gate and up share it), a BF16-rounded `amax / 6` per
-16-element block multiplied by the divisor and rounded to E4M3FN, and E2M1 codes rounded to
-nearest with ties to even. With the published divisor it reproduces the compressed-tensors NVFP4
-words of the source bit for bit. Values come from BF16 matrices, or from dequantized row-scaled
-FP8 matrices when `--mlp-source` names a compressed-tensors checkpoint (a double quantization,
-recorded in `provenance.rewrite`).
+The new matrices use the round-to-nearest quantizer of `tools/convert/common/nvfp4_quantize.py`,
+which follows compressed-tensors: one divisor `448 * 6 / amax` per parent (gate and up share it),
+evaluated in BF16 and stored as FP32; a BF16-rounded `amax / 6` per 16-element block multiplied by
+the divisor and rounded to E4M3FN, with a zero scale replaced by the E4M3FN epsilon (word `0x20`);
+and E2M1 codes rounded to nearest with ties to even. Quantizing the BF16 release of the source
+from scratch reproduces its published NVFP4 divisor, code and scale words bit for bit. Values come
+from BF16 matrices, or from dequantized row-scaled FP8 matrices when `--mlp-source` names a
+compressed-tensors checkpoint (a double quantization, recorded in `provenance.rewrite`).
 
 ```bash
 python3 -m tools.convert.qwen3_8_27b.rewrite_nvfp4 \
@@ -954,6 +955,8 @@ python3 -m tools.convert.qwen3_8_27b.rewrite_nvfp4 \
   --out out/qwen3_8_27b_nvfp4_stageA.ninfer --verify
 ```
 
-The artifact binds through `Qwen38Nvfp4FullA`. Its output head runs through `linear()` on the
-Volta QPN2 route (prepacked at load); `linear_topk` has no NVFP4 vocabulary route, so DFlash2 is
-refused at load with this profile and MTP is the supported speculative backend.
+The artifact binds through `Qwen38Nvfp4FullA`, on sm_70 builds only: its output head runs through
+`linear()` on the Volta QPN2 route (prepacked at load), and other builds refuse an NVFP4 head at
+bind time. `linear_topk` has no NVFP4 vocabulary route; DFlash2 is refused with this profile as a
+precaution (its optimized-proposal path would not need that route but is not validated), and MTP
+is the supported speculative backend.
