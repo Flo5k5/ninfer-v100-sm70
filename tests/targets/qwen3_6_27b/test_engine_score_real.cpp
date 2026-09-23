@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -138,7 +139,43 @@ int main() {
                   << '\n';
         return 1;
     }
+
+    // The decode/verify execution shape scores the same targets with the same history through the
+    // narrow-width kernels, so it agrees with the prefill shape to kernel tolerance only. A target
+    // sitting on a near tie can move by a nat between two kernel paths, so the mean difference is
+    // the agreement gate and the maximum only bounds a gross failure.
+    const std::vector<float> narrow = engine.score_tokens(tokens, 513, nullptr, {.scored_chunk = 4});
+    if (narrow.size() != suffix.size()) {
+        std::cerr << "decode-width scoring returned an invalid result shape\n";
+        return 1;
+    }
+    float maximum_shape_error = 0.0F;
+    double total_shape_error  = 0.0;
+    for (std::size_t i = 0; i < suffix.size(); ++i) {
+        if (!std::isfinite(narrow[i])) {
+            std::cerr << "decode-width scoring returned a non-finite logprob\n";
+            return 1;
+        }
+        const float difference = std::abs(narrow[i] - suffix[i]);
+        maximum_shape_error    = std::max(maximum_shape_error, difference);
+        total_shape_error += difference;
+    }
+    const double mean_shape_error = total_shape_error / static_cast<double>(suffix.size());
+    if (mean_shape_error > 0.02 || maximum_shape_error > 2.0F) {
+        std::cerr << "decode-width scoring moved targets by " << mean_shape_error
+                  << " on average, " << maximum_shape_error << " at most\n";
+        return 1;
+    }
+    try {
+        (void)engine.score_tokens(tokens, 513, nullptr,
+                                  {.scored_chunk = effective.prefill_chunk + 1});
+        std::cerr << "a scored chunk wider than the prefill chunk was accepted\n";
+        return 1;
+    } catch (const std::invalid_argument&) {
+    }
     std::cout << "OK causal_score_real max_overlap_error=" << maximum_overlap_error
-              << " max_sink_error=" << maximum_sink_error << '\n';
+              << " max_sink_error=" << maximum_sink_error
+              << " decode_shape_error mean=" << mean_shape_error << " max=" << maximum_shape_error
+              << '\n';
     return 0;
 }

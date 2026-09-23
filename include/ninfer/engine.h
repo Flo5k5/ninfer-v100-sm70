@@ -78,10 +78,12 @@ public:
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()). A non-null
-    // logits_sink also receives the full main-head logits of every scored position.
+    // logits_sink also receives the full main-head logits of every scored position. `options`
+    // selects the forward width over the scored region (see CausalScoreOptions).
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target,
-                                                  ScoreLogitsSink* logits_sink = nullptr);
+                                                  ScoreLogitsSink* logits_sink = nullptr,
+                                                  CausalScoreOptions options = {});
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;

@@ -298,9 +298,10 @@ Program<Variant>::plan_request(const PreparedPrompt& prompt,
 template <>
 std::vector<float> Program<Variant>::causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target,
-                                                  ScoreLogitsSink* logits_sink) {
+                                                  ScoreLogitsSink* logits_sink,
+                                                  CausalScoreOptions options) {
     return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target,
-                               logits_sink);
+                               logits_sink, options);
 }
 
 template <>

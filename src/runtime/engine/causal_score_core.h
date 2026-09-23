@@ -60,13 +60,15 @@ public:
     CausalScoreCore& operator=(const CausalScoreCore&) = delete;
 
     [[nodiscard]] std::vector<float> score(PreparedPrompt prompt, std::uint32_t first_target,
-                                           ScoreLogitsSink* logits_sink = nullptr) {
+                                           ScoreLogitsSink* logits_sink = nullptr,
+                                           CausalScoreOptions options = {}) {
         // One synchronous public call owns the sole job slot until its result is delivered.
         std::scoped_lock call_lock(call_mutex_);
         auto job                               = std::make_unique<Job>();
         job->prompt                            = std::move(prompt);
         job->first_target                      = first_target;
         job->logits_sink                       = logits_sink;
+        job->options                           = options;
         std::future<std::vector<float>> result = job->promise.get_future();
         {
             std::lock_guard queue_lock(queue_mutex_);
@@ -116,6 +118,7 @@ private:
         PreparedPrompt prompt;
         std::uint32_t first_target   = 0;
         ScoreLogitsSink* logits_sink = nullptr;
+        CausalScoreOptions options;
         std::promise<std::vector<float>> promise;
     };
 
@@ -136,7 +139,8 @@ private:
                 {
                     std::scoped_lock lock(execution_mutex_);
                     result = instance_.program->causal_score(std::move(job->prompt),
-                                                             job->first_target, job->logits_sink);
+                                                             job->first_target, job->logits_sink,
+                                                             job->options);
                 }
                 job->promise.set_value(std::move(result));
             } catch (...) {

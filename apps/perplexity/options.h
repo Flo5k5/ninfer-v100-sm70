@@ -21,6 +21,10 @@ struct Options {
     std::optional<std::uint32_t> chunks;
     std::uint32_t context       = 4096;
     std::uint32_t stride        = 2048;
+    // Prefill chunk of the scoring engine, and the forward width over each window's scored
+    // targets (0: prefill chunks; see CausalScoreOptions).
+    std::uint32_t prefill_chunk = 1024;
+    std::uint32_t scored_chunk  = 0;
     int device                  = 0;
     KvCacheStorage kv           = KvCacheStorage::Fp8E4M3Row256;
     bool quick                  = false;

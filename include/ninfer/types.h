@@ -630,6 +630,18 @@ public:
     virtual void publish(OutputDelta delta)                 = 0;
 };
 
+// Execution shape of Engine::score_tokens. Every scored target sees the same history under any
+// shape; only the width of the forward calls that evaluate the scored region changes, and with it
+// the kernels that run.
+struct CausalScoreOptions {
+    // Largest forward width over the scored targets, at most the prefill chunk. Zero evaluates
+    // them in prefill chunks. A small width (1 for decoding, the draft window plus one for MTP
+    // verification) evaluates them one column block at a time through the narrow-width attention
+    // and projection kernels that generation selects at that width; the pass keeps the prefill
+    // phase, so the GDN input projection and convolution keep their prefill forms.
+    std::uint32_t scored_chunk = 0;
+};
+
 // Receives the main-head logits of the scored positions of Engine::score_tokens, in target order,
 // one block per call on the scoring thread. `bf16_logits` holds `columns` consecutive rows of
 // `row_stride` raw BF16 bit patterns; row j holds the logits that predict the j-th target of the
