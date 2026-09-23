@@ -2,6 +2,7 @@
 #include "evaluation.h"
 #include "logits_dump.h"
 #include "options.h"
+#include "preflight.h"
 
 #include "ninfer/engine.h"
 #include "product/logging/logging.h"
@@ -11,7 +12,6 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -61,23 +61,12 @@ std::string timestamp() {
     return out.str();
 }
 
-std::filesystem::path prepare_output_directory(const Options& options,
-                                               const ninfer::LoadSummary& load,
-                                               const CorpusSelection& corpus) {
-    std::filesystem::path output = options.output.value_or(
-        std::filesystem::path("profiles/perplexity") / safe_component(load.model_id) /
-        safe_component(load.weights_id) / ninfer::perplexity::kv_dtype_name(options.kv) /
-        safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp());
-    if (std::filesystem::exists(output)) {
-        if (!std::filesystem::is_directory(output) ||
-            std::filesystem::directory_iterator(output) != std::filesystem::directory_iterator()) {
-            throw std::runtime_error("output directory exists and is not empty: " +
-                                     output.string());
-        }
-    } else if (!std::filesystem::create_directories(output)) {
-        throw std::runtime_error("cannot create output directory: " + output.string());
-    }
-    return std::filesystem::absolute(output).lexically_normal();
+// Report directory used when --output is omitted; it depends on the loaded artifact.
+std::filesystem::path default_output_path(const Options& options, const ninfer::LoadSummary& load,
+                                          const CorpusSelection& corpus) {
+    return std::filesystem::path("profiles/perplexity") / safe_component(load.model_id) /
+           safe_component(load.weights_id) / ninfer::perplexity::kv_dtype_name(options.kv) /
+           safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp();
 }
 
 double seconds_since(Clock::time_point begin) {
@@ -107,6 +96,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         ninfer::product::StartupLogRenderer& startup_log,
         const std::shared_ptr<ninfer::product::TerminalProgress>& progress) {
     const Clock::time_point total_started = Clock::now();
+    // Output paths and the reference dump are checked before the model is loaded.
+    const ninfer::perplexity::Preflight preflight = ninfer::perplexity::run_preflight(options);
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path    = options.artifact;
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
@@ -161,13 +152,18 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  ninfer::product::format_pretty_count(total_windows),
                  ninfer::product::format_pretty_duration(preflight_seconds));
 
-    std::optional<KldBaseHeader> reference;
+    // Before the dump writer: an explicit --output was prepared by the preflight, so a dump
+    // inside it can be created now.
+    const std::filesystem::path output_directory =
+        preflight.report_directory ? *preflight.report_directory
+                                   : ninfer::perplexity::prepare_report_directory(
+                                         default_output_path(options, load, corpus));
+    const std::optional<KldBaseHeader>& reference = preflight.reference;
     std::unique_ptr<KldBaseWriter> logits_writer;
     if (options.logits_out) {
         const EvaluationStream& stream = streams.front();
         const std::size_t chunks       = stream.windows.size();
-        if (options.logits_reference) {
-            reference = ninfer::perplexity::read_kld_base_header(*options.logits_reference);
+        if (reference) {
             ninfer::perplexity::check_reference_tokens(*reference, options.context, chunks,
                                                        stream.tokens, options.chunks.has_value());
             logger->info("tokenization matches the reference dump | {} of {} chunks | {} tokens",
@@ -183,8 +179,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                      ninfer::product::format_pretty_count(logits_writer->expected_positions()));
     }
 
-    const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
-    const Clock::time_point scoring_started      = Clock::now();
+    const Clock::time_point scoring_started = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  ninfer::product::format_pretty_count(streams.size()),
                  ninfer::product::format_pretty_count(total_scored_tokens),

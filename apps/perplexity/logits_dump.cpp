@@ -115,12 +115,32 @@ KldBaseHeader read_kld_base_header(const std::filesystem::path& path) {
     return header;
 }
 
-void check_reference_tokens(const KldBaseHeader& reference, std::uint32_t context,
-                            std::size_t chunks, std::span<const TokenId> tokens, bool prefix) {
+void check_reference_context(const KldBaseHeader& reference, std::uint32_t context) {
     if (reference.context != context) {
         throw std::runtime_error("reference dump context " + std::to_string(reference.context) +
                                  " differs from --context " + std::to_string(context));
     }
+}
+
+void check_logits_destination(const std::filesystem::path& path) {
+    if (std::filesystem::exists(path)) {
+        throw std::runtime_error("logits output already exists: " + path.string());
+    }
+    std::filesystem::path partial = path;
+    partial += ".partial";
+    if (std::filesystem::exists(partial)) {
+        throw std::runtime_error("a partial logits dump from an interrupted run exists: " +
+                                 partial.string() + "; delete it or choose another --logits-out");
+    }
+    const std::filesystem::path directory = std::filesystem::absolute(path).parent_path();
+    if (!std::filesystem::is_directory(directory)) {
+        throw std::runtime_error("logits output directory does not exist: " + directory.string());
+    }
+}
+
+void check_reference_tokens(const KldBaseHeader& reference, std::uint32_t context,
+                            std::size_t chunks, std::span<const TokenId> tokens, bool prefix) {
+    check_reference_context(reference, context);
     const std::size_t evaluated = chunks * context;
     if (tokens.size() < evaluated) {
         throw std::logic_error("reference check received fewer tokens than the window plan");
@@ -155,18 +175,7 @@ KldBaseWriter::KldBaseWriter(std::filesystem::path path, std::uint32_t context,
     expected_positions_ = static_cast<std::uint64_t>(chunks_) * (context_ - 1 - context_ / 2);
     partial_path_       = path_;
     partial_path_ += ".partial";
-    if (std::filesystem::exists(path_)) {
-        throw std::runtime_error("logits output already exists: " + path_.string());
-    }
-    if (std::filesystem::exists(partial_path_)) {
-        throw std::runtime_error(
-            "a partial logits dump from an interrupted run exists: " + partial_path_.string() +
-            "; delete it or choose another --logits-out");
-    }
-    const std::filesystem::path directory = std::filesystem::absolute(path_).parent_path();
-    if (!std::filesystem::is_directory(directory)) {
-        throw std::runtime_error("logits output directory does not exist: " + directory.string());
-    }
+    check_logits_destination(path_);
     if (expected_vocab_) { require_space(*expected_vocab_); }
     // Created now so an unwritable destination fails before scoring; the header is written by
     // the first consume(), when the logits row width is known.
