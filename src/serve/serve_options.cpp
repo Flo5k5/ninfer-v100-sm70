@@ -80,6 +80,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
+           "[--default-reasoning-effort LEVEL] [--reasoning-effort-alias FROM=TO] "
+           "[--omitted-thinking-as-summarized] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -110,6 +112,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --default-reasoning-effort applies when a thinking request names no effort\n"
+           "       --reasoning-effort-alias maps a requested level onto another before template "
+           "validation (repeatable, e.g. high=medium)\n"
+           "       --omitted-thinking-as-summarized serves Anthropic thinking.display=omitted with "
+           "visible Thinking instead of rejecting it\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -278,6 +285,34 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--default-reasoning-effort") {
+            const auto effort =
+                parse_requested_reasoning_effort(require_value("--default-reasoning-effort"));
+            if (!effort || *effort == RequestedReasoningEffort::None) {
+                throw std::invalid_argument(
+                    "--default-reasoning-effort must be minimal, low, medium, high, xhigh, or max; "
+                    "use --no-thinking to disable thinking");
+            }
+            options.default_reasoning_effort = *effort;
+        } else if (arg == "--reasoning-effort-alias") {
+            const std::string_view mapping = require_value("--reasoning-effort-alias");
+            const std::size_t separator    = mapping.find('=');
+            const auto from                = separator == std::string_view::npos
+                                                 ? std::nullopt
+                                                 : parse_requested_reasoning_effort(
+                                                       mapping.substr(0, separator));
+            const auto to = separator == std::string_view::npos
+                                ? std::nullopt
+                                : parse_requested_reasoning_effort(mapping.substr(separator + 1));
+            if (!from || !to || *from == RequestedReasoningEffort::None ||
+                *to == RequestedReasoningEffort::None) {
+                throw std::invalid_argument(
+                    "--reasoning-effort-alias expects FROM=TO over minimal, low, medium, high, "
+                    "xhigh, max");
+            }
+            options.reasoning_effort_aliases[static_cast<std::size_t>(*from)] = *to;
+        } else if (arg == "--omitted-thinking-as-summarized") {
+            options.omitted_thinking_as_summarized = true;
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {

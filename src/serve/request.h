@@ -45,6 +45,9 @@ private:
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
     int default_max_tokens = 8192;
+    // Serve Anthropic thinking.display='omitted' as 'summarized'. Clients echo the visible
+    // Thinking back, which restores it without encrypted reasoning state.
+    bool omitted_thinking_as_summarized = false;
 };
 
 enum class ContentKind {
