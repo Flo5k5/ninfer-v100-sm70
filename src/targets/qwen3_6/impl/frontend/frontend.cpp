@@ -218,16 +218,29 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json.chat_template must contain the loaded chat template");
     }
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
-    }
+    // v3 artifacts ship an NInfer-modified chat_template.jinja next to the stock Qwen template
+    // kept in tokenizer_config.json, so the two are not expected to be equal any more. Like
+    // upstream, the compiled template is always the standalone resource.
 }
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
     validate_tokenizer_config(resources);
-    return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
+    try {
+        return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
+    } catch (const std::invalid_argument& standalone_error) {
+        // v3 artifacts ship an NInfer-modified chat_template.jinja meant for the upstream Jinja
+        // engine. This port only has precompiled renderers keyed by the digest of the official
+        // Qwen template, which tokenizer_config.json still carries: fall back to it.
+        const Json tokenizer_config =
+            parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
+        try {
+            return fi::CompiledChatTemplate::resolve(
+                tokenizer_config.at("chat_template").get_ref<const std::string&>());
+        } catch (const std::invalid_argument& config_error) {
+            throw std::invalid_argument(std::string(standalone_error.what()) +
+                                        "; tokenizer_config.json fallback: " + config_error.what());
+        }
+    }
 }
 
 [[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {

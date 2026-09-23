@@ -26,6 +26,7 @@ add_library(ninfer_core STATIC
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
+  core/weight_view.cpp
   core/decode_graph.cpp
   runtime/engine/admission_policy.cpp
   runtime/engine/context_cost.cpp
@@ -39,9 +40,13 @@ target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threa
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
   artifact/reader.cpp
-  artifact/storage_layouts.cpp
+  artifact/file_io.cpp
+  artifact/formats.cpp
+  artifact/schema.cpp
   artifact/binder.cpp
   artifact/materializer.cpp
+  artifact/layouts.cpp
+  artifact/views.cpp
   artifact/typed_binding.cpp)
 ninfer_internal_includes(ninfer_artifact)
 target_link_libraries(ninfer_artifact PUBLIC ninfer_core)

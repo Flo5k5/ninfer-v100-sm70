@@ -7,6 +7,7 @@
 #include <ninfer/targets/qwen3_6/vision.h>
 
 #include "artifact/binder.h"
+#include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
