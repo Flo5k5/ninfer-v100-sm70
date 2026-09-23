@@ -40,6 +40,9 @@ struct ShapeCase {
     Comparison comparison;
     bool verify_input_preservation;
     std::span<const Invocation> invocations;
+    // sm_70 only: load-time QPN prepack of an NVFP4 weight, as the runtime does for the MLP and
+    // the NVFP4 output head.
+    bool prepack_nvfp4_for_qpn = false;
 };
 
 using WeightGenerator = quantized_weight::PackedWeight (*)(std::int32_t, std::int32_t,

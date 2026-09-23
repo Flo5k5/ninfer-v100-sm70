@@ -224,8 +224,6 @@ ObjectHandle resolve_input_divisor(Binder& binder, std::string_view v2_name) {
                 found.push_back(whole_object_of(directory, aux->second, v2_name));
             }
         }
-        // A parameter read from several inputs (the output head: text, MTP and DFlash2 hidden
-        // states) may carry one divisor per Use, provided they all name the same object.
         if (found.empty()) {
             throw ArtifactError(quote_name(v2_name) + ": no Use of " + quote_name(leaf) +
                                 " carries an activation input divisor");

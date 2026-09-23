@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 #endif
 #include "ops/op_tester.h"
 
@@ -319,6 +320,13 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
 #ifdef NINFER_VOLTA_BUILD
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         ops::detail::fp8_prepack_qpn_sm70(weight);
+    }
+    if (shape.prepack_nvfp4_for_qpn && weight.qtype == QType::NVFP4) {
+        ops::detail::nvfp4_prepack_qpn_sm70(weight);
+    }
+#else
+    if (shape.prepack_nvfp4_for_qpn) {
+        throw std::invalid_argument("linear test: NVFP4 QPN prepack is sm_70 only");
     }
 #endif
     std::vector<std::uint8_t> weight_before(host_weight.payload.size());
