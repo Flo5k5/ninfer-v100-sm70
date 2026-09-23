@@ -681,6 +681,8 @@ public:
 
     PinnedHostBuffer round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
+    // One BF16 logits tile for a causal-score logits sink; allocated on first use, then reused.
+    std::optional<PinnedHostBuffer> score_logits_host;
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
