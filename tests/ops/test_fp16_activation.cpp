@@ -1,6 +1,7 @@
 // The Volta fp16 activation domain: wherever linear_swiglu / linear_add report FP16 support, an
 // FP16 activation (the BF16 value converted to fp16) must give results bit-identical to the BF16
 // tensor, and an FP16 SwiGLU output must equal the BF16 output converted to fp16.
+#include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
@@ -185,6 +186,48 @@ int run_linear_add(const std::string& label, QType qtype, std::int32_t k, std::i
     return compare(label, run(x_fp16_device, DType::FP16), run(x_bf16_device, DType::BF16));
 }
 
+int run_attn_input(std::int32_t tokens) {
+    constexpr std::int32_t kParentRows = 14336;
+    constexpr std::int32_t kQRows      = 6144;
+    constexpr std::int32_t kKvRows     = 1024;
+    const ops::LinearPolicy policy     = ops::LinearPolicy::A16Only;
+    const std::string label            = "attn_input_proj FP8 T=" + std::to_string(tokens);
+    DeviceWeight weight =
+        make_weight(QType::FP8_E4M3FN_ROW_BF16S, kParentRows, kHidden, 3341U, Layout::Fp8);
+    if (!ops::attn_input_proj_fp16_activation_supported(weight.weight, policy, tokens)) {
+        std::cerr << label << ": fp16 activation domain unexpectedly unsupported\n";
+        return 1;
+    }
+    const auto x_bf16 = random_bf16(static_cast<std::size_t>(kHidden) * tokens, 3343U, 3.0F);
+    DeviceWords x_bf16_device(x_bf16);
+    DeviceWords x_fp16_device(to_fp16(x_bf16));
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S, kParentRows,
+                                                      kHidden, policy, tokens, tokens),
+        256));
+    const std::size_t q_count  = static_cast<std::size_t>(kQRows) * tokens;
+    const std::size_t kv_count = static_cast<std::size_t>(kKvRows) * tokens;
+    const auto run = [&](const DeviceWords& input, DType dtype) {
+        DeviceWords q(q_count), gate(q_count), k(kv_count), v(kv_count);
+        Tensor x(input.buffer.p, dtype, {kHidden, tokens});
+        Tensor q_tensor(q.buffer.p, DType::BF16, {kQRows, tokens});
+        Tensor gate_tensor(gate.buffer.p, DType::BF16, {kQRows, tokens});
+        Tensor k_tensor(k.buffer.p, DType::BF16, {kKvRows, tokens});
+        Tensor v_tensor(v.buffer.p, DType::BF16, {kKvRows, tokens});
+        workspace.reset();
+        ops::attn_input_proj(x, weight.weight, q_tensor, gate_tensor, k_tensor, v_tensor, policy,
+                             workspace, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<std::uint16_t> all = q.read(q_count);
+        for (const auto* part : {&gate, &k, &v}) {
+            const auto bits = part->read(part == &gate ? q_count : kv_count);
+            all.insert(all.end(), bits.begin(), bits.end());
+        }
+        return all;
+    };
+    return compare(label, run(x_fp16_device, DType::FP16), run(x_bf16_device, DType::BF16));
+}
+
 // The fused 27B GDN norm/control kernel writes h itself: an FP16 h must be the BF16 h converted.
 int run_norm_gating(std::int32_t tokens) {
     constexpr std::int32_t kHeads = 48;
@@ -263,7 +306,10 @@ int main() {
                     run_linear_add("linear_add FP8" + shape, QType::FP8_E4M3FN_ROW_BF16S, k, t);
             }
         }
-        for (const std::int32_t t : {1, 5, 32}) { failures += run_norm_gating(t); }
+        for (const std::int32_t t : {1, 5, 32}) {
+            failures += run_norm_gating(t);
+            failures += run_attn_input(t);
+        }
         // Past the QPN width the domain is closed: callers must keep BF16 there.
         DeviceWeight wide = make_weight(QType::NVFP4, 2 * kIntermediate, kHidden, 3399U,
                                         Layout::Nvfp4SwiGlu);

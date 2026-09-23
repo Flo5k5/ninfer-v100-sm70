@@ -106,6 +106,10 @@ struct Variant {
     // True when gdn_output_projection takes an FP16 `hidden` at this width (the caller's gated
     // RMSNorm then writes the QPN GEMV's fp16 copy itself).
     [[nodiscard]] static bool gdn_output_takes_fp16(const Weight& weight, std::int32_t tokens);
+    // True when attention_projection takes an FP16 `hidden` at this width (the caller's RMSNorm
+    // then writes the QPN GEMV's fp16 copy itself).
+    [[nodiscard]] static bool attention_projection_takes_fp16(
+        const FullAttentionProjectionWeights& weights, std::int32_t tokens);
     // True when the verify-phase GDN norm/control and conv-record/snapshot input projection keep
     // the normalized hidden in fp16 (the fused norm kernel writes the QPN GEMV's copy itself).
     [[nodiscard]] static bool gdn_input_takes_fp16(const GdnProjectionWeights& weights,

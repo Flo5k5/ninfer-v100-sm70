@@ -235,6 +235,11 @@ bool Variant::gdn_input_takes_fp16(const GdnProjectionWeights&, std::int32_t, st
     return false;
 }
 
+bool Variant::attention_projection_takes_fp16(const FullAttentionProjectionWeights&,
+                                              std::int32_t) {
+    return false;
+}
+
 bool Variant::gdn_output_takes_fp16(const Weight&, std::int32_t) { return false; }
 
 bool Variant::post_mixer_takes_fp16(const PostMixerWeights&, std::int32_t) { return false; }

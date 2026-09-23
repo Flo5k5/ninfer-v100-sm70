@@ -824,6 +824,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
+    if (Variant::attention_projection_takes_fp16(*w.projection, T)) {
+        h = Tensor(h.data, DType::FP16, {h.ne[0], h.ne[1]});
+    }
     ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
