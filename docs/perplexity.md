@@ -193,6 +193,11 @@ this `ninfer-perplexity`, and the corpus above. `$LLAMA` is the llama.cpp `bin` 
      -c 4096 -b 2048 -ngl 99 -fa on --kl-divergence-base $K/dumps/q8_0.kld 2>&1 | tee $K/logs/q8_0.log
    ```
 
+   A BF16 GGUF of the 27B model (55 GB) does not fit one 32 GB GPU; with two visible GPUs add
+   `-sm layer` and it runs at about 290 tok/s on two V100s, versus about 26 tok/s on a 36-core
+   AVX-512 CPU (`-ngl 0`). CPU and GPU BF16 dumps of the same corpus differ by a mean KLD of
+   about 4e-5 nat.
+
 2. Ceiling dump, llama.cpp Q4_K_M of the same checkpoint, identical options:
 
    ```bash
