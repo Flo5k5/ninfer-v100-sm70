@@ -91,6 +91,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/rmsnorm.cu
   ops/launcher/rmsnorm_pack_tail.cu
   ops/launcher/rope.cu
+  ops/launcher/qk_rmsnorm_rope.cu
   ops/launcher/sampling.cu
   ops/launcher/scalar.cu
   ops/launcher/scatter.cu
@@ -306,6 +307,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/rmsnorm.cpp
   ops/wrapper/rmsnorm_pack_tail.cpp
   ops/wrapper/rope.cpp
+  ops/wrapper/qk_rmsnorm_rope.cpp
   ops/wrapper/sampling.cpp
   ops/wrapper/scalar.cpp
   ops/wrapper/scatter.cpp
