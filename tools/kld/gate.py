@@ -11,7 +11,7 @@ import math
 from typing import Any, Sequence
 
 from tools.kld.compare import COMPARE_SCHEMA
-from tools.kld.dump import DumpError
+from tools.kld.dump import DumpError, finite_number
 
 GATE_SCHEMA = "ninfer-kld-gate/1"
 
@@ -23,26 +23,42 @@ DEFAULT_GATE = {
     "max_ppl_increase_percent": 1.0,
 }
 
-_RESULT_KEYS = ("name", "kld", "top1_agreement", "ppl_candidate")
+
+def _validate_candidate(candidate: Any, where: str) -> None:
+    if not isinstance(candidate, dict) or not isinstance(candidate.get("name"), str):
+        raise DumpError(f"{where} has a candidate without a name")
+    label = f"{where} candidate {candidate['name']!r}"
+    kld = candidate.get("kld")
+    if not isinstance(kld, dict):
+        raise DumpError(f"{label}: kld must be an object with mean and p99, got {kld!r}")
+    finite_number(kld.get("mean"), f"{label}: kld.mean")
+    finite_number(kld.get("p99"), f"{label}: kld.p99")
+    top1 = finite_number(candidate.get("top1_agreement"), f"{label}: top1_agreement")
+    if not 0.0 <= top1 <= 1.0:
+        raise DumpError(f"{label}: top1_agreement must be in [0, 1], got {top1!r}")
+    finite_number(candidate.get("ppl_candidate"), f"{label}: ppl_candidate", positive=True)
+    if candidate.get("ppl_candidate_exact") is not None:
+        finite_number(candidate["ppl_candidate_exact"], f"{label}: ppl_candidate_exact",
+                      positive=True)
 
 
 def validate_results(results: Sequence[Any]) -> None:
-    """Reject anything but compare results before reading them."""
+    """Reject anything but well-formed compare results before reading them."""
     for index, document in enumerate(results):
+        where = f"results[{index}]"
         if not isinstance(document, dict) or document.get("schema") != COMPARE_SCHEMA:
             schema = document.get("schema") if isinstance(document, dict) else None
-            raise DumpError(f"results[{index}] is not a compare result (schema {schema!r}, "
+            raise DumpError(f"{where} is not a compare result (schema {schema!r}, "
                             f"expected {COMPARE_SCHEMA!r})")
         reference = document.get("reference")
+        if not isinstance(reference, dict) or not isinstance(reference.get("tokens_sha256"), str) \
+                or not isinstance(reference.get("path"), str):
+            raise DumpError(f"{where} lacks its reference (tokens_sha256 and path)")
         candidates = document.get("candidates")
-        if not isinstance(reference, dict) or not isinstance(candidates, list) or \
-                not {"tokens_sha256", "path"} <= reference.keys():
-            raise DumpError(f"results[{index}] lacks its reference or candidates")
+        if not isinstance(candidates, list):
+            raise DumpError(f"{where} lacks its list of candidates")
         for candidate in candidates:
-            missing = [key for key in _RESULT_KEYS
-                       if not isinstance(candidate, dict) or key not in candidate]
-            if missing:
-                raise DumpError(f"results[{index}] has a candidate without {missing}")
+            _validate_candidate(candidate, where)
 
 
 def _find(results: Sequence[dict[str, Any]], name: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -56,7 +72,11 @@ def _find(results: Sequence[dict[str, Any]], name: str) -> tuple[dict[str, Any],
 def gate(results: Sequence[dict[str, Any]], *, prod: str, candidate: str, ceiling: str,
          previous: str | None = None, limits: dict[str, float] | None = None) -> dict[str, Any]:
     validate_results(results)
-    limits = {**DEFAULT_GATE, **(limits or {})}
+    unknown = set(limits or {}) - set(DEFAULT_GATE)
+    if unknown:
+        raise DumpError(f"unknown gate limits: {sorted(unknown)}")
+    limits = {key: finite_number(value, f"limit {key}")
+              for key, value in {**DEFAULT_GATE, **(limits or {})}.items()}
     named = {role: _find(results, name) for role, name in
              (("prod", prod), ("candidate", candidate), ("ceiling", ceiling),
               ("previous", previous or prod))}

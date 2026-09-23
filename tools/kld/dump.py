@@ -15,9 +15,11 @@ c*context + context/2 + 1 + j, after context/2 + 1 + j tokens of history.
 from __future__ import annotations
 
 import hashlib
+import math
 import struct
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -26,7 +28,24 @@ HEADER_FIXED_BYTES = 8 + 3 * 4
 
 
 class DumpError(RuntimeError):
-    """A dump or a result is malformed, or two runs cannot be compared."""
+    """An input (dump, result, report, log or option value) is unusable, or two runs cannot be
+    compared. The command line reports it with exit code 2."""
+
+
+def finite_number(value: Any, label: str, *, positive: bool = False) -> float:
+    """Return `value` as a float, or raise DumpError unless it is a finite (positive) number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise DumpError(f"{label} must be a finite number, got {value!r}")
+    if positive and value <= 0:
+        raise DumpError(f"{label} must be positive, got {value!r}")
+    return float(value)
+
+
+def positive_integer(value: Any, label: str) -> int:
+    """Return `value`, or raise DumpError unless it is an integer of at least 1."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise DumpError(f"{label} must be a positive integer, got {value!r}")
+    return value
 
 
 def words_per_position(vocab: int) -> int:

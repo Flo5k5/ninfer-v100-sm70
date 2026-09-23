@@ -8,8 +8,9 @@ import pytest
 
 from kld_synthetic import write_dump
 from tools.kld import kld
-from tools.kld.compare import COMPARE_SCHEMA, ExactPpl, compare, read_exact_ppl
+from tools.kld.compare import COMPARE_SCHEMA, compare
 from tools.kld.dump import DumpError, decode, read_dump
+from tools.kld.exact_ppl import ExactPpl, read_exact_ppl
 from tools.kld.gate import gate
 
 CONTEXT = 16
@@ -251,24 +252,81 @@ def test_gate_prefers_exact_perplexity_when_both_runs_have_it() -> None:
     assert not check["passed"] and "exact PPL" in check["detail"]
 
 
-def test_exact_ppl_sources_record_their_window_count(tmp_path) -> None:
-    log = tmp_path / "base.log"
-    log.write_text("perplexity: calculating perplexity over 32 chunks, n_ctx=4096\n"
-                   "Final estimate: PPL = 6.1234 +/- 0.05\n")
+def _llama_log(path, chunks: int = 3, context: int = 4096) -> None:
+    path.write_text(f"perplexity: calculating perplexity over {chunks} chunks, n_ctx={context}, "
+                    "batch_size=2048, n_seq=1\n[1]4.1000,[2]4.0500,[3]4.0200,\n"
+                    "Final estimate: PPL = 4.0100 +/- 0.05\n")
+
+
+def _report(path, perplexity=6.5, chunks=8, context=4096) -> None:
+    path.write_text(json.dumps({"execution": {"window_plan": "kld-chunks"},
+                                "overall": {"perplexity": perplexity},
+                                "logits_dump": {"chunks": chunks, "context_tokens": context}}))
+
+
+def test_exact_ppl_sources_record_their_windows_and_context(tmp_path) -> None:
+    log = tmp_path / "run.log"
+    _llama_log(log)
     report = tmp_path / "report.json"
+    _report(report)
+    assert read_exact_ppl("7.25@8") == ExactPpl(7.25, 8, None)
+    assert read_exact_ppl(str(log)) == ExactPpl(pytest.approx(4.01), 3, 4096)
+    assert read_exact_ppl(f"{log}@2") == ExactPpl(pytest.approx(4.05), 2, 4096)
+    assert read_exact_ppl(f"{log}@3") == ExactPpl(pytest.approx(4.02), 3, 4096)  # the last window
+    assert read_exact_ppl(str(report)) == ExactPpl(6.5, 8, 4096)
+
+
+@pytest.mark.parametrize(("source", "message"), [
+    ("7.25", "bare number does not record the windows"),
+    ("nan@2", "must be a finite number, got nan"),
+    ("inf@2", "must be a finite number, got inf"),
+    ("0@2", "must be positive, got 0.0"),
+    ("-1.5@2", "must be positive, got -1.5"),
+    ("7.25@0", "N must be a positive integer, got 0"),
+])
+def test_exact_ppl_rejects_unusable_numbers(source: str, message: str) -> None:
+    with pytest.raises(DumpError, match=message):
+        read_exact_ppl(source)
+
+
+def test_exact_ppl_rejects_unusable_files(tmp_path) -> None:
+    log = tmp_path / "run.log"
+    _llama_log(log)
+    with pytest.raises(DumpError, match="the run has 3 windows, not 4"):
+        read_exact_ppl(f"{log}@4")
+    report = tmp_path / "report.json"
+    _report(report)
+    with pytest.raises(DumpError, match="@N applies to numbers and llama-perplexity logs only"):
+        read_exact_ppl(f"{report}@2")
+    _report(report, perplexity=None)  # a NaN perplexity is written as null
+    with pytest.raises(DumpError, match="overall.perplexity must be a finite number, got None"):
+        read_exact_ppl(str(report))
     report.write_text(json.dumps({"execution": {"window_plan": "kld-chunks"},
-                                  "overall": {"perplexity": 6.5},
-                                  "logits_dump": {"chunks": 8}}))
-    assert read_exact_ppl("7.25") == ExactPpl(7.25, None)
-    assert read_exact_ppl(str(log)) == ExactPpl(pytest.approx(6.1234), 32)
-    assert read_exact_ppl(str(report)) == ExactPpl(6.5, 8)
-    report.write_text(json.dumps({"execution": {"window_plan": "sliding"},
                                   "overall": {"perplexity": 6.5}}))
+    with pytest.raises(DumpError, match="lacks overall or logits_dump"):
+        read_exact_ppl(str(report))
+    report.write_text(json.dumps({"execution": {"window_plan": "sliding"}}))
     with pytest.raises(DumpError, match="--logits-out"):
         read_exact_ppl(str(report))
-    log.write_text("Final estimate: PPL = 6.1234 +/- 0.05\n")
-    with pytest.raises(DumpError, match="over N chunks"):
+    report.write_text("{not json")
+    with pytest.raises(DumpError, match="not valid JSON"):
+        read_exact_ppl(str(report))
+    log.write_text("Final estimate: PPL = 4.0100 +/- 0.05\n")
+    with pytest.raises(DumpError, match="n_ctx=C"):
         read_exact_ppl(str(log))
+
+
+def test_exact_ppl_paths_may_contain_at_signs(tmp_path) -> None:
+    folder = tmp_path / "runs@2x"
+    folder.mkdir()
+    _llama_log(folder / "run.log")
+    assert read_exact_ppl(str(folder / "run.log")).chunks == 3
+    assert read_exact_ppl(f"{folder / 'run.log'}@2").chunks == 2
+    literal = tmp_path / "odd.log@2"  # an existing path wins over the @N suffix
+    _llama_log(literal)
+    assert read_exact_ppl(str(literal)) == ExactPpl(pytest.approx(4.01), 3, 4096)
+    with pytest.raises(FileNotFoundError):
+        read_exact_ppl(str(tmp_path / "run.log@abc"))
 
 
 def test_exact_ppl_of_other_windows_is_rejected(tmp_path) -> None:
@@ -278,16 +336,20 @@ def test_exact_ppl_of_other_windows_is_rejected(tmp_path) -> None:
     write_dump(tmp_path / "cand.kld", CONTEXT, tokens, logits * 1.01)
     candidates = [("cand", tmp_path / "cand.kld")]
     same = compare(tmp_path / "ref.kld", candidates, workers=1,
-                   exact_ppl={"cand": ExactPpl(5.0, CHUNKS), "reference": ExactPpl(4.9, None)})
+                   exact_ppl={"cand": ExactPpl(5.0, CHUNKS, CONTEXT),
+                              "reference": ExactPpl(4.9, CHUNKS, None)})
     assert same["candidates"][0]["ppl_candidate_exact"] == 5.0
     assert same["reference"]["ppl_exact"] == 4.9
     # A full-run perplexity attached to a --chunks prefix would shift the gate's PPL check.
     with pytest.raises(DumpError, match="covers 3 windows but the comparison uses 2"):
         compare(tmp_path / "ref.kld", candidates, workers=1, chunks=2,
-                exact_ppl={"cand": ExactPpl(5.0, CHUNKS)})
+                exact_ppl={"cand": ExactPpl(5.0, CHUNKS, CONTEXT)})
+    with pytest.raises(DumpError, match="context of 2048 tokens, the comparison uses 16"):
+        compare(tmp_path / "ref.kld", candidates, workers=1,
+                exact_ppl={"cand": ExactPpl(5.0, CHUNKS, 2048)})
     with pytest.raises(DumpError, match="names no compared run"):
         compare(tmp_path / "ref.kld", candidates, workers=1,
-                exact_ppl={"other": ExactPpl(5.0, None)})
+                exact_ppl={"other": ExactPpl(5.0, CHUNKS, None)})
 
 
 def test_cli_compare_and_gate_exit_codes(tmp_path) -> None:
@@ -314,31 +376,70 @@ def test_cli_compare_and_gate_exit_codes(tmp_path) -> None:
                      "--ceiling", "stage", "--candidate", "q4km"]) == 1
 
 
+def _gate_args(path) -> list[str]:
+    return ["gate", "--results", str(path), "--prod", "prod", "--ceiling", "q4",
+            "--candidate", "stage"]
+
+
+def _stored(tmp_path, *candidates: dict):
+    path = tmp_path / "compare.json"
+    path.write_text(json.dumps(_document(*candidates)))
+    return path
+
+
 def test_cli_reports_unusable_input_with_exit_code_2(tmp_path, capsys) -> None:
     tokens = _tokens()
     logits = _logits(13)
     write_dump(tmp_path / "ref.kld", CONTEXT, tokens, logits)
-    missing = tmp_path / "missing.kld"
-    assert kld.main(["compare", "--reference", str(missing), "--workers", "1",
-                     "--candidate", f"c={tmp_path / 'ref.kld'}"]) == 2
+
+    def rejected(arguments: list[str], message: str) -> None:
+        assert kld.main(arguments) == 2
+        assert message in capsys.readouterr().err
+
+    rejected(["compare", "--reference", str(tmp_path / "missing.kld"), "--workers", "1",
+              "--candidate", f"c={tmp_path / 'ref.kld'}"], "No such file")
     broken = tmp_path / "broken.json"
     broken.write_text("{not json")
-    assert kld.main(["gate", "--results", str(broken), "--prod", "a", "--ceiling", "b",
-                     "--candidate", "c"]) == 2
-    gate_result = tmp_path / "gate.json"
-    gate_result.write_text(json.dumps({"schema": "ninfer-kld-gate/1", "checks": [],
-                                       "passed": True}))
-    assert kld.main(["gate", "--results", str(gate_result), "--prod", "a", "--ceiling", "b",
-                     "--candidate", "c"]) == 2
-    assert "not a compare result" in capsys.readouterr().err
-    incomplete = tmp_path / "incomplete.json"
-    incomplete.write_text(json.dumps({"schema": COMPARE_SCHEMA, "candidates": []}))
-    assert kld.main(["gate", "--results", str(incomplete), "--prod", "a", "--ceiling", "b",
-                     "--candidate", "c"]) == 2
-    report = tmp_path / "report.json"
-    report.write_text(json.dumps({"execution": {"window_plan": "kld-chunks"},
-                                  "overall": {"perplexity": 6.5}}))
+    rejected(_gate_args(broken), "broken.json: not valid JSON")
+    verdict = tmp_path / "gate.json"
+    verdict.write_text(json.dumps({"schema": "ninfer-kld-gate/1", "checks": [], "passed": True}))
+    rejected(_gate_args(verdict), "is not a compare result")
+    no_reference = tmp_path / "no_reference.json"
+    no_reference.write_text(json.dumps({"schema": COMPARE_SCHEMA, "candidates": []}))
+    rejected(_gate_args(no_reference), "lacks its reference")
+    no_candidates = tmp_path / "no_candidates.json"
+    no_candidates.write_text(json.dumps({"schema": COMPARE_SCHEMA,
+                                         "reference": {"tokens_sha256": "a", "path": "/r"}}))
+    rejected(_gate_args(no_candidates), "lacks its list of candidates")
+    for stage, message in (
+            ({**_result("stage", 0.01, 0.1, 0.95, 6.0), "top1_agreement": None},
+             "top1_agreement must be a finite number, got None"),
+            ({**_result("stage", 0.01, 0.1, 0.95, 6.0), "kld": 0.01},
+             "kld must be an object with mean and p99"),
+            ({**_result("stage", 0.01, 0.1, 0.95, 6.0), "ppl_candidate_exact": 0},
+             "ppl_candidate_exact must be positive"),
+            ({**_result("stage", 0.01, 0.1, 0.95, 6.0), "ppl_candidate": float("nan")},
+             "ppl_candidate must be a finite number")):
+        rejected(_gate_args(_stored(tmp_path, _result("prod", 0.01, 0.1, 0.95, 6.0),
+                                    _result("q4", 0.03, 0.3, 0.93, 6.1), stage)), message)
+    for source, message in (("0", "bare number"), ("0@3", "must be positive"),
+                            ("nan@3", "must be a finite number")):
+        rejected(["compare", "--reference", str(tmp_path / "ref.kld"), "--workers", "1",
+                  "--candidate", f"c={tmp_path / 'ref.kld'}", "--exact-ppl", f"c={source}"],
+                 message)
+    stored = _stored(tmp_path, _result("prod", 0.01, 0.1, 0.95, 6.0),
+                     _result("q4", 0.03, 0.3, 0.93, 6.1), _result("stage", 0.01, 0.1, 0.95, 6.0))
+    rejected(_gate_args(stored) + ["--max-top1-drop-points", "nan"],
+             "limit max_top1_drop_points must be a finite number")
+
+
+def test_cli_reports_internal_errors_with_exit_code_3(tmp_path, capsys, monkeypatch) -> None:
+    def broken_compare(*args, **kwargs):
+        raise ZeroDivisionError("a bug")
+
+    monkeypatch.setattr(kld, "compare", broken_compare)
+    write_dump(tmp_path / "ref.kld", CONTEXT, _tokens(), _logits(14))
     assert kld.main(["compare", "--reference", str(tmp_path / "ref.kld"), "--workers", "1",
-                     "--candidate", f"c={tmp_path / 'ref.kld'}",
-                     "--exact-ppl", f"c={report}"]) == 2
-    assert "missing field" in capsys.readouterr().err
+                     "--candidate", f"c={tmp_path / 'ref.kld'}"]) == 3
+    error = capsys.readouterr().err
+    assert "ZeroDivisionError: a bug" in error and "internal error" in error
