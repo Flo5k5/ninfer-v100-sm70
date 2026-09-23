@@ -293,8 +293,24 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
                                                 active_split_count, weights, warp_sums, scalars);
     const int d = d_start + tid;
     if (tid >= DChunk || d >= kCausalHeadDim) return;
-    float numerator = 0.0f;
-    for (int split = 0; split < active_split_count; ++split) {
+    // Split loads are issued in batches (the sum keeps its split order, so the result is
+    // unchanged): one dependent load per split made this loop latency bound at long context.
+    constexpr int kSplitBatch = 8;
+    float numerator           = 0.0f;
+    int split                 = 0;
+    for (; split + kSplitBatch <= active_split_count; split += kSplitBatch) {
+        float values[kSplitBatch];
+#pragma unroll
+        for (int j = 0; j < kSplitBatch; ++j) {
+            values[j] =
+                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split + j, tokens)];
+        }
+#pragma unroll
+        for (int j = 0; j < kSplitBatch; ++j) {
+            if (weights[split + j] != 0.0f) numerator += values[j] * weights[split + j];
+        }
+    }
+    for (; split < active_split_count; ++split) {
         if (weights[split] != 0.0f)
             numerator +=
                 partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] *

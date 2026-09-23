@@ -386,7 +386,13 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
 #undef NINFER_CAUSAL_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
-    constexpr int kDChunk      = Geometry::QHeads == 24 ? 256 : 64;
+#ifdef NINFER_VOLTA_BUILD
+    // One 256-wide block per (head, column) left most of the 80 SMs idle at small widths (24
+    // blocks at width one); 64-dim chunks give four times the blocks for the same reads.
+    constexpr int kDChunk = 64;
+#else
+    constexpr int kDChunk = Geometry::QHeads == 24 ? 256 : 64;
+#endif
     const auto launch_reduce   = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                           invocation.width * invocation.batch_size);
