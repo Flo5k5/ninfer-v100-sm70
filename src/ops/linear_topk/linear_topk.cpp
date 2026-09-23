@@ -51,6 +51,10 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     if (head_rows == detail::kLinearTopKOptimizedRows && qtype == QType::Q4G64_F16S) {
         return HeadProfile::Q4Optimized;
     }
+    if (qtype == QType::NVFP4) {
+        throw std::invalid_argument(
+            "linear_topk: no NVFP4 head profile (full heads are W8 or FP8)");
+    }
     throw std::invalid_argument("linear_topk: unsupported head profile");
 }
 

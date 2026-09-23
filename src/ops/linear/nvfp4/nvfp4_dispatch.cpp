@@ -25,10 +25,13 @@ enum class Nvfp4LinearRoute : std::uint8_t {
 
 Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                LinearPolicy policy, std::int32_t tokens) {
-    if (tokens <= 0 || !is_nvfp4_linear_problem(output_rows, input_rows)) {
+    if (tokens <= 0 || !is_nvfp4_dispatch_problem(output_rows, input_rows)) {
         throw std::invalid_argument("nvfp4 linear: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) { return Nvfp4LinearRoute::A16; }
+    if (is_nvfp4_vocabulary_problem(output_rows, input_rows)) {
+        throw std::invalid_argument("nvfp4 linear: the vocabulary head has an A16 route only");
+    }
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear: unsupported policy");
     }
@@ -76,7 +79,10 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
     // workspace only when split-K applies (rare at production shapes -- both registered NVFP4
     // shapes measured splits=1 at prefill width); fall back to the chunked route rather than
     // fault if a caller genuinely has none. See docs/v100.md.
+    // The wide-T kernel reads the checkpoint-native code and scale planes; a QPN-prepacked weight
+    // stays on the chunked QPN2 route, which reads both layouts.
     if (workspace != nullptr && total_t > kNvfp4VoltaQpnMaxTokens &&
+        weight.layout == QuantLayout::BlockScaleK16M128x4 &&
         nvfp4_volta_mma_supported(weight.n, weight.k, total_t)) {
         const std::size_t need = nvfp4_volta_mma_workspace_bytes(weight.n, weight.k, total_t);
         if (need == 0 || workspace->capacity() - workspace->used() >= need) {
@@ -170,7 +176,7 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     if (weight.layout == QuantLayout::VoltaQpnPrepackedSwiGlu) {
         throw std::invalid_argument("nvfp4 linear: SwiGLU-interleaved weights are linear_swiglu-only");
     }
-    if (!is_nvfp4_linear_problem(weight.n, weight.k) || x.ne[1] <= 0) {
+    if (!is_nvfp4_dispatch_problem(weight.n, weight.k) || x.ne[1] <= 0) {
         throw std::invalid_argument("nvfp4 linear: unsupported shape");
     }
 
