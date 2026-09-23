@@ -253,6 +253,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.startup_observer         = std::move(startup_observer);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
+    validate_reasoning_effort_policy(options_, prompt_capabilities_);
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
