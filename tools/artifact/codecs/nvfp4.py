@@ -7,7 +7,7 @@ from typing import Sequence
 
 import torch
 
-from ..formats import valid_positive_fp32_word
+from ..formats import _E2M1_MAGNITUDES, valid_positive_fp32_word
 from ..layouts import block_scale_geometry
 from ._tensor_bytes import (
     Payload,
@@ -142,3 +142,24 @@ def decode_nvfp4_words(
         ()
     )
     return codes, scales, divisor
+
+
+def dequantize_nvfp4(
+    payload: Payload,
+    shape: Sequence[int],
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Reconstruct an NVFP4 matrix from its exact stored words.
+
+    Each weight is ``e2m1(code) * e4m3(block scale) / divisor``; the even K element of every
+    packed byte is its low nibble.
+    """
+
+    codes, scales, divisor = decode_nvfp4_words(payload, shape)
+    rows, columns = int(shape[0]), int(shape[1])
+    nibbles = torch.stack((codes & 0x0F, codes >> 4), dim=2).reshape(rows, columns)
+    magnitudes = torch.tensor(_E2M1_MAGNITUDES, dtype=torch.float32)[(nibbles & 0x7).long()]
+    values = torch.where((nibbles & 0x8) != 0, -magnitudes, magnitudes)
+    multipliers = scales.view(torch.float8_e4m3fn).float() / divisor.float()
+    blocks = values.reshape(rows, columns // 16, 16) * multipliers.unsqueeze(2)
+    return blocks.reshape(rows, columns).to(dtype)

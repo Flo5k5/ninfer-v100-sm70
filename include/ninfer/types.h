@@ -599,6 +599,19 @@ public:
     virtual void publish(OutputDelta delta)                 = 0;
 };
 
+// Receives the main-head logits of the scored positions of Engine::score_tokens, in target order,
+// one block per call on the scoring thread. `bf16_logits` holds `columns` consecutive rows of
+// `row_stride` raw BF16 bit patterns; row j holds the logits that predict the j-th target of the
+// block. Only the first `valid_rows` entries of a row are vocabulary logits; the remaining entries
+// are output-head padding outside the token domain. The pointer is valid only during the call.
+// An exception thrown by consume() aborts the score_tokens call.
+class ScoreLogitsSink {
+public:
+    virtual ~ScoreLogitsSink()                                               = default;
+    virtual void consume(const std::uint16_t* bf16_logits, std::uint32_t columns,
+                         std::uint32_t row_stride, std::uint32_t valid_rows) = 0;
+};
+
 enum class OutputConsumerMode : std::uint8_t {
     Aggregate,
     Streaming,

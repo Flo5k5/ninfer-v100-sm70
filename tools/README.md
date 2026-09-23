@@ -17,6 +17,7 @@ for the selected tool.
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
+| Compare logits dumps (KLD, top-1, PPL) and gate a quantization | [`kld/kld.py`](kld/kld.py), [runbook](../docs/perplexity.md#runbook) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 

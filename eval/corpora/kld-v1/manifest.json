@@ -1,0 +1,15 @@
+{
+  "corpus_id": "ninfer-kld-v1",
+  "context": 4096,
+  "chunks": 32,
+  "rounds": 4,
+  "slack_tokens": 64,
+  "sources": [
+    {"id": "wikitext-00", "domain": "english_reference", "path": "../perplexity-1m/data/wikitext/00.txt", "tokens": 28672},
+    {"id": "pg19-00", "domain": "english_long_form", "path": "../perplexity-1m/data/pg19/00.txt", "tokens": 28672},
+    {"id": "zhwiki-00", "domain": "chinese_reference", "path": "../perplexity-1m/data/zhwiki/00.txt", "tokens": 28672},
+    {"id": "french-00", "domain": "french", "path": "data/french/00.txt", "tokens": 6144},
+    {"id": "chat-00", "domain": "chat_reasoning", "path": "data/chat/00.txt", "tokens": 6144},
+    {"id": "ninfer-00", "domain": "ninfer_code", "path": "../perplexity-1m/data/ninfer/00.txt", "tokens": "rest"}
+  ]
+}
