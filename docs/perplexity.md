@@ -83,7 +83,8 @@ agreement of their top-1 tokens, and their perplexities, all on identical token 
 
 `--logits-out FILE` switches the window plan to the llama.cpp `llama-perplexity` KL-divergence
 protocol so that NInfer and llama.cpp dumps are position-for-position comparable. It requires
-`--text` (one token stream) and a `--stride` of `context/2` (the default for the default context):
+`--text` (one token stream) and sets the stride to `context/2`: an omitted `--stride` takes that
+value and any other `--stride` is rejected.
 
 - the stream is cut into `floor(tokens/context)` non-overlapping windows of exactly `context`
   tokens; the tail after the last full window is not evaluated;
@@ -108,12 +109,16 @@ NInfer writes the output-head row width (248,320 for Qwen3.8, the GGUF vocabular
 normalizes over the 248,077-token domain; padding rows encode as the floor and carry no mass. The
 dump holds the evaluated token ids, so a comparison verifies tokenization equality. A dump is
 written as `FILE.partial` and renamed only when every position is present; `report.json` records it
-under `logits_dump`. The partial file is created before scoring, so a missing or unwritable
-directory fails immediately, and a `FILE.partial` left by an interrupted run is refused rather than
-overwritten. For 32 windows of 4,096 tokens (65,504 positions) a dump is 32.5 GB.
+under `logits_dump`. Before the model is loaded, an explicit `--output` directory is created (an
+existing one must be empty), and `--logits-out` is refused if the dump exists, if a `FILE.partial`
+left by an interrupted run exists, or if its directory is missing; a dump may live inside the
+`--output` directory. The partial file itself is created after tokenization, before scoring, so an
+unwritable destination also fails before any scoring time is spent. For 32 windows of 4,096 tokens
+(65,504 positions) a dump is 32.5 GB.
 
-`--logits-reference REF` reads the token block of an existing dump and aborts before scoring if the
-artifact tokenizer produced different ids, a different chunk count, or a different context. With
+`--logits-reference REF` reads the header of an existing dump before the model is loaded (a missing
+file or a different context fails there) and, after tokenization, aborts before scoring if the
+artifact tokenizer produced different ids or a different chunk count. With
 `--chunks N` the reference may hold more windows: the run must match its first N windows, the
 prefix that `kld.py compare --chunks N` compares. It also rejects a logits row width that differs
 from the reference vocabulary.
@@ -123,9 +128,10 @@ over the 248,077-token domain; with Qwen3.8-27B the padding rows hold a probabil
 on average (at most 4e-5) in llama.cpp, which biases a cross-engine KLD by about as much. NInfer's
 output head writes BF16 logits: rounding FP32 logits to BF16 costs a KLD of 0.00023 nat on average
 (p99 0.001, matching the uniform-rounding estimate `0.5 sum p(1-p) step^2/12`) but flips the top-1
-token at 1.7% of positions, where two candidates are within one BF16 step (0.125 for logits in
-[16, 32)). Compare top-1 agreement between runs of the same engine; against an FP32-logits
-reference, a BF16-logits run starts about 1.5 points lower.
+token at 1.5 to 1.7% of positions, where the two most likely tokens are within one BF16 step (0.125
+for logits in [16, 32)). Against an FP32-logits reference, a BF16-logits run therefore starts 1.5 to
+1.7 points lower on top-1 agreement, more than the gate's 1-point limit: compare top-1 agreement,
+and gate it, only between runs of the same engine.
 
 Because of the 16-nat window, a target less likely than `max_prob*e^-16` is counted at the floor, so
 perplexity recomputed from dumps slightly under-counts very surprising tokens (llama.cpp's
@@ -141,11 +147,23 @@ perplexity recomputed from dumps slightly under-counts very surprising tokens (l
   every token id match, then reports per candidate the mean (with standard error), median, p90,
   p95, p99, p99.9 and max KLD, the top-1 agreement, the reference and candidate perplexities and
   their delta, and the target-probability difference. `--segments` adds the same statistics per
-  corpus domain, `--exact-ppl NAME=SOURCE` attaches the unclamped perplexity of a run (it must
-  cover the compared windows: `--chunks` needs the perplexity of the same prefix), `--json`
+  corpus domain, `--exact-ppl NAME=SOURCE` attaches the unclamped perplexity of a run, `--json`
   writes the machine-readable result;
 - `gate --results JSON... --candidate NAME --prod NAME --ceiling NAME [--previous NAME]` applies the
-  quantization gate and exits 0 on pass, 1 on failure, 2 on unusable input.
+  quantization gate.
+
+Every command exits 0 on success (for `gate`, PASS), 1 when the gate fails, 2 on unusable input
+(a missing or malformed file, runs that cannot be compared, a result that is not a compare result,
+a non-finite or non-positive value) and 3 on an internal error, after printing its traceback.
+
+An exact perplexity must cover the compared windows: each source records the windows it covers,
+and `compare` refuses one computed over another window count or context. A source is a
+`VALUE@N` (a number over N windows), a llama-perplexity log (its `Final estimate` over the chunks
+and `n_ctx` of its `calculating perplexity over N chunks, n_ctx=C` line), `LOG@N` (the running
+perplexity after window N of that log, for a `--chunks N` comparison) or a ninfer-perplexity
+`report.json` (`overall.perplexity` over `logits_dump.chunks` windows of
+`logits_dump.context_tokens`). A path that exists is always read as a path, even if it ends with
+`@N`.
 
 KLD per position is llama.cpp's definition, `sum_i p_ref(i) (log p_ref(i) - log p_cand(i))` over
 tokens with `log p_ref(i) > -16`. llama.cpp evaluates the candidate from unquantized logits, here
@@ -167,7 +185,9 @@ default); each limit has a command-line override:
 | top-1 agreement drop from the previous stage | at most 1 percentage point |
 | perplexity increase over the previous stage | at most +1% (unclamped when both runs provide it) |
 
-The gate refuses results computed against different references or corpora.
+The gate refuses results computed against different references or corpora. The top-1 limit only
+holds between runs of the same engine: BF16 logits alone cost 1.5 to 1.7 points of top-1 agreement
+against an FP32-logits run (see above), more than the limit.
 
 ### Corpus
 
