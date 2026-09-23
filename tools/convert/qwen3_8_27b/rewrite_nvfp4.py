@@ -34,8 +34,8 @@ MLP from its FP8 codes instead (double quantization).
 
 ``--check-idempotence`` re-quantizes NVFP4 source matrices with their own global
 divisor and requires bit-identical codes and scales. ``--check-reproduction``
-quantizes BF16 matrices with the divisors of a published NVFP4 checkpoint and
-counts the words that differ from it.
+quantizes BF16 matrices from scratch and requires the divisor, code and scale
+words of a published NVFP4 checkpoint of the same weights, bit for bit.
 """
 
 from __future__ import annotations
@@ -136,6 +136,35 @@ def _float_matrix(source: SourceCheckpoint, name: str) -> tuple[torch.Tensor, st
     raise RewriteError(f"{name}: no NVFP4 route for source dtype {dtype or 'missing'}")
 
 
+def stage_objects(
+    base: Artifact, stage: Stage
+) -> list[tuple[str, tuple[tuple[str, str], ...], str]]:
+    """Objects a stage rewrites: (object id, (logical parameter, checkpoint matrix)..., source)."""
+
+    directory = base.directory
+    result = []
+    for layer in stage.mlp_layers:
+        prefix = f"text/layers/{layer}/mlp/"
+        gate_object, gate_begin, gate_end = _whole_object(directory, prefix + "gate")
+        up_object, up_begin, up_end = _whole_object(directory, prefix + "up")
+        obj = base.object(gate_object)
+        if up_object != gate_object or gate_begin != 0 or up_begin != gate_end:
+            raise RewriteError(f"{prefix}gate_up: gate and up are not one fused object")
+        if up_end != obj.shape[0] * obj.shape[1]:
+            raise RewriteError(f"{prefix}gate_up: gate and up do not cover the object")
+        parts = (
+            (prefix + "gate", _mlp_matrix(layer, "gate")),
+            (prefix + "up", _mlp_matrix(layer, "up")),
+        )
+        result.append((gate_object, parts, "mlp"))
+        down_object, _, _ = _whole_object(directory, prefix + "down")
+        result.append((down_object, ((prefix + "down", _mlp_matrix(layer, "down")),), "mlp"))
+    if stage.output_head:
+        head_object, _, _ = _whole_object(directory, OUTPUT_HEAD)
+        result.append((head_object, ((OUTPUT_HEAD, OUTPUT_HEAD_SOURCE),), "head"))
+    return result
+
+
 class Rewriter:
     def __init__(
         self,
@@ -148,30 +177,9 @@ class Rewriter:
         self.stage = stage
         self.mlp_source = mlp_source
         self.head_source = head_source
-        directory = base.directory
         self.targets: dict[str, Target] = {}
-        for layer in stage.mlp_layers:
-            prefix = f"text/layers/{layer}/mlp/"
-            gate_object, gate_begin, gate_end = _whole_object(directory, prefix + "gate")
-            up_object, up_begin, up_end = _whole_object(directory, prefix + "up")
-            obj = base.object(gate_object)
-            if up_object != gate_object or gate_begin != 0 or up_begin != gate_end:
-                raise RewriteError(f"{prefix}gate_up: gate and up are not one fused object")
-            if up_end != obj.shape[0] * obj.shape[1]:
-                raise RewriteError(f"{prefix}gate_up: gate and up do not cover the object")
-            self._add_target(
-                gate_object,
-                (
-                    (prefix + "gate", _mlp_matrix(layer, "gate")),
-                    (prefix + "up", _mlp_matrix(layer, "up")),
-                ),
-                "mlp",
-            )
-            down_object, _, _ = _whole_object(directory, prefix + "down")
-            self._add_target(down_object, ((prefix + "down", _mlp_matrix(layer, "down")),), "mlp")
-        if stage.output_head:
-            head_object, _, _ = _whole_object(directory, OUTPUT_HEAD)
-            self._add_target(head_object, ((OUTPUT_HEAD, OUTPUT_HEAD_SOURCE),), "head")
+        for object_id, parts, source in stage_objects(base, stage):
+            self._add_target(object_id, parts, source)
         self._plan_uses()
 
     def _add_target(self, object_id: str, parts, source: str) -> None:
@@ -451,54 +459,109 @@ def _object_digest(artifact: Artifact, object_id: str) -> str:
     return digest.hexdigest()
 
 
+def _use_key(use: dict) -> tuple[str, str]:
+    return use["parameter"], use["input"]
+
+
 def verify_output(base_path: Path, out_path: Path, stage: Stage) -> int:
-    """Check a rewritten artifact against its base without a GPU."""
+    """Check a rewritten artifact against its base without a GPU.
+
+    Exactly the stage objects change format (to NVFP4, decodable); every other base
+    object is present and byte-identical; bindings are unchanged; the Uses of
+    untouched parameters are unchanged; each rewritten Use has ``AllowA4`` and a
+    positive scalar input divisor that is a new auxiliary object; the Uses of the
+    output head share one divisor object; and every new object is such a divisor.
+    """
 
     failures = 0
+
+    def fail(message: str) -> None:
+        nonlocal failures
+        failures += 1
+        print(f"FAIL {message}", flush=True)
+
     with Artifact(base_path) as base, Artifact(out_path) as out:
+        targets = {object_id: parts for object_id, parts, _ in stage_objects(base, stage)}
+        rewritten = {logical for parts in targets.values() for logical, _ in parts}
         base_ids = {obj.id for obj in base.objects}
-        rewritten = {
-            use["parameter"]
-            for use in out.directory.uses
-            if DIVISOR_ROLE in use.get("auxiliaries", {})
-        }
+        out_ids = {obj.id for obj in out.objects}
+        new_ids = out_ids - base_ids
+
         if out.directory.provenance.get("recipe") != stage.recipe:
-            print(f"FAIL recipe {out.directory.provenance.get('recipe')!r}", flush=True)
-            failures += 1
+            fail(f"recipe {out.directory.provenance.get('recipe')!r}")
         if out.directory.bindings != base.directory.bindings:
-            print("FAIL bindings differ from base", flush=True)
-            failures += 1
+            fail("bindings differ from base")
+        if not base_ids <= out_ids:
+            fail(f"objects missing from the output: {sorted(base_ids - out_ids)[:8]}")
+
+        changed = set()
         for obj in out.objects:
-            if obj.id not in base_ids:
-                (value,) = struct.unpack("<f", out.read_object(obj.id))
-                ok = obj.id.startswith("auxiliary/") and value > 0.0
-                failures += 0 if ok else 1
-                print(f"{'OK  ' if ok else 'FAIL'} new {obj.id} = {value}", flush=True)
+            if obj.id in new_ids:
                 continue
             before = base.object(obj.id)
             if isinstance(obj, TensorObject) and obj.format != before.format:
-                codes, scales, divisor = decode_nvfp4_words(out.read_object(obj.id), obj.shape)
-                ok = obj.format == NVFP4_FORMAT and float(divisor) > 0.0
-                failures += 0 if ok else 1
-                print(
-                    f"{'OK  ' if ok else 'FAIL'} {obj.id} {before.format}->{obj.format} "
-                    f"divisor={float(divisor):.6g}",
-                    flush=True,
-                )
+                changed.add(obj.id)
+                if obj.id not in targets or obj.format != NVFP4_FORMAT:
+                    fail(f"{obj.id} changed {before.format}->{obj.format} outside the stage")
+                    continue
+                try:
+                    _, _, divisor = decode_nvfp4_words(out.read_object(obj.id), obj.shape)
+                except ValueError as error:
+                    fail(f"{obj.id} does not decode as NVFP4: {error}")
+                    continue
+                print(f"OK   {obj.id} {before.format}->{obj.format} divisor={float(divisor):.6g}")
                 continue
-            same = _object_digest(out, obj.id) == _object_digest(base, obj.id)
-            if not same:
-                print(f"FAIL {obj.id} differs from base", flush=True)
-                failures += 1
-        expected = set()
-        for layer in stage.mlp_layers:
-            expected |= {f"text/layers/{layer}/mlp/{leaf}" for leaf in ("gate", "up", "down")}
-        if stage.output_head:
-            expected.add(OUTPUT_HEAD)
-        missing = expected - rewritten
-        if missing:
-            print(f"FAIL parameters without an input divisor: {sorted(missing)}", flush=True)
-            failures += 1
+            if _object_digest(out, obj.id) != _object_digest(base, obj.id):
+                fail(f"{obj.id} differs from base")
+        if changed != set(targets):
+            fail(f"stage objects left unconverted: {sorted(set(targets) - changed)}")
+
+        base_uses = {_use_key(use): use for use in base.directory.uses}
+        out_uses = {_use_key(use): use for use in out.directory.uses}
+        if set(base_uses) != set(out_uses):
+            fail("the set of Uses differs from base")
+        referenced: set[str] = set()
+        head_divisors: set[str] = set()
+        for key, use in out_uses.items():
+            if key not in base_uses:
+                continue
+            parameter = key[0]
+            if parameter not in rewritten:
+                if use != base_uses[key]:
+                    fail(f"Use {key} of an untouched parameter changed")
+                continue
+            aux = use.get("auxiliaries", {}).get(DIVISOR_ROLE, {}).get("object")
+            if use.get("activation_policy") != "AllowA4" or aux is None:
+                fail(f"Use {key} lacks AllowA4 or an input divisor")
+                continue
+            if aux not in new_ids:
+                fail(f"Use {key} divisor {aux} is not a new auxiliary object")
+                continue
+            referenced.add(aux)
+            if parameter == OUTPUT_HEAD:
+                head_divisors.add(aux)
+        if stage.output_head and len(head_divisors) != 1:
+            fail(f"the output head Uses name {len(head_divisors)} divisor objects, expected one")
+
+        for object_id in sorted(new_ids):
+            obj = out.object(object_id)
+            raw = out.read_object(object_id)
+            if (
+                not object_id.startswith("auxiliary/")
+                or not isinstance(obj, TensorObject)
+                or obj.format != AUX_FORMAT
+                or tuple(obj.shape) != ()
+                or len(raw) != 4
+            ):
+                fail(f"new object {object_id} is not a scalar FP32 auxiliary")
+                continue
+            (value,) = struct.unpack("<f", raw)
+            if not value > 0.0 or value == float("inf"):
+                fail(f"new {object_id} = {value} is not a positive finite divisor")
+            elif object_id not in referenced:
+                fail(f"new {object_id} is not referenced by a rewritten Use")
+            else:
+                print(f"OK   new {object_id} = {value}", flush=True)
     print(f"verify: {failures} failures", flush=True)
     return 1 if failures else 0
 
@@ -547,11 +610,16 @@ def check_idempotence(source: SourceCheckpoint, layers: Sequence[int]) -> int:
     return 1 if failures else 0
 
 
+def _fp32_word(value: torch.Tensor) -> int:
+    return struct.unpack("<I", struct.pack("<f", float(value)))[0]
+
+
 def check_reproduction(
     source: SourceCheckpoint, reference: SourceCheckpoint, layers: Sequence[int]
 ) -> int:
-    """Quantize BF16 source MLP matrices with the divisor of a published NVFP4 checkpoint
-    of the same weights and count the words that differ from the published ones."""
+    """Quantize BF16 source MLP matrices from scratch and compare every word with a
+    published NVFP4 checkpoint of the same weights: the global divisor bit for bit,
+    then the packed codes and the scale words."""
 
     failures = 0
     for layer in layers:
@@ -562,16 +630,23 @@ def check_reproduction(
             scales = torch.cat(
                 [reference.get(prefix + name + ".weight_scale").view(torch.uint8) for name in group]
             )
-            divisor = reference.get(prefix + group[0] + ".weight_global_scale").float().reshape(())
-            words = nvfp4_quantize.quantize_fused(values, divisor=divisor)
+            published = {
+                _fp32_word(reference.get(prefix + name + ".weight_global_scale")) for name in group
+            }
+            if len(published) != 1:
+                raise RewriteError(f"layer {layer} {group}: fused parts have different divisors")
+            (published_word,) = published
+            words = nvfp4_quantize.quantize_fused(values)
+            divisor_word = _fp32_word(words.divisor)
             code_diff = int((words.packed != packed).sum())
             scale_diff = int((words.scales != scales).sum())
-            fresh = float(nvfp4_quantize.global_divisor(nvfp4_quantize.tensor_amax(values)))
-            failures += 0 if code_diff == 0 and scale_diff == 0 else 1
+            ok = divisor_word == published_word and code_diff == 0 and scale_diff == 0
+            failures += 0 if ok else 1
             print(
-                f"layer {layer} {'+'.join(group)}: {code_diff}/{packed.numel()} code bytes and "
-                f"{scale_diff}/{scales.numel()} scales differ with the published divisor "
-                f"{float(divisor)}; amax divisor would be {fresh:.7g}",
+                f"{'OK  ' if ok else 'DIFF'} layer {layer} {'+'.join(group)}: divisor "
+                f"{float(words.divisor)} (0x{divisor_word:08x}) vs published "
+                f"0x{published_word:08x}; {code_diff}/{packed.numel()} code bytes and "
+                f"{scale_diff}/{scales.numel()} scales differ",
                 flush=True,
             )
     source.close()
@@ -619,8 +694,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="LAYERS",
         default=None,
         help=(
-            "quantize these BF16 --source MLP layers with the divisors of --reference and "
-            "compare with its published NVFP4 words, then exit"
+            "quantize these BF16 --source MLP layers from scratch and require the published "
+            "NVFP4 words of --reference (divisor, codes, scales), then exit"
         ),
     )
     parser.add_argument("--reference", type=Path, help="published NVFP4 checkpoint")

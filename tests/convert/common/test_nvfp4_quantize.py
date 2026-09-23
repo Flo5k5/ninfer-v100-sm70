@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import struct
+
 import pytest
 import torch
 
@@ -11,7 +13,8 @@ def _well_formed_words(rows: int, columns: int, seed: int) -> tuple[torch.Tensor
     """Random NVFP4 words where every nonzero block holds a magnitude-6 code.
 
     An RTN quantizer always maps the block maximum to the E2M1 maximum, so these
-    are exactly the words it can produce; the all-zero block covers scale 0.
+    are exactly the words it can produce; the all-zero block carries the epsilon
+    scale word a zero scale is replaced by.
     """
 
     generator = torch.Generator().manual_seed(seed)
@@ -20,7 +23,7 @@ def _well_formed_words(rows: int, columns: int, seed: int) -> tuple[torch.Tensor
     codes[:, :, 0] = (codes[:, :, 0] & 0x8) | 0x7
     scales = torch.randint(1, 0x7F, (rows, columns // 16), generator=generator, dtype=torch.uint8)
     codes[0, 0] = 0
-    scales[0, 0] = 0
+    scales[0, 0] = nvfp4_quantize.E4M3_EPS_WORD
     codes = codes.reshape(rows, columns)
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
     return packed.contiguous(), scales
@@ -32,10 +35,17 @@ def test_requantizing_decoded_words_is_bit_identical() -> None:
     values = nvfp4_quantize.dequantize(packed, scales, divisor)
     words = nvfp4_quantize.quantize_fused([values], divisor=divisor, chunk_rows=64)
     # Signed zero codes (0x8) survive because the sign comes from signbit.
-    mask = torch.ones_like(packed, dtype=torch.bool)
-    mask[0, :8] = False  # the all-zero block: codes are free when the scale is zero
-    assert torch.equal(words.packed[mask], packed[mask])
+    assert torch.equal(words.packed, packed)
     assert torch.equal(words.scales, scales)
+
+
+def test_zero_blocks_get_the_epsilon_scale_word() -> None:
+    row = torch.zeros(2, 32)
+    row[1, 16] = 1.0
+    packed, scales = nvfp4_quantize.quantize_rows(row, torch.tensor(2688.0))
+    assert scales[:, 0].tolist() == [0x20, 0x20]
+    assert scales[1, 1].item() != 0x20
+    assert int(packed[0].abs().sum()) == 0
 
 
 def test_e2m1_rounding_is_nearest_with_ties_to_even() -> None:
@@ -61,7 +71,9 @@ def test_fused_parts_share_the_amax_divisor_and_encode() -> None:
     up = 3.0 * torch.randn(128, 64, generator=generator)
     words = nvfp4_quantize.quantize_fused([gate, up])
     amax = max(float(gate.abs().max()), float(up.abs().max()))
-    assert float(words.divisor) == pytest.approx(448.0 * 6.0 / amax, rel=1e-6)
+    assert float(words.divisor) == pytest.approx(448.0 * 6.0 / amax, rel=1e-2)
+    # The divisor is evaluated in BF16, so its FP32 word has a zero low half.
+    assert struct.unpack("<I", words.divisor_word)[0] & 0xFFFF == 0
     assert words.packed.shape == (256, 32)
     assert words.scales.shape == (256, 4)
     assert int(words.scales.max()) <= 0x7E

@@ -2,12 +2,16 @@
 
 The scheme is the one compressed-tensors checkpoints publish for NVFP4 weights:
 
-* one FP32 global divisor per logical weight, ``448 * 6 / amax``, where ``amax``
-  is taken over every fused part (gate and up share one divisor);
+* one global divisor per logical weight, ``448 * 6 / amax``, where ``amax`` is
+  taken over every fused part (gate and up share one divisor). compressed-tensors
+  evaluates it in the BF16 model dtype (``2688.0 / amax_bf16``, which PyTorch
+  computes as a BF16 reciprocal times the scalar) and stores the BF16 result as
+  FP32; this module does the same, so the divisor word is BF16-exact;
 * one E4M3FN scale per 16-element K block, ``block_amax / 6 * divisor``
   rounded to nearest even and clamped to the finite E4M3FN range, where
-  ``block_amax / 6`` is first rounded to BF16 as compressed-tensors computes it
-  in the model dtype (this reproduces its published scale words exactly);
+  ``block_amax / 6`` is first rounded to BF16 (also the model dtype). A scale
+  that rounds to zero is replaced by the E4M3FN epsilon 0.125 (word ``0x20``),
+  as compressed-tensors does to avoid dividing by zero;
 * every value divided by its decoded block multiplier ``scale / divisor`` and
   rounded to the nearest E2M1 level, ties to even, saturating at 6.
 
@@ -28,10 +32,11 @@ import torch
 from tools.artifact.codecs.nvfp4 import encode_nvfp4
 
 
-ENCODER_PROFILE = "NVFP4_RTN_AMAX_DIVISOR_BF16_LOCAL_E4M3_RNE_E2M1_RNE_V1"
+ENCODER_PROFILE = "NVFP4_RTN_BF16_DIVISOR_BF16_LOCAL_E4M3_RNE_ZERO_EPS_E2M1_RNE_V2"
 GROUP = 16
 E2M1_MAX = 6.0
 E4M3_MAX = 448.0
+E4M3_EPS_WORD = 0x20  # 0.125, torch.finfo(torch.float8_e4m3fn).eps
 DEFAULT_CHUNK_ROWS = 2048
 
 _E2M1_LEVELS = torch.tensor((0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), dtype=torch.float32)
@@ -78,15 +83,19 @@ def tensor_amax(parts: Iterable[torch.Tensor], chunk_rows: int = DEFAULT_CHUNK_R
 
 
 def global_divisor(amax: float) -> torch.Tensor:
-    """FP32 global divisor ``448 * 6 / amax`` shared by every fused part."""
+    """Global divisor ``448 * 6 / amax`` in the BF16 model dtype, returned as FP32.
+
+    ``amax`` is rounded to BF16 first (exact for BF16 sources). The expression is
+    written exactly as compressed-tensors writes it: a Python scalar divided by a
+    BF16 tensor, which PyTorch evaluates as a BF16 reciprocal times the scalar.
+    """
 
     if not amax > 0.0:
         raise ValueError("NVFP4 global divisor needs a positive amax")
-    divisor = torch.tensor(E4M3_MAX * E2M1_MAX, dtype=torch.float32) / torch.tensor(
-        amax, dtype=torch.float32
-    )
-    if not bool(torch.isfinite(divisor)):
-        raise ValueError("NVFP4 global divisor is not finite")
+    amax_bf16 = torch.tensor([amax], dtype=torch.float32).to(torch.bfloat16)
+    divisor = (E4M3_MAX * E2M1_MAX / amax_bf16).float()
+    if not bool(torch.isfinite(divisor).all()) or not float(divisor) > 0.0:
+        raise ValueError("NVFP4 global divisor is not finite and positive")
     return divisor.reshape(())
 
 
@@ -108,16 +117,17 @@ def _quantize_rows(
     # FP32 divisor; rounding it the same way reproduces its published scale words.
     local = (block_amax / E2M1_MAX).to(torch.bfloat16).float()
     scale_value = (local * divisor).clamp_(0.0, E4M3_MAX)
-    scale_words = scale_value.to(torch.float8_e4m3fn)
-    multiplier = scale_words.float() / divisor
-    safe = torch.where(multiplier > 0, multiplier, torch.ones_like(multiplier))
-    scaled = blocks / safe.unsqueeze(2)
-    scaled = torch.where((multiplier > 0).unsqueeze(2), scaled, torch.zeros_like(scaled))
+    scale_words = scale_value.to(torch.float8_e4m3fn).view(torch.uint8)
+    scale_words = torch.where(
+        scale_words == 0, torch.full_like(scale_words, E4M3_EPS_WORD), scale_words
+    )
+    multiplier = scale_words.view(torch.float8_e4m3fn).float() / divisor
+    scaled = blocks / multiplier.unsqueeze(2)
     magnitude = _round_e2m1(scaled.abs().clamp_(max=E2M1_MAX))
     sign = torch.signbit(blocks).to(torch.uint8) << 3
     codes = (magnitude | sign).reshape(rows, columns)
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
-    return packed.contiguous(), scale_words.view(torch.uint8).contiguous()
+    return packed.contiguous(), scale_words.contiguous()
 
 
 def quantize_rows(
