@@ -3,9 +3,12 @@
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <initializer_list>
 #include <iostream>
@@ -437,6 +440,105 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     return failures;
 }
 
+// FP32 x (an FP32 residual stream) on the 5120-wide geometries. x carries values off the BF16
+// grid, so a kernel that rounded it on load would miss the oracle, which reads the represented
+// FP32 values. Covers the fused 27B route (T <= 42, BF16 or FP16 h) and the composed route
+// (FP32-input rmsnorm, then the BF16 control projection of h) past it.
+int run_norm_projection_fp32_input_case(const Geometry& geometry, std::int32_t tokens,
+                                        std::uint32_t seed, DeviceExecutionView execution,
+                                        bool fp16_hidden = false) {
+    constexpr float kEps               = 1.0e-6f;
+    const std::size_t h_elements       = std::size_t(geometry.hidden) * tokens;
+    const std::size_t control_elements = std::size_t(geometry.heads) * tokens;
+    std::vector<float> x(h_elements), norm_weight(geometry.hidden);
+    std::vector<float> a_weight(std::size_t(geometry.heads) * geometry.hidden),
+        b_weight(a_weight.size());
+    std::vector<float> a_log(geometry.heads), dt_bias(geometry.heads);
+    fill_uniform(x, seed, -3.0f, 3.0f);
+    fill_uniform(norm_weight, seed + 1, -0.2f, 0.2f);
+    fill_uniform(a_weight, seed + 2, -0.015f, 0.015f);
+    fill_uniform(b_weight, seed + 3, -0.015f, 0.015f);
+    fill_uniform(a_log, seed + 4, -2.0f, 1.0f);
+    fill_uniform(dt_bias, seed + 5, -1.0f, 1.0f);
+    round_to_bf16(norm_weight);
+    round_to_bf16(a_weight);
+    round_to_bf16(b_weight);
+    const auto norm_weight_bits = bf16_bits(norm_weight);
+    auto weight_bits            = bf16_bits(a_weight);
+    const auto b_weight_bits    = bf16_bits(b_weight);
+    if (geometry.parent_weight)
+        weight_bits.insert(weight_bits.end(), b_weight_bits.begin(), b_weight_bits.end());
+    DeviceBuffer device_x = to_device(x), device_norm_weight = to_device(norm_weight_bits),
+                 device_weight = to_device(weight_bits);
+    DeviceBuffer device_b_weight;
+    if (!geometry.parent_weight) device_b_weight = to_device(b_weight_bits);
+    DeviceBuffer device_a_log = to_device(a_log), device_dt_bias = to_device(dt_bias);
+    GuardedDeviceBuffer device_h(h_elements * 2), device_g(control_elements * 4),
+        device_beta(control_elements * 4);
+    Tensor tx(device_x.p, DType::FP32, {geometry.hidden, tokens}),
+        tn(device_norm_weight.p, DType::BF16, {geometry.hidden});
+    Tensor th(device_h.data(), fp16_hidden ? DType::FP16 : DType::BF16, {geometry.hidden, tokens}),
+        tg(device_g.data(), DType::FP32, {geometry.heads, tokens}),
+        tb(device_beta.data(), DType::FP32, {geometry.heads, tokens});
+    Tensor ta(device_a_log.p, DType::FP32, {geometry.heads}),
+        td(device_dt_bias.p, DType::FP32, {geometry.heads});
+    const auto capacity = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+        geometry.heads, geometry.hidden, tokens, tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 256)});
+    const auto wa = bf16_weight(device_weight.p, (geometry.parent_weight ? 2 : 1) * geometry.heads,
+                                geometry.hidden);
+    const auto wb = geometry.parent_weight
+                        ? Weight{}
+                        : bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
+    device_h.fill(0xff);
+    device_g.fill(0xff);
+    device_beta.fill(0xff);
+    scratch.fill(0xff);
+    cuda_synchronize();
+    if (geometry.parent_weight)
+        ops::gdn_norm_gating_proj(tx, tn, kEps, wa, ta, td, workspace, th, tg, tb, execution);
+    else
+        ops::gdn_norm_gating_proj(tx, tn, kEps, wa, wb, ta, td, workspace, th, tg, tb, execution);
+    cuda_synchronize(execution.stream);
+
+    std::vector<double> rh, rg, rb;
+    norm_projection_oracle(geometry, x, norm_weight, a_weight, b_weight, a_log, dt_bias, tokens,
+                           kEps, rh, rg, rb);
+    const std::string label = std::string("gdn_norm_gating_proj FP32 x ") + geometry.label +
+                              " T=" + std::to_string(tokens) + (fp16_hidden ? " FP16 h" : " BF16 h");
+    std::vector<double> h(h_elements);
+    const auto h_bits = from_device<std::uint16_t>(device_h.data(), h_elements);
+    for (std::size_t i = 0; i < h_elements; ++i) {
+        if (fp16_hidden) {
+            __half value;
+            std::memcpy(&value, &h_bits[i], sizeof(value));
+            h[i] = static_cast<double>(__half2float(value));
+        } else {
+            h[i] = static_cast<double>(bf16_to_f32(h_bits[i]));
+        }
+    }
+    int failures = verify_normwise(label + " h", h, rh, kGdnNormOutputBf16);
+    failures += verify_normwise(label + " g", read_fp32(device_g.data(), control_elements), rg,
+                                kGdnNormControlFp32);
+    failures += verify_normwise(label + " beta", read_fp32(device_beta.data(), control_elements),
+                                rb, kGdnNormControlFp32);
+    failures += device_h.verify_guards((label + " h").c_str());
+    failures += device_g.verify_guards((label + " g").c_str());
+    failures += device_beta.verify_guards((label + " beta").c_str());
+    failures += scratch.verify_guards((label + " scratch").c_str());
+    failures += verify_exact((label + " x immutable").c_str(),
+                             from_device<float>(device_x, x.size()), x);
+    failures += verify_exact((label + " weight immutable").c_str(),
+                             from_device<std::uint16_t>(device_weight, weight_bits.size()),
+                             weight_bits);
+    if (workspace.used() != 0 || workspace.peak_used() != capacity) {
+        std::cerr << label << ": workspace query/peak mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int verify_workspace_capacity_contract(const Geometry& geometry,
                                        std::initializer_list<std::int32_t> route_endpoints) {
     const std::int32_t last = *std::max_element(route_endpoints.begin(), route_endpoints.end());
@@ -522,6 +624,17 @@ int main() {
     for (int tokens : {2, 8, 15, 127, 128, 1024, 1025, 2048, 2049, 4097})
         failures += run_norm_projection_case(kQwen35, tokens, 0x7800u + tokens, norm_execution,
                                              tokens == 15);
+
+    // FP32 residual-stream input: fused 27B route (BF16 and FP16 h) and the composed route.
+    for (int tokens : {1, 5, 42}) {
+        failures += run_norm_projection_fp32_input_case(kQwen27, tokens, 0x8000u + tokens,
+                                                        norm_execution);
+        failures += run_norm_projection_fp32_input_case(kQwen38Parent, tokens, 0x8100u + tokens,
+                                                        norm_execution, true);
+    }
+    for (int tokens : {43, 1025})
+        failures += run_norm_projection_fp32_input_case(kQwen38Parent, tokens, 0x8200u + tokens,
+                                                        norm_execution);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";
     return failures == 0 ? 0 : 1;

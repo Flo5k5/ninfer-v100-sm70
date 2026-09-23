@@ -18,4 +18,9 @@ namespace ninfer::ops::detail {
 void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
                              cudaStream_t stream);
 
+// Same projection accumulated onto an FP32 residual stream [n, cols]: residual += x W^T from the
+// FP32 accumulators, with no intermediate rounding. Same workspace as fp8_cutlass_sm70_launch.
+void fp8_cutlass_sm70_residual_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                      WorkspaceArena& ws, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

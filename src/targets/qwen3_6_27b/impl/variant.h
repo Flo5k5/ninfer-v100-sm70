@@ -49,6 +49,12 @@ struct Variant {
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
+    // True when every op that reads or writes the text residual stream has an FP32 form for this
+    // weights profile: an FP8 token embedding and FP8/NVFP4 residual projections.
+    [[nodiscard]] static constexpr bool fp32_residual_supported(WeightsProfile profile) {
+        return profile == WeightsProfile::Qwen38Nvfp4;
+    }
+
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,
                                      Tensor& gate, Tensor& key, Tensor& value,

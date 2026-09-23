@@ -42,8 +42,8 @@ void launch_rmsnorm_fp16(const Tensor& x, const Tensor& weight, const Tensor* z,
         if (d == 5120 && aligned16(x, weight, out)) {
             rmsnorm_row5120_vec8_kernel<Epilogue, __half2>
                 <<<static_cast<unsigned>(rows), 640, 0, stream>>>(
-                    static_cast<const uint4*>(x.data), static_cast<const uint4*>(weight.data),
-                    static_cast<uint4*>(out.data), eps);
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const uint4*>(weight.data), static_cast<uint4*>(out.data), eps);
             return;
         }
         if (aligned2 && d == 5120) {
@@ -72,10 +72,39 @@ void launch_rmsnorm_fp16(const Tensor& x, const Tensor& weight, const Tensor* z,
         "rmsnorm: FP16 output supports the aligned 5120-wide row and gated 64..256-wide rows");
 }
 
+// FP32 input: the residual stream in FP32. Only the plain/offset 16-byte aligned 5120-wide row is
+// registered (the wrapper rejects a gated FP32 input; this launcher rejects the other shapes).
+template <RmsEpilogue Epilogue>
+void launch_rmsnorm_f32(const Tensor& x, const Tensor& weight, Tensor& out, std::int32_t d,
+                        std::int64_t rows, float eps, cudaStream_t stream) {
+    if constexpr (Epilogue != RmsEpilogue::Gated) {
+        if (d == 5120 && aligned16(x, weight, out)) {
+            if (out.dtype == DType::FP16) {
+                rmsnorm_row5120_vec8_kernel<Epilogue, __half2, float>
+                    <<<static_cast<unsigned>(rows), 640, 0, stream>>>(
+                        static_cast<const float*>(x.data), static_cast<const uint4*>(weight.data),
+                        static_cast<uint4*>(out.data), eps);
+            } else {
+                rmsnorm_row5120_vec8_kernel<Epilogue, __nv_bfloat162, float>
+                    <<<static_cast<unsigned>(rows), 640, 0, stream>>>(
+                        static_cast<const float*>(x.data), static_cast<const uint4*>(weight.data),
+                        static_cast<uint4*>(out.data), eps);
+            }
+            return;
+        }
+    }
+    throw std::invalid_argument(
+        "rmsnorm: FP32 input supports the ungated 16-byte aligned 5120-wide row");
+}
+
 template <RmsEpilogue Epilogue>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
                     std::int32_t d, std::int64_t rows, float eps, bool aligned2,
                     cudaStream_t stream) {
+    if (x.dtype == DType::FP32) {
+        launch_rmsnorm_f32<Epilogue>(x, weight, out, d, rows, eps, stream);
+        return;
+    }
     if (out.dtype == DType::FP16) {
         launch_rmsnorm_fp16<Epilogue>(x, weight, z, out, d, rows, eps, aligned2, stream);
         return;
@@ -95,8 +124,8 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         if (d == 5120 && aligned16(x, weight, out)) {
             rmsnorm_row5120_vec8_kernel<Epilogue, __nv_bfloat162>
                 <<<static_cast<unsigned>(rows), 640, 0, stream>>>(
-                    static_cast<const uint4*>(x.data), static_cast<const uint4*>(weight.data),
-                    static_cast<uint4*>(out.data), eps);
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const uint4*>(weight.data), static_cast<uint4*>(out.data), eps);
             return;
         }
         if (aligned2 && d == 5120) {

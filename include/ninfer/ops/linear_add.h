@@ -40,7 +40,8 @@ namespace ninfer::ops {
  *   [5120,17408] or [5120,6144], W8G32_F16S RowSplit [2048,4096] or [2048,6144], NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
  *   FP8_E4M3FN_ROW_BF16S [5120,6144] or [5120,17408], or BF16_CTRL Contiguous [5120,6144]. T may
- *   be any positive value.
+ *   be any positive value. On Volta builds the FP8 and NVFP4 registrations also accept a 16-byte
+ *   aligned FP32 residual (an FP32 residual stream), updated with a single rounding to FP32.
  *
  * Numeric:
  *   The oracle reads a registered BF16 weight directly or exact-decodes a registered packed

@@ -50,12 +50,18 @@ void launch_nvfp4_volta_qpn_residual(const Tensor& x, const Weight& w, const voi
                                      Tensor& residual, cudaStream_t stream) {
     const std::int32_t n               = residual.ne[0];
     const float inverse_weight_divisor = 1.0F / w.weight_scale_divisor;
-    const Nvfp4ResidualOutput output{static_cast<__nv_bfloat16*>(residual.data), n};
-    if (x_fp16 != nullptr) {
-        launch_nvfp4_volta_qpn_with_fp16_activation(x, w, static_cast<const half*>(x_fp16), output,
-                                                    n, inverse_weight_divisor, stream);
+    const auto launch                  = [&](const auto& output) {
+        if (x_fp16 != nullptr) {
+            launch_nvfp4_volta_qpn_with_fp16_activation(x, w, static_cast<const half*>(x_fp16),
+                                                        output, n, inverse_weight_divisor, stream);
+        } else {
+            launch_nvfp4_volta_qpn_with_output(x, w, output, n, inverse_weight_divisor, stream);
+        }
+    };
+    if (residual.dtype == DType::FP32) {
+        launch(Nvfp4ResidualOutputF32{static_cast<float*>(residual.data), n});
     } else {
-        launch_nvfp4_volta_qpn_with_output(x, w, output, n, inverse_weight_divisor, stream);
+        launch(Nvfp4ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), n});
     }
 }
 

@@ -271,6 +271,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         plan.draft_window >= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("sequence workspace dimensions are invalid");
     }
+    if (workspace_recipe::text_residual_dtype() != DType::BF16 &&
+        !Variant::fp32_residual_supported(plan.weights_profile)) {
+        throw std::invalid_argument(
+            "an FP32 text residual stream needs an FP8 embedding and FP8/NVFP4 residual "
+            "projections on a 5120-wide target; this weights profile has no FP32 form");
+    }
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
@@ -431,7 +437,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
          ++batch) {
         WorkspaceLayoutBuilder ordinary;
-        matrix(ordinary, DType::BF16, TextConfig::hidden, batch);
+        matrix(ordinary, workspace_recipe::text_residual_dtype(), TextConfig::hidden, batch);
         target_body(ordinary, batch, batch, qwen3_6::TextPhase::Verify, GdnWorkspacePath::Snapshot,
                     batch, 1, 1, text_envelope);
         scratch(ordinary,
@@ -476,7 +482,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             const std::int32_t aggregate = batch * lookup_verify;
             WorkspaceLayoutBuilder target;
-            matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+            matrix(target, workspace_recipe::text_residual_dtype(), TextConfig::hidden,
+                   aggregate);
             target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                         GdnWorkspacePath::ReplayRecord, batch, lookup_verify, lookup_verify,
                         text_envelope);
@@ -512,6 +519,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.masked_draft()) {
+        if (workspace_recipe::text_residual_dtype() != DType::BF16) {
+            // DFlash reads target features straight from the BF16 residual stream.
+            throw std::invalid_argument("an FP32 text residual stream does not support DFlash");
+        }
         if constexpr (!Variant::supports_dflash) {
             throw std::logic_error("unsupported target reached DFlash scratch planning");
         } else {

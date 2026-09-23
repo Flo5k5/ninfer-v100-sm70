@@ -222,6 +222,105 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool prepack) 
     return failures;
 }
 
+
+#ifdef NINFER_VOLTA_BUILD
+// FP32 residual stream: both routes accumulate in FP32 and round the sum once, to FP32 (measured
+// relative L2 below 4e-6 on these shapes), so the criterion sits far below the BF16 unit roundoff:
+// a BF16-rounded residual or a BF16-materialized projection (about 1e-3 and 1.6e-3 relative L2
+// here) fails it.
+constexpr ReductionCriterion kFp32ResidualTolerance{1.0e-4, 1.0 / 16384.0, 1.0 / 16384.0};
+
+// FP32 residual stream: the same weight and activation update an FP32 residual. The fused QPN
+// epilogue (T <= 32) and the wide GEMM route (T > 32, accumulating onto the residual from its FP32
+// accumulators) both round the sum once, to FP32.
+int run_fp32_residual_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    constexpr std::array<std::int32_t, 4> kTokens{1, 5, 33, 64};
+    constexpr std::int32_t kMaximumTokens = 64;
+    quantized_weight::PackedWeight host_weight = [&] {
+        quantized_weight::PatternedWeightOptions options;
+        options.weight_scale_divisor = 0.125F;
+        options.input_scale_divisor  = 3.5F;
+        return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
+    }();
+    const std::vector<std::int32_t> rows = sampled_indices(n);
+    const std::vector<float> materialized_weight =
+        quantized_weight::materialize_rows_fp32(host_weight, rows);
+    std::vector<std::uint16_t> activation = make_activation(k, kMaximumTokens, seed + 1U);
+    // Token 2 projects to exact zero, so its residual column must come back bit-identical.
+    constexpr std::int32_t kZeroToken = 2;
+    std::fill_n(activation.begin() + static_cast<std::ptrdiff_t>(kZeroToken) * k, k,
+                f32_to_bf16(0.0F));
+    const std::vector<std::uint16_t> residual_bits = make_residual(n, kMaximumTokens, seed + 2U);
+    std::vector<float> initial_residual(residual_bits.size());
+    for (std::size_t i = 0; i < residual_bits.size(); ++i) {
+        // Values off the BF16 grid, so an FP32 residual that were rounded to BF16 would show.
+        initial_residual[i] = bf16_to_f32(residual_bits[i]) * 1.0009765625F;
+    }
+
+    GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(activation.data(), device_activation.bytes());
+    GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    Weight weight = host_weight.device_weight(device_weight.data());
+    ops::detail::nvfp4_prepack_qpn_sm70(weight);
+
+    int failures = 0;
+    for (const std::int32_t tokens : kTokens) {
+        const std::size_t output_words = static_cast<std::size_t>(n) * tokens;
+        GuardedDeviceBuffer output(output_words * sizeof(float));
+        output.copy_from_host(initial_residual.data(), output.bytes());
+        Tensor x(device_activation.data(), DType::BF16, {k, tokens});
+        Tensor residual(output.data(), DType::FP32, {n, tokens});
+        const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
+            QType::NVFP4, n, k, ops::LinearPolicy::A16Only, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::linear_add(x, weight, residual, ops::LinearPolicy::A16Only, workspace, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "synchronize FP32-residual linear_add");
+
+        const std::string label = std::string("NVFP4") + " linear_add FP32 residual [" +
+                                  std::to_string(n) + "," + std::to_string(k) +
+                                  "] T=" + std::to_string(tokens);
+        if (workspace.peak_used() > std::max<std::size_t>(capacity, 256)) {
+            std::cerr << label << ": workspace overrun\n";
+            ++failures;
+        }
+        failures += output.verify_guards(label);
+        std::vector<float> actual_values(output_words);
+        output.copy_to_host(actual_values.data(), output.bytes());
+        std::vector<double> actual;
+        std::vector<double> expected;
+        for (std::size_t sampled_row = 0; sampled_row < rows.size(); ++sampled_row) {
+            const std::int32_t row = rows[sampled_row];
+            const float* weight_row =
+                materialized_weight.data() + sampled_row * static_cast<std::size_t>(k);
+            for (const std::int32_t token : sampled_indices(tokens)) {
+                double sum = 0.0;
+                const std::uint16_t* activation_row =
+                    activation.data() + static_cast<std::size_t>(token) * k;
+                for (std::int32_t column = 0; column < k; ++column) {
+                    sum += static_cast<double>(weight_row[column]) *
+                           static_cast<double>(bf16_to_f32(activation_row[column]));
+                }
+                const std::size_t index = static_cast<std::size_t>(token) * n + row;
+                actual.push_back(static_cast<double>(actual_values[index]));
+                expected.push_back(sum + static_cast<double>(initial_residual[index]));
+            }
+        }
+        failures += verify_reduction(label, actual, expected, kFp32ResidualTolerance);
+        if (tokens > kZeroToken) {
+            const auto column = [&](const std::vector<float>& values) {
+                const auto begin = values.begin() + static_cast<std::ptrdiff_t>(kZeroToken) * n;
+                return std::vector<float>(begin, begin + n);
+            };
+            failures += verify_exact((label + " zero-projection column").c_str(),
+                                     column(actual_values), column(initial_residual));
+        }
+    }
+    failures += device_activation.verify_guards("FP32-residual linear_add activation");
+    failures += device_weight.verify_guards("FP32-residual linear_add weight");
+    return failures;
+}
+#endif
 } // namespace
 
 int main() {
@@ -235,6 +334,8 @@ int main() {
 #ifdef NINFER_VOLTA_BUILD
     failures += run_shape(5120, 6144, 812U, true);
     failures += run_shape(5120, 17408, 822U, true);
+    failures += run_fp32_residual_shape(5120, 6144, 815U);
+    failures += run_fp32_residual_shape(5120, 17408, 825U);
 #endif
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;

@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - RMSNorm kernels over contiguous BF16 rows.
+// ninfer::ops - RMSNorm kernels over contiguous BF16 rows (and FP32 5120-wide rows).
 
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -164,15 +165,36 @@ __launch_bounds__(Block) __global__
                               rmsnorm_epilogue<Epilogue>(x1.y, inv, w1.y, z1.y));
 }
 
-// The 5120-wide hidden row in one vector pass: 640 threads, eight BF16 per thread through one
-// 16-byte load of x and one of the gain, no loops. Small on purpose. A decode step runs this ~150
-// times, each between weight streams that evict its code from L2, and ncu shows the unrolled CTA
-// kernel below (536 SASS instructions at D=5120) spending ~60% of its warp cycles stalled on
-// no_instruction: every launch paid a cold instruction fetch. Plain and offset epilogues only;
-// the launcher requires 16-byte aligned x, weight and out.
-template <RmsEpilogue Epilogue, class OutPair>
+// Eight consecutive inputs of one thread as float pairs: one 16-byte load of BF16, or two of FP32
+// for an FP32 residual stream.
+template <class X>
+__device__ __forceinline__ void rmsnorm_load8(const X* __restrict__ x, std::int64_t vector,
+                                              float2 (&xf)[4]) {
+    if constexpr (std::is_same_v<X, float>) {
+        const auto* x_vec = reinterpret_cast<const float4*>(x) + 2 * vector;
+        const float4 lo   = x_vec[0];
+        const float4 hi   = x_vec[1];
+        xf[0]             = {lo.x, lo.y};
+        xf[1]             = {lo.z, lo.w};
+        xf[2]             = {hi.x, hi.y};
+        xf[3]             = {hi.z, hi.w};
+    } else {
+        const uint4 x_vec   = reinterpret_cast<const uint4*>(x)[vector];
+        const auto* x_pairs = reinterpret_cast<const __nv_bfloat162*>(&x_vec);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { xf[j] = __bfloat1622float2(x_pairs[j]); }
+    }
+}
+
+// The 5120-wide hidden row in one vector pass: 640 threads, eight inputs per thread through one
+// 16-byte load of BF16 x (two for an FP32 x) and one of the gain, no loops. Small on purpose. A
+// decode step runs this ~150 times, each between weight streams that evict its code from L2, and
+// ncu shows the unrolled CTA kernel below (536 SASS instructions at D=5120) spending ~60% of its
+// warp cycles stalled on no_instruction: every launch paid a cold instruction fetch. Plain and
+// offset epilogues only; the launcher requires 16-byte aligned x, weight and out.
+template <RmsEpilogue Epilogue, class OutPair, class X = __nv_bfloat16>
 __launch_bounds__(640) __global__
-    void rmsnorm_row5120_vec8_kernel(const uint4* __restrict__ x, const uint4* __restrict__ weight,
+    void rmsnorm_row5120_vec8_kernel(const X* __restrict__ x, const uint4* __restrict__ weight,
                                      uint4* __restrict__ out, float eps) {
     static_assert(Epilogue != RmsEpilogue::Gated);
     static_assert(sizeof(OutPair) == 4);
@@ -181,16 +203,12 @@ __launch_bounds__(640) __global__
     const int tid          = static_cast<int>(threadIdx.x);
     const std::int64_t row = blockIdx.x;
 
-    const uint4 x_vec = x[row * kThreads + tid];
-    const uint4 w_vec = weight[tid];
-    const auto* x_pairs = reinterpret_cast<const __nv_bfloat162*>(&x_vec);
     float2 xf[4];
-    float sum = 0.0f;
+    rmsnorm_load8(x, row * kThreads + tid, xf);
+    const uint4 w_vec = weight[tid];
+    float sum         = 0.0f;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        xf[j] = __bfloat1622float2(x_pairs[j]);
-        sum += xf[j].x * xf[j].x + xf[j].y * xf[j].y;
-    }
+    for (int j = 0; j < 4; ++j) { sum += xf[j].x * xf[j].x + xf[j].y * xf[j].y; }
 
     __shared__ float warp_sums[kWarps];
     __shared__ float inv_shared;

@@ -7,8 +7,33 @@
 #include "core/layout.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
+#include <string_view>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe {
+
+// Storage of the text residual stream that every decoder layer updates twice. BF16 rounds the
+// stream twice per layer (128 times per token on the 64-layer 27B); on Volta the FP8/NVFP4
+// residual updates, the input norms, the FP8 token embedding and the vision scatter also accept
+// FP32. Experimental, read once per process: NINFER_TEXT_RESIDUAL=fp32 selects FP32 (Volta builds
+// only); unset, empty or "bf16" keeps BF16, and any other value is rejected.
+inline DType text_residual_dtype() {
+    static const DType selected = [] {
+        const char* value = std::getenv("NINFER_TEXT_RESIDUAL");
+        const std::string_view name = value != nullptr ? value : "";
+        if (name.empty() || name == "bf16") { return DType::BF16; }
+        if (name == "fp32") {
+#ifdef NINFER_VOLTA_BUILD
+            return DType::FP32;
+#else
+            throw std::invalid_argument("NINFER_TEXT_RESIDUAL=fp32 requires the Volta build");
+#endif
+        }
+        throw std::invalid_argument("NINFER_TEXT_RESIDUAL must be bf16 or fp32");
+    }();
+    return selected;
+}
 
 template <class Allocator>
 Tensor matrix(Allocator& allocator, DType dtype, std::int32_t rows, std::int32_t tokens) {
@@ -35,7 +60,7 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, std::int32_t tokens,
     out.ids       = vector(allocator, DType::I32, tokens);
     out.positions = vector(allocator, DType::I32, tokens);
     if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
-    out.residual = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    out.residual = matrix(allocator, text_residual_dtype(), Config::hidden, tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
     }
