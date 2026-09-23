@@ -43,6 +43,8 @@ from tools.artifact.reader import Artifact
 from tools.convert.qwen3_8_27b.graft_single_source import logical_matrix
 
 OUTPUT_DTYPES = {"f16": torch.float16, "f32": torch.float32, "bf16": torch.bfloat16}
+
+
 def decode_object(artifact: Artifact, object_id: str) -> torch.Tensor:
     obj = artifact.by_id[object_id]
     payload = artifact.read_object(object_id)
@@ -145,7 +147,7 @@ def convert_artifact(artifact: Artifact, source_dir: Path, out_dir: Path,
         if item.is_file() and item.suffix != ".safetensors":
             shutil.copy2(item, out_dir / item.name)
 
-    report: dict[str, Any] = {"artifact": str(getattr(artifact, "path", "")),
+    report: dict[str, Any] = {"artifact": str(artifact.path),
                               "source": str(source_dir), "dtype": str(dtype), "tensors": {}}
     written: set[str] = set()
     for shard in shards:
