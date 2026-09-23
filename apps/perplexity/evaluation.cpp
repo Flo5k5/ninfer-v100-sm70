@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::perplexity {
 
@@ -37,6 +38,27 @@ std::vector<WindowPlan> plan_windows(std::size_t tokens, std::uint32_t context,
             .first_target = static_cast<std::uint32_t>(local_target),
         });
         previous_end = end;
+    }
+    return windows;
+}
+
+std::vector<WindowPlan> plan_kld_chunks(std::size_t tokens, std::uint32_t context) {
+    if (context < 4) { throw std::invalid_argument("KLD chunks require context>=4"); }
+    const std::size_t chunks = tokens / context;
+    if (chunks < 2) {
+        throw std::invalid_argument("KLD chunks require at least 2*context tokens, got " +
+                                    std::to_string(tokens));
+    }
+    const std::uint32_t first_target = context / 2 + 1;
+    std::vector<WindowPlan> windows;
+    windows.reserve(chunks);
+    for (std::size_t chunk = 0; chunk < chunks; ++chunk) {
+        const std::size_t begin = chunk * context;
+        windows.push_back(WindowPlan{.input_begin  = begin,
+                                     .input_end    = begin + context,
+                                     .target_begin = begin + first_target,
+                                     .target_end   = begin + context,
+                                     .first_target = first_target});
     }
     return windows;
 }

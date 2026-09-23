@@ -1058,7 +1058,8 @@ ProgramImplCore::~ProgramImplCore() noexcept {
 }
 
 std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
-                                                 std::uint32_t first_target) {
+                                                 std::uint32_t first_target,
+                                                 ScoreLogitsSink* logits_sink) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -1105,6 +1106,8 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
     std::vector<TokenId> staged_targets;
     staged_targets.reserve(kCausalScoreTile);
     std::uint32_t staged_columns = 0;
+    // Host copy of one logits tile, only for a caller-supplied logits sink.
+    std::vector<std::uint16_t> logits_host;
 
     try {
         state = state_store->reserve_reset(device.stream);
@@ -1136,9 +1139,19 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                                               device.stream);
             CUDA_CHECK(cudaMemcpyAsync(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
                                                     cudaMemcpyDeviceToHost, device.stream));
+            if (logits_sink != nullptr) {
+                logits_host.resize(logits.bytes() / sizeof(std::uint16_t));
+                CUDA_CHECK(cudaMemcpyAsync(logits_host.data(), logits.data, logits.bytes(),
+                                           cudaMemcpyDeviceToHost, device.stream));
+            }
             device.synchronize();
             const auto* host = static_cast<const float*>(score_logprobs_host->data());
             output.insert(output.end(), host, host + staged_columns);
+            if (logits_sink != nullptr) {
+                logits_sink->consume(logits_host.data(), staged_columns,
+                                     static_cast<std::uint32_t>(TextConfig::output_rows),
+                                     static_cast<std::uint32_t>(TextConfig::token_domain));
+            }
             staged_targets.clear();
             staged_columns = 0;
             work.reset();
