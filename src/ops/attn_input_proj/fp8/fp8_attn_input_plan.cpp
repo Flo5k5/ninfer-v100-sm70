@@ -43,6 +43,14 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
         return;
     }
     const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
+    if (x.dtype == DType::FP16) {
+        // The fp16 activation domain: x is already the staged copy.
+        if (!qpn || x.ne[1] > kFp8VoltaQpnMaxTokens) {
+            throw std::logic_error("fp8 attn_input_proj: FP16 x needs a single QPN pass");
+        }
+        launch_fp8_attn_input_volta_qpn(x, weight, q, x.data, gate, k, v, stream);
+        return;
+    }
     const std::int32_t kChunk =
         qpn ? kFp8VoltaQpnMaxTokens : kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
     if (!qpn) { throw std::logic_error("fp8 Volta attention problem has no QPN route"); }
@@ -116,6 +124,14 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
 #endif
     return capacity;
 }
+
+#ifdef NINFER_VOLTA_BUILD
+bool fp8_attn_input_fp16_activation_supported(LinearPolicy policy, std::int32_t tokens) noexcept {
+    return tokens > 0 && tokens <= kFp8VoltaQpnMaxTokens &&
+           (policy == LinearPolicy::A16Only ||
+            (policy == LinearPolicy::AllowA8 && resolve_route(policy, tokens) == Fp8AttnInputRoute::A16));
+}
+#endif
 
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,

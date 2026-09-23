@@ -22,8 +22,9 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
-void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, const char* label) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != cols ||
+void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, const char* label,
+                    DType dtype = DType::BF16) {
+    if (tensor.dtype != dtype || tensor.ne[0] != rows || tensor.ne[1] != cols ||
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         !aligned_to(tensor.data, 16)) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
@@ -139,7 +140,9 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 attn_input_proj admits only A16 or A8");
         }
-        require_matrix(x, kHidden, cols, "x");
+        const bool fp16_x =
+            x.dtype == DType::FP16 && attn_input_proj_fp16_activation_supported(weight, policy, cols);
+        require_matrix(x, kHidden, cols, "x", fp16_x ? DType::FP16 : DType::BF16);
         require_matrix(q, kQRows, cols, "q");
         require_matrix(gate, kQRows, cols, "gate");
         require_matrix(k, kKvRows, cols, "k");
@@ -171,6 +174,21 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
 }
 
 } // namespace
+
+bool attn_input_proj_fp16_activation_supported(const Weight& query_key_gate_value_weight,
+                                               LinearPolicy policy, std::int32_t tokens) noexcept {
+#ifdef NINFER_VOLTA_BUILD
+    const Weight& weight = query_key_gate_value_weight;
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S && weight.n == 14336 && weight.k == 5120) {
+        return detail::fp8_attn_input_fp16_activation_supported(policy, tokens);
+    }
+#else
+    (void)query_key_gate_value_weight;
+    (void)policy;
+    (void)tokens;
+#endif
+    return false;
+}
 
 std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
                                                      std::int32_t input_rows, LinearPolicy policy,

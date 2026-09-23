@@ -94,6 +94,16 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 
 /**
+ * Volta fp16 activation domain. True when the single-parent query/key/gate/value form at `tokens`
+ * columns also accepts an FP16 x holding BF16-rounded values -- the fp16 copy its QPN route would
+ * otherwise stage -- and then skips that staging pass; results are bit-identical to the BF16
+ * tensor. False elsewhere.
+ */
+[[nodiscard]] bool attn_input_proj_fp16_activation_supported(const Weight& query_key_gate_value_weight,
+                                                             LinearPolicy policy,
+                                                             std::int32_t tokens) noexcept;
+
+/**
  * Three-output W8 specialization. The W8G32_F16S RowSplit parent stores rows in order
  * [query 4096, key 1024, value 1024]. Registered parent forms are [6144,2048] with BF16
  * x [2048,T] for the Qwen3.6 companion and [6144,5120] with BF16 x [5120,T] for DFlash2.

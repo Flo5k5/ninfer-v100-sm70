@@ -81,4 +81,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);
 
+/**
+ * Volta fp16 activation domain. True when linear_swiglu(x, w, out, policy, ...) at `tokens`
+ * columns also accepts an FP16 x holding BF16-rounded values (skipping the fp16 staging pass of
+ * its QPN route) and/or an FP16 out, which then receives the BF16-rounded SwiGLU converted to
+ * fp16 -- ready for a downstream QPN GEMV without staging. Bit-identical to the BF16 tensors.
+ * False on every other route and on non-Volta builds.
+ */
+[[nodiscard]] bool linear_swiglu_fp16_activation_supported(const Weight& gate_up_weight,
+                                                           LinearPolicy policy,
+                                                           std::int32_t tokens) noexcept;
+
 } // namespace ninfer::ops

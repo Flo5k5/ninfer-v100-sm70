@@ -2,12 +2,14 @@
 
 #include "ops/input_projection_test_common.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -519,6 +521,84 @@ int run_fp8_oracle_case(DevicePackedWeight& parent, std::int32_t width, std::int
     return failures;
 }
 
+// The fp16 activation domain: where gdn_input_proj_conv_fp16_activation_supported() admits it, an
+// FP16 x (the BF16 activation converted to fp16) must reproduce the BF16 call bit for bit.
+int run_fp8_fp16_equivalence(DevicePackedWeight& parent, std::int32_t width, std::int32_t batch,
+                             std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
+    constexpr std::int32_t kHidden    = 5120;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kRows      = kChannels + kZRows;
+    const ops::LinearPolicy policy    = ops::LinearPolicy::A16Only;
+    const std::string label =
+        "FP8 fp16-x B=" + std::to_string(batch) + " W=" + std::to_string(width);
+    if (!ops::gdn_input_proj_conv_fp16_activation_supported(parent.view(), policy, width,
+                                                            batch)) {
+        std::cerr << label << ": fp16 activation domain unexpectedly unsupported\n";
+        return 1;
+    }
+    const std::int32_t columns = width * batch;
+    const std::int32_t slots   = batch + 2;
+    const bool dense           = valid_columns.empty();
+    const std::vector<float> activation              = make_bf16_activation(kHidden, columns, seed);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    std::vector<std::uint16_t> activation_fp16(activation_bits.size());
+    for (std::size_t i = 0; i < activation_bits.size(); ++i) {
+        const __half converted = __float2half_rn(bf16_to_f32(activation_bits[i]));
+        std::memcpy(&activation_fp16[i], &converted, sizeof(std::uint16_t));
+    }
+    const std::vector<std::uint16_t> conv_weight_bits =
+        make_bf16_bits(static_cast<std::size_t>(kChannels) * 4, seed + 1, -0.02F, 0.02F);
+    const std::vector<std::uint16_t> state_before =
+        make_bf16_bits(static_cast<std::size_t>(kChannels) * 3 * slots, seed + 2, -0.05F, 0.05F);
+    std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
+    for (std::int32_t row = 0; row < batch; ++row) {
+        initial_slots[static_cast<std::size_t>(row)] = row;
+    }
+    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
+    DeviceBuffer device_state       = to_device(state_before);
+    DeviceBuffer device_initial     = to_device(initial_slots);
+    DeviceBuffer device_valid;
+    if (!dense) { device_valid = to_device(valid_columns); }
+    Tensor conv_weight(device_conv_weight.p, DType::BF16, {kChannels, 4});
+    Tensor state(device_state.p, DType::BF16, {kChannels, 3, slots});
+    Tensor valid;
+    if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
+    Tensor initial(device_initial.p, DType::I32, {batch});
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, batch, width, width);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+
+    const auto run = [&](const std::vector<std::uint16_t>& input_bits, DType dtype) {
+        DeviceBuffer device_x = to_device(input_bits);
+        GuardedBf16Tensor conv_record(kChannels, columns);
+        GuardedBf16Tensor query(kQueryRows, columns);
+        GuardedBf16Tensor key(kKeyRows, columns);
+        GuardedBf16Tensor value(kValueRows, columns);
+        GuardedBf16Tensor z(kZRows, columns);
+        Tensor x(device_x.p, dtype, {kHidden, width, batch});
+        Tensor record_view(conv_record.data(), DType::BF16, {kChannels, width, batch});
+        Tensor query_view(query.data(), DType::BF16, {kQueryRows, width, batch});
+        Tensor key_view(key.data(), DType::BF16, {kKeyRows, width, batch});
+        Tensor value_view(value.data(), DType::BF16, {kValueRows, width, batch});
+        Tensor z_view(z.data(), DType::BF16, {kZRows, width, batch});
+        workspace.reset();
+        ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, state, valid, initial,
+                                        record_view, query_view, key_view, value_view, z_view,
+                                        policy, workspace, nullptr);
+        cuda_synchronize();
+        std::vector<std::uint16_t> all = conv_record.bits();
+        for (const auto* tensor : {&query, &key, &value, &z}) {
+            const std::vector<std::uint16_t> bits = tensor->bits();
+            all.insert(all.end(), bits.begin(), bits.end());
+        }
+        return all;
+    };
+    return verify_equal(label, run(activation_fp16, DType::FP16),
+                        run(activation_bits, DType::BF16));
+}
+
 int run_fp8() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
@@ -536,6 +616,11 @@ int run_fp8() {
 #endif
     failures += run_fp8_oracle_case(parent, 10, 1, {8}, ops::LinearPolicy::A16Only, 1781U);
     failures += run_fp8_oracle_case(parent, 11, 1, {9}, ops::LinearPolicy::A16Only, 1791U);
+#ifdef NINFER_VOLTA_BUILD
+    failures += run_fp8_fp16_equivalence(parent, 5, 1, {}, 1901U);
+    failures += run_fp8_fp16_equivalence(parent, 5, 1, {3}, 1903U);
+    failures += run_fp8_fp16_equivalence(parent, 4, 8, {4, 3, 2, 1, 4, 3, 2, 1}, 1905U);
+#endif
 #ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_oracle_case(parent, 3, 2, {3, 1}, ops::LinearPolicy::AllowA8, 1801U);
     failures += run_fp8_oracle_case(parent, 4, 2, {4, 2}, ops::LinearPolicy::AllowA8, 1811U);

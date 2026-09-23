@@ -5,6 +5,9 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_launch.h"
+#endif
 
 #include <cstdint>
 #include <stdexcept>
@@ -187,7 +190,7 @@ void launch_snapshot_plan(const Tensor& x, const Weight& weight, const Tensor& c
     const std::int32_t aggregate_columns = width * batch;
     auto scope                           = workspace.scope();
     Fp8GdnProjectedWorkspace scratch     = allocate_projected(workspace, aggregate_columns);
-    Tensor x_flat(x.data, DType::BF16, {Fp8GdnInputGeometry::kInputRows, aggregate_columns});
+    Tensor x_flat(x.data, x.dtype, {Fp8GdnInputGeometry::kInputRows, aggregate_columns});
     Tensor z_flat(z.data, DType::BF16, {kZRows, aggregate_columns});
     launch_projection(x_flat, weight, scratch.projected, z_flat, plan.schedule, workspace, stream);
 
@@ -211,7 +214,7 @@ void launch_record_plan(const Tensor& x, const Weight& weight, const Tensor& con
     const std::int32_t batch             = x.ne[2];
     const std::int32_t aggregate_columns = width * batch;
     auto scope                           = workspace.scope();
-    Tensor x_flat(x.data, DType::BF16, {Fp8GdnInputGeometry::kInputRows, aggregate_columns});
+    Tensor x_flat(x.data, x.dtype, {Fp8GdnInputGeometry::kInputRows, aggregate_columns});
     Tensor record_flat(conv_record.data, DType::BF16, {kChannels, aggregate_columns});
     Tensor z_flat(z.data, DType::BF16, {kZRows, aggregate_columns});
     launch_projection(x_flat, weight, record_flat, z_flat, plan.schedule, workspace, stream);
@@ -220,6 +223,16 @@ void launch_record_plan(const Tensor& x, const Weight& weight, const Tensor& con
 }
 
 } // namespace
+
+#ifdef NINFER_VOLTA_BUILD
+bool fp8_gdn_conv_fp16_activation_supported(LinearPolicy policy, std::int32_t width,
+                                            std::int32_t batch) noexcept {
+    // On Volta, A16 record and snapshot are MaterializedA16 at every B/W (b1_a16_plan), whose
+    // projection is fp8_gdn_input_a16_dispatch: one QPN pass up to 32 aggregate columns.
+    return policy == LinearPolicy::A16Only && width > 0 && batch > 0 &&
+           width * batch <= kFp8VoltaQpnMaxTokens;
+}
+#endif
 
 void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                Tensor& conv_states, const Tensor& valid_columns,

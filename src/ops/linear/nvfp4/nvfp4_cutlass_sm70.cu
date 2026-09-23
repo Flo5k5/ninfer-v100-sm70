@@ -94,7 +94,7 @@ __global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes
 
 __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes,
                                           const std::uint8_t* __restrict__ scales, int n, int k,
-                                          float inverse_weight_divisor,
+                                          float inverse_weight_divisor, bool swiglu_interleave,
                                           cutlass::half_t* __restrict__ out) {
     const int row      = static_cast<int>(blockIdx.y);
     const int segment  = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -103,13 +103,18 @@ __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes
 
     const int group      = segment / 2;
     const int group_half = segment & 1;
-    const int local_row  = row & 31;
+    // `row` is logical; the SwiGLU layout stores gate row f and up row f in the same 32-row tile.
+    const int half_n       = n / 2;
+    const int physical_row = !swiglu_interleave ? row
+                             : row < half_n     ? (row / 16) * 32 + (row & 15)
+                                                : ((row - half_n) / 16) * 32 + 16 + ((row - half_n) & 15);
+    const int local_row  = physical_row & 31;
     const int qp         = local_row / 8;
     const int r          = local_row & 7;
     const int lane       = (qp << 2) | (r & 3) | ((r & 4) << 2);
     const int groups     = k / 16;
     const std::int64_t tuple =
-        (static_cast<std::int64_t>(row / 32) * groups + group) * 32 + lane;
+        (static_cast<std::int64_t>(physical_row / 32) * groups + group) * 32 + lane;
     const std::uint8_t* packed = codes + tuple * 8 + group_half * 4;
     const std::uint32_t packed_word = *reinterpret_cast<const std::uint32_t*>(packed);
     const half2 rebias = __float2half2_rn(16384.0f);
@@ -203,13 +208,15 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
     auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
 
     constexpr int kThreads = 256;
-    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+    if (w.layout == QuantLayout::VoltaQpnPrepacked ||
+        w.layout == QuantLayout::VoltaQpnPrepackedSwiGlu) {
         const dim3 grid(static_cast<unsigned>((k / 8 + kThreads - 1) / kThreads),
                         static_cast<unsigned>(n), 1u);
         dequant_nvfp4_qpn_to_fp16<<<grid, kThreads, 0, stream>>>(
             static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), n, k,
-            1.0F / w.weight_scale_divisor, w_fp16);
+            1.0F / w.weight_scale_divisor, w.layout == QuantLayout::VoltaQpnPrepackedSwiGlu,
+            w_fp16);
     } else {
         const std::int64_t segments = static_cast<std::int64_t>(n) * (k / 8);
         const int blocks = static_cast<int>((segments + kThreads - 1) / kThreads);

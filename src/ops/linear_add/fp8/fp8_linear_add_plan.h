@@ -24,10 +24,16 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                               WorkspaceArena& workspace, cudaStream_t stream);
 #ifdef NINFER_VOLTA_BUILD
-void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                               cudaStream_t stream);
+// x_fp16: optional fp16 copy of x staged by the caller; nullptr converts bf16 in the kernel.
+void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, const void* x_fp16,
+                               Tensor& residual, cudaStream_t stream);
 #endif
 
+#ifdef NINFER_VOLTA_BUILD
+[[nodiscard]] bool fp8_linear_add_fp16_activation_supported(const Weight& weight,
+                                                            LinearPolicy policy,
+                                                            std::int32_t tokens);
+#endif
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 

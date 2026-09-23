@@ -25,6 +25,11 @@ void fp8_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream);
 
+#ifdef NINFER_VOLTA_BUILD
+// The A16 route takes an FP16 x (the staged copy) where one QPN pass covers the call.
+[[nodiscard]] bool fp8_attn_input_fp16_activation_supported(LinearPolicy policy,
+                                                            std::int32_t tokens) noexcept;
+#endif
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream);

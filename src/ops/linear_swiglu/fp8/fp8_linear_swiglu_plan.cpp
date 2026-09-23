@@ -5,6 +5,7 @@
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_cutlass_sm70.h"
 #endif
 
@@ -57,6 +58,15 @@ std::size_t qpn_split_workspace_bytes(std::int32_t tokens) {
 
 constexpr std::int32_t kVoltaCutlassMinT = 33;
 
+// The SIMT small-T kernel's 4-token chunk does not apply to the QPN split route: QPN covers up to
+// 32 tokens in one pass over the weight (four 8-row tiles), so chunking it by 4 re-streamed the
+// whole 178 MB gate/up weight once per 4 tokens -- a K=4 verify (T=5) read it twice. Same
+// chunking rule as the FP8 attention/GDN input plans.
+std::int32_t volta_chunk(std::int32_t k) {
+    return fp8_linear_swiglu_qpn_split_supported(k, kFp8VoltaQpnMaxTokens) ? kFp8VoltaQpnMaxTokens
+                                                                             : kChunk;
+}
+
 template <class Allocator>
 Tensor allocate_materialized_workspace(Allocator& allocator, std::int32_t rows,
                                        std::int32_t cols) {
@@ -82,14 +92,19 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceAre
         return;
     }
 #endif
-    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
-        const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
+#ifdef NINFER_VOLTA_BUILD
+    const std::int32_t chunk = volta_chunk(weight.k);
+#else
+    const std::int32_t chunk = kChunk;
+#endif
+    for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += chunk) {
+        const std::int32_t active = std::min(chunk, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +
                       static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
         auto* output = static_cast<std::uint8_t*>(out.data) +
                        static_cast<std::int64_t>(token_begin) * kOutputRows * sizeof(std::uint16_t);
-        Tensor input_chunk(input, DType::BF16, {weight.k, active});
-        Tensor output_chunk(output, DType::BF16, {kOutputRows, active});
+        Tensor input_chunk(input, x.dtype, {weight.k, active});
+        Tensor output_chunk(output, out.dtype, {kOutputRows, active});
 #ifdef NINFER_VOLTA_BUILD
         if (fp8_linear_swiglu_qpn_split_supported(weight.k, active)) {
             auto scope                    = workspace.scope();
@@ -126,7 +141,8 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
     }
 #ifdef NINFER_VOLTA_BUILD
     if (policy == LinearPolicy::A16Only) {
-        std::size_t need = qpn_split_workspace_bytes(std::min(max_tokens, kChunk));
+        std::size_t need = qpn_split_workspace_bytes(
+            std::min(max_tokens, volta_chunk(Fp8MlpGateUpGeometry::kInputRows)));
         if (max_tokens >= kVoltaCutlassMinT) {
             need = std::max(
                 need, materialized_workspace_bytes(Fp8MlpGateUpGeometry::kOutputRows, max_tokens) +
@@ -139,6 +155,16 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 #endif
     return 0;
 }
+
+#ifdef NINFER_VOLTA_BUILD
+// FP16 activations are taken only where one QPN split launch covers the whole call.
+bool fp8_linear_swiglu_fp16_activation_supported(const Weight& weight, LinearPolicy policy,
+                                                 std::int32_t tokens) {
+    return resolve_route(policy, tokens) == Fp8LinearSwiGluRoute::A16 &&
+           tokens < kVoltaCutlassMinT && tokens <= volta_chunk(weight.k) &&
+           fp8_linear_swiglu_qpn_split_supported(weight.k, tokens);
+}
+#endif
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,

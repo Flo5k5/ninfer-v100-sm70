@@ -5,7 +5,9 @@
 #include "ninfer/ops/residual_add.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 #endif
 
 #include <algorithm>
@@ -75,9 +77,38 @@ Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::i
     return allocator.alloc(DType::BF16, {output_rows, tokens}, 256);
 }
 
+// Verify and decode widths fold the residual add into the QPN2 epilogue on a staged fp16 copy of
+// x: 57 of the 27B's 64 down projections are NVFP4, and each paid a separate residual_add launch
+// plus a materialized BF16 projection.
+bool qpn_residual(const Weight& weight, std::int32_t tokens) {
+    return tokens <= kNvfp4VoltaQpnMaxTokens &&
+           nvfp4_volta_qpn_supported(weight.n, weight.k, tokens);
+}
+
+std::size_t qpn_activation_bytes(std::int32_t input_rows, std::int32_t tokens) {
+    return static_cast<std::size_t>(input_rows) * tokens * sizeof(std::uint16_t);
+}
+
 void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& residual,
                             WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope         = workspace.scope();
+    if (qpn_residual(weight, x.ne[1])) {
+        if (x.dtype == DType::FP16) {
+            launch_nvfp4_volta_qpn_residual(x, weight, x.data, residual, stream);
+            return;
+        }
+        constexpr std::size_t kAlign = 256;
+        const std::size_t bytes      = qpn_activation_bytes(weight.k, x.ne[1]);
+        const std::size_t start      = (workspace.used() + kAlign - 1) / kAlign * kAlign;
+        if (start + bytes > workspace.capacity()) {
+            launch_nvfp4_volta_qpn_residual(x, weight, nullptr, residual, stream);
+            return;
+        }
+        DeviceSpan activation = workspace.alloc_bytes(bytes, kAlign);
+        fp8_stage_bf16_activation_sm70(x, activation.data, stream);
+        launch_nvfp4_volta_qpn_residual(x, weight, activation.data, residual, stream);
+        return;
+    }
     Tensor projected    = allocate_projected(workspace, weight.n, x.ne[1]);
     if (x.ne[1] >= 33) {
         nvfp4_cutlass_sm70_launch(x, weight, projected, workspace, stream);
@@ -95,6 +126,11 @@ void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& resid
 std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                             std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
+    if (tokens <= kNvfp4VoltaQpnMaxTokens &&
+        nvfp4_volta_qpn_supported(output_rows, input_rows, tokens)) {
+        (void)layout.alloc_bytes(qpn_activation_bytes(input_rows, tokens), 256);
+        return layout.peak_bytes(1);
+    }
     (void)allocate_projected(layout, output_rows, tokens);
     const std::size_t linear_bytes = tokens >= 33
         ? nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens)
@@ -128,6 +164,15 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 #endif
     return 0;
 }
+
+#ifdef NINFER_VOLTA_BUILD
+bool nvfp4_linear_add_fp16_activation_supported(const Weight& weight, LinearPolicy policy,
+                                                std::int32_t tokens) {
+    return resolve_route(weight.n, weight.k, policy, tokens) ==
+               Nvfp4LinearAddRoute::LinearThenAdd &&
+           qpn_residual(weight, tokens);
+}
+#endif
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,

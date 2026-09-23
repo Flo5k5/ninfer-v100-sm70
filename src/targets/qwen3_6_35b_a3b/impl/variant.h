@@ -99,6 +99,21 @@ struct Variant {
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, const ::ninfer::ops::SparseMoeHints& hints,
                            WorkspaceArena& workspace, cudaStream_t stream);
+    // True when post_mixer takes an FP16 `hidden` at this width: the Volta fp16 activation domain,
+    // in which the caller's RMSNorm writes the copy the QPN GEMVs would otherwise stage.
+    [[nodiscard]] static bool post_mixer_takes_fp16(const PostMixerWeights& weights,
+                                                    std::int32_t tokens);
+    // True when gdn_output_projection takes an FP16 `hidden` at this width (the caller's gated
+    // RMSNorm then writes the QPN GEMV's fp16 copy itself).
+    [[nodiscard]] static bool gdn_output_takes_fp16(const Weight& weight, std::int32_t tokens);
+    // True when attention_projection takes an FP16 `hidden` at this width (the caller's RMSNorm
+    // then writes the QPN GEMV's fp16 copy itself).
+    [[nodiscard]] static bool attention_projection_takes_fp16(
+        const FullAttentionProjectionWeights& weights, std::int32_t tokens);
+    // True when the verify-phase GDN norm/control and conv-record/snapshot input projection keep
+    // the normalized hidden in fp16 (the fused norm kernel writes the QPN GEMV's copy itself).
+    [[nodiscard]] static bool gdn_input_takes_fp16(const GdnProjectionWeights& weights,
+                                                   std::int32_t width, std::int32_t batch);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 

@@ -27,6 +27,11 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream);
 
+#ifdef NINFER_VOLTA_BUILD
+[[nodiscard]] bool nvfp4_linear_add_fp16_activation_supported(const Weight& weight,
+                                                              LinearPolicy policy,
+                                                              std::int32_t tokens);
+#endif
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 

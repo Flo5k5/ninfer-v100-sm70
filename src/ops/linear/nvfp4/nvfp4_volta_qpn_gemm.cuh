@@ -53,6 +53,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
 namespace ninfer::ops::detail {
@@ -286,9 +287,54 @@ __global__ __launch_bounds__(
     }
 }
 
+// e2m1 decode without the 2^14 rebias: out[j] = 2^-14 * value. The prepacked kernel folds the
+// rebias into its per-group scale multiply instead (see nvfp4_prepacked_scale).
+__device__ __forceinline__ void nvfp4_decode_e2m1_quad_unscaled(std::uint32_t q, half2 (&out)[4]) {
+    constexpr std::uint32_t kSign = 0x80008000u;
+    constexpr std::uint32_t kExpM = 0x0E000E00u;
+    std::uint32_t v0 = ((q << 12) & kSign) | ((q << 9) & kExpM);
+    std::uint32_t v1 = ((q << 8) & kSign) | ((q << 5) & kExpM);
+    std::uint32_t v2 = ((q << 4) & kSign) | ((q << 1) & kExpM);
+    std::uint32_t v3 = (q & kSign) | ((q >> 3) & kExpM);
+    out[0]           = *reinterpret_cast<half2*>(&v0);
+    out[1]           = *reinterpret_cast<half2*>(&v1);
+    out[2]           = *reinterpret_cast<half2*>(&v2);
+    out[3]           = *reinterpret_cast<half2*>(&v3);
+}
+
+// The prepacked kernel's dequant constant, split on the host. The unprepacked kernel multiplies
+// every decoded e2m1 value by 2^14 and then by the group scale: two HMUL2 per half2. Folding the
+// 2^14 into the group scale leaves one, but the file header's warning stands -- the group scale
+// times 2^14 can leave fp16. The fold is only exact while it stays finite, so the host bounds it
+// for the *worst* e4m3 byte (448 * 2^-8 = 1.75 after the shift decode) and hands any excess to a
+// power-of-two `output_scale` the epilogue applies in fp32. Real checkpoints never need it
+// (inverse divisors ~1e-4 keep the product near 1e3), and while `output_scale` is 1 every weight
+// is bit-identical to the two-multiply form: scaling by a power of two commutes with rounding.
+struct Nvfp4PrepackedScale {
+    float divisor;
+    float output_scale;
+};
+
+inline Nvfp4PrepackedScale nvfp4_prepacked_scale(float inverse_weight_divisor) {
+    Nvfp4PrepackedScale scale{inverse_weight_divisor * 256.0F * 16384.0F, 1.0F};
+    while (scale.divisor * 1.75F > 32768.0F) {
+        scale.divisor *= 0.5F;
+        scale.output_scale *= 2.0F;
+    }
+    return scale;
+}
+
 // Load-time-prepacked companion. Codes are [N/32 tile][K/16 group][lane32][8B], with
 // the nibble order chosen so the shift decoder's structural (i,i+4) pairs become adjacent K.
 // This is v100-skinny's QPN2 main loop: no activation PRMTs and one scale byte per group.
+//
+// The loop is issue-bound as much as it is DRAM-bound (ncu: long_scoreboard 33%, not_selected
+// 19%, math_pipe_throttle 15% at ~81% of DRAM), so it is written to issue as little as possible
+// per 16-k group besides the 16 HMMA steps it cannot shed:
+//   - one HMUL2 per decoded half2 (the rebias folded into the group scale, above);
+//   - activation rows past `t` read row t-1 instead of predicating the load and zeroing the
+//     fragment: a garbage A row only lands in its own C row, which the epilogue never stores;
+//   - running pointers, so every load in a batch is a constant offset from one base.
 template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation>
 __global__ __launch_bounds__(
     SPLITK * 32, (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK < 1
@@ -297,7 +343,8 @@ __global__ __launch_bounds__(
 void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
                                       const std::uint8_t* __restrict__ scales,
                                       const Activation* __restrict__ x, int n, int k, int t,
-                                      float inverse_weight_divisor, OutputPolicy output) {
+                                      float folded_divisor, float output_scale,
+                                      OutputPolicy output) {
     using S = Nvfp4VoltaQpnSchedule;
     __shared__ float cs[SPLITK][kTiles * S::kRowsPerTile * S::kColsPerCta];
 
@@ -309,10 +356,18 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     const int quotient = groups / SPLITK;
     const int g0       = warp * quotient;
     const int gend     = warp == SPLITK - 1 ? groups : g0 + quotient;
-    const std::int64_t tile_base =
-        static_cast<std::int64_t>(blockIdx.x) * groups * 32 + lane;
-    const half2 rebias   = __float2half2_rn(16384.0f);
-    const half2 divisor2 = __float2half2_rn(inverse_weight_divisor * 256.0f);
+    const std::int64_t first_tuple =
+        (static_cast<std::int64_t>(blockIdx.x) * groups + g0) * 32 + lane;
+    const half2 divisor2 = __float2half2_rn(folded_divisor);
+
+    const uint2* code_ptr          = reinterpret_cast<const uint2*>(codes) + first_tuple;
+    const std::uint8_t* scale_ptr  = scales + first_tuple;
+    const Activation* xrow[kTiles];
+#pragma unroll
+    for (int tile = 0; tile < kTiles; ++tile) {
+        const int row = min(tile * S::kRowsPerTile + r, t - 1);
+        xrow[tile]    = x + static_cast<std::int64_t>(row) * k + g0 * S::kGroupK;
+    }
 
     float c[kTiles][NACC][8];
 #pragma unroll
@@ -324,46 +379,40 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         }
     }
 
-    for (int group = g0; group < gend; ++group) {
-        const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(group) * 32;
-        const uint2 q2 = __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8));
-        const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scales[packed_index]), divisor2);
+    // One group is only 8 bytes of codes per lane, and each is consumed by a dependent
+    // decode + four mma before the next load issues, so a warp keeps a single 256-byte request
+    // in flight -- far below what HBM needs at 2 CTAs/SM (the 5120x17408 down projection ran at
+    // 37% of bandwidth). Issue kLoadBatch groups' code and scale loads together first.
+    constexpr int kLoadBatch = 4;
+    const auto consume_group = [&](uint2 q2, std::uint8_t scale_byte, int k_offset) {
+        const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scale_byte), divisor2);
         half2 b[8];
-        nvfp4_decode_e2m1_quad(q2.x, rebias, *reinterpret_cast<half2(*)[4]>(&b[0]));
-        nvfp4_decode_e2m1_quad(q2.y, rebias, *reinterpret_cast<half2(*)[4]>(&b[4]));
+        nvfp4_decode_e2m1_quad_unscaled(q2.x, *reinterpret_cast<half2(*)[4]>(&b[0]));
+        nvfp4_decode_e2m1_quad_unscaled(q2.y, *reinterpret_cast<half2(*)[4]>(&b[4]));
 #pragma unroll
         for (int j = 0; j < 8; ++j) { b[j] = __hmul2(b[j], sc2); }
         const unsigned* B = reinterpret_cast<const unsigned*>(b);
-        const int kbase   = group * S::kGroupK;
 
 #pragma unroll
         for (int tile = 0; tile < kTiles; ++tile) {
-            const int row = tile * S::kRowsPerTile + r;
             half values[16];
-            if (row < t) {
-                const Activation* source = x + static_cast<std::int64_t>(row) * k + kbase;
-                const uint4 raw0 = *reinterpret_cast<const uint4*>(source);
-                const uint4 raw1 = *reinterpret_cast<const uint4*>(source + 8);
-                const auto* src0 = reinterpret_cast<const Activation*>(&raw0);
-                const auto* src1 = reinterpret_cast<const Activation*>(&raw1);
-                if constexpr (std::is_same_v<Activation, half>) {
+            const Activation* source = xrow[tile] + k_offset;
+            const uint4 raw0 = *reinterpret_cast<const uint4*>(source);
+            const uint4 raw1 = *reinterpret_cast<const uint4*>(source + 8);
+            const auto* src0 = reinterpret_cast<const Activation*>(&raw0);
+            const auto* src1 = reinterpret_cast<const Activation*>(&raw1);
+            if constexpr (std::is_same_v<Activation, half>) {
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) { values[j] = src0[j]; }
+                for (int j = 0; j < 8; ++j) { values[j] = src0[j]; }
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) { values[j + 8] = src1[j]; }
-                } else {
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        values[j] = __float2half(__bfloat162float(src0[j]));
-                    }
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        values[j + 8] = __float2half(__bfloat162float(src1[j]));
-                    }
-                }
+                for (int j = 0; j < 8; ++j) { values[j + 8] = src1[j]; }
             } else {
 #pragma unroll
-                for (int j = 0; j < 16; ++j) { values[j] = __ushort_as_half(0); }
+                for (int j = 0; j < 8; ++j) { values[j] = __float2half(__bfloat162float(src0[j])); }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    values[j + 8] = __float2half(__bfloat162float(src1[j]));
+                }
             }
             const unsigned* A = reinterpret_cast<const unsigned*>(values);
             volta_mma_qp_n(c[tile][0 % NACC], A[0], A[1], B[0], B[1]);
@@ -371,6 +420,33 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
             volta_mma_qp_n(c[tile][2 % NACC], A[4], A[5], B[4], B[5]);
             volta_mma_qp_n(c[tile][3 % NACC], A[6], A[7], B[6], B[7]);
         }
+    };
+
+    const int count = gend - g0;
+    int done        = 0;
+    for (; done + kLoadBatch <= count; done += kLoadBatch) {
+        uint2 q2[kLoadBatch];
+        std::uint8_t scale_bytes[kLoadBatch];
+#pragma unroll
+        for (int u = 0; u < kLoadBatch; ++u) {
+            q2[u]          = __ldg(code_ptr + u * 32);
+            scale_bytes[u] = __ldg(scale_ptr + u * 32);
+        }
+#pragma unroll
+        for (int u = 0; u < kLoadBatch; ++u) {
+            consume_group(q2[u], scale_bytes[u], u * S::kGroupK);
+        }
+        code_ptr += kLoadBatch * 32;
+        scale_ptr += kLoadBatch * 32;
+#pragma unroll
+        for (int tile = 0; tile < kTiles; ++tile) { xrow[tile] += kLoadBatch * S::kGroupK; }
+    }
+    for (; done < count; ++done) {
+        consume_group(__ldg(code_ptr), __ldg(scale_ptr), 0);
+        code_ptr += 32;
+        scale_ptr += 32;
+#pragma unroll
+        for (int tile = 0; tile < kTiles; ++tile) { xrow[tile] += S::kGroupK; }
     }
 
 #pragma unroll
@@ -393,16 +469,39 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     }
     __syncthreads();
 
-    constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
-    for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * 32) {
-        const int row  = e / S::kColsPerCta;
-        const int col  = e % S::kColsPerCta;
-        const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
-        if (row < t && ocol < n) {
-            float value = 0.0f;
+    if constexpr (nvfp4_swiglu_pairs_v<OutputPolicy>) {
+        // VoltaQpnPrepackedSwiGlu: columns [0, 16) of this CTA are gate features, [16, 32) the
+        // same up features.
+        constexpr int kHalf  = S::kColsPerCta / 2;
+        constexpr int kPairs = kTiles * S::kRowsPerTile * kHalf;
+        for (int e = static_cast<int>(threadIdx.x); e < kPairs; e += SPLITK * 32) {
+            const int row     = e / kHalf;
+            const int local   = e % kHalf;
+            const int feature = static_cast<int>(blockIdx.x) * kHalf + local;
+            if (row < t && feature < n / 2) {
+                const int gate_index = row * S::kColsPerCta + local;
+                float gate           = 0.0f;
+                float up             = 0.0f;
 #pragma unroll
-            for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
-            output.store(ocol, row, value);
+                for (int w = 0; w < SPLITK; ++w) {
+                    gate += cs[w][gate_index];
+                    up += cs[w][gate_index + kHalf];
+                }
+                output.store_pair(feature, row, gate * output_scale, up * output_scale);
+            }
+        }
+    } else {
+        constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
+        for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * 32) {
+            const int row  = e / S::kColsPerCta;
+            const int col  = e % S::kColsPerCta;
+            const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
+            if (row < t && ocol < n) {
+                float value = 0.0f;
+#pragma unroll
+                for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
+                output.store(ocol, row, value * output_scale);
+            }
         }
     }
 }
@@ -419,7 +518,8 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
 //   - the split SwiGLU kernel's per-half shape (17408 rows, 544 CTAs): SPLITK=16 at *both*
 //     kTiles=1 and kTiles=2 (344.2 vs 279.8 GB/s at T=4; 214.4 vs 209.3 at T=16) --
 //     bench/ops/nvfp4_qpn2_split_shape_sweep.cu, deleted.
-//   - down (5120 rows, 160 CTAs): SPLITK=8 tops out, 16 is worse.
+//   - down (5120 rows, 160 CTAs): SPLITK=8 tops out, 16 is worse -- for the unbatched loop. The
+//     prepacked kernel's batched group loads flip that: SPLITK=16 there (see `down` below).
 // NACC barely moves any of them once SPLITK is right, so it only varies where it measured a real
 // (if small) edge. Geometries this dispatch doesn't name (attn/gdn input, the 6144-residual)
 // aren't reached by the mixed artifact's routing and fall to the SPLITK=8 default, which was never
@@ -430,13 +530,16 @@ void launch_nvfp4_qpn_schedule(bool prepacked, dim3 grid, const std::uint8_t* co
                                int t, float inverse_weight_divisor, OutputPolicy output,
                                cudaStream_t stream) {
     if (prepacked) {
+        const Nvfp4PrepackedScale scale = nvfp4_prepacked_scale(inverse_weight_divisor);
         nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC>
-            <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
-                                               inverse_weight_divisor, output);
-    } else {
+            <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t, scale.divisor,
+                                               scale.output_scale, output);
+    } else if constexpr (!nvfp4_swiglu_pairs_v<OutputPolicy>) {
         nvfp4_volta_qpn_gemm_kernel<kTiles, SPLITK, NACC>
             <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
                                                inverse_weight_divisor, output);
+    } else {
+        throw std::logic_error("NVFP4 QPN2 SwiGLU pairs need the interleaved prepacked layout");
     }
 }
 
@@ -452,11 +555,17 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
     const auto* scales = static_cast<const std::uint8_t*>(w.scales);
-    const bool prepacked  = w.layout == QuantLayout::VoltaQpnPrepacked;
+    const bool prepacked  = w.layout == QuantLayout::VoltaQpnPrepacked ||
+                           w.layout == QuantLayout::VoltaQpnPrepackedSwiGlu;
     const bool gate_up    = (n == 34816 && k == 5120);
     const bool split_half = (n == 17408 && k == 5120);
+    // The down projection's 160 CTAs leave SPLITK=8 at 2 CTAs/SM (16 warps) short of the
+    // requests in flight HBM needs; with the batched group loads SPLITK=16 measured 157 -> 114 us
+    // at T=6 (322 -> 444 GB/s), where the unbatched kernel had SPLITK=8 on top.
+    // Only the prepacked kernel has the batched loads that make SPLITK=16 pay on this shape.
+    const bool down       = prepacked && n == 5120 && k == 17408;
     if (t <= S::kRowsPerTile) {
-        if (gate_up || split_half) {
+        if (gate_up || split_half || down) {
             launch_nvfp4_qpn_schedule<1, 16, 2>(prepacked, grid, codes, scales, xd, n, k, t,
                                                 inverse_weight_divisor, output, stream);
         } else {

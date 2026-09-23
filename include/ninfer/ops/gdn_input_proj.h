@@ -228,6 +228,17 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * Volta fp16 activation domain. True when gdn_input_proj_conv_record / _snapshot with this
+ * single-parent weight, policy and [hidden, width, batch] input also accept an FP16 x holding
+ * BF16-rounded values -- the fp16 copy their QPN route would otherwise stage -- and then skip
+ * that staging pass; results are bit-identical to the BF16 tensor. False elsewhere.
+ */
+[[nodiscard]] bool gdn_input_proj_conv_fp16_activation_supported(const Weight& weight,
+                                                                 LinearPolicy policy,
+                                                                 std::int32_t width,
+                                                                 std::int32_t batch) noexcept;
+
+/**
  * Single-parent record-producing form. Registered parents are W8G32_F16S [12288,2048], NVFP4
  * [16384,5120], and FP8_E4M3FN_ROW_BF16S [16384,5120]. W8 admits A16Only, NVFP4 admits
  * A16Only/AllowA4, and FP8 admits A16Only/AllowA8. Record and snapshot share arithmetic route

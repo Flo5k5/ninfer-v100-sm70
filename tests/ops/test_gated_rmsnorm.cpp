@@ -2,7 +2,10 @@
 #include "core/device.h"
 #include "ops/norm_test_common.h"
 
+#include <cuda_fp16.h>
+
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -105,6 +108,51 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     return failures;
 }
 
+// FP16 output is the BF16 result staged to fp16 (the Volta QPN GEMVs' activation copy): it must
+// match converting the BF16 output bit for bit.
+int run_fp16_case(const std::string& label, const Shape& shape, std::uint32_t seed) {
+    const std::size_t count = shape.elements();
+    std::vector<float> input(count), weight(shape.d), gate(count);
+    fill_uniform(input, seed, -4.0F, 4.0F);
+    fill_uniform(weight, seed + 1U, 0.25F, 1.75F);
+    fill_uniform(gate, seed + 2U, -5.0F, 5.0F);
+    round_to_bf16(input);
+    round_to_bf16(weight);
+    round_to_bf16(gate);
+    DeviceInput device_input  = make_input(input, false);
+    DeviceInput device_weight = make_input(weight, false);
+    DeviceInput device_gate   = make_input(gate, false);
+    GuardedDeviceBuffer bf16_output(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer fp16_output(count * sizeof(std::uint16_t));
+    Tensor input_tensor = tensor_for(device_input.data, shape);
+    Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
+    Tensor gate_tensor = tensor_for(device_gate.data, shape);
+    Tensor bf16_tensor = tensor_for(bf16_output.data(), shape);
+    Tensor fp16_tensor = tensor_for(fp16_output.data(), shape);
+    fp16_tensor.dtype  = DType::FP16;
+    ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, kEps, bf16_tensor, nullptr);
+    ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, kEps, fp16_tensor, nullptr);
+    cuda_synchronize();
+
+    std::vector<std::uint16_t> bf16_bits(count), fp16_bits(count);
+    CUDA_CHECK(cudaMemcpy(bf16_bits.data(), bf16_output.data(), count * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(fp16_bits.data(), fp16_output.data(), count * 2, cudaMemcpyDeviceToHost));
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uint32_t widened = static_cast<std::uint32_t>(bf16_bits[i]) << 16;
+        float value                 = 0.0F;
+        std::memcpy(&value, &widened, sizeof(value));
+        const __half expected       = __float2half_rn(value);
+        std::uint16_t expected_bits = 0;
+        std::memcpy(&expected_bits, &expected, sizeof(expected_bits));
+        if (expected_bits != fp16_bits[i]) {
+            std::cerr << label << ": FP16 output " << i << " is 0x" << std::hex << fp16_bits[i]
+                      << ", staged BF16 gives 0x" << expected_bits << std::dec << '\n';
+            return 1;
+        }
+    }
+    return verify_output_storage(label + " fp16 output", fp16_output, false);
+}
+
 } // namespace
 
 int main() {
@@ -124,6 +172,9 @@ int main() {
     failures += run_case("gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);
     failures += run_case("gated_rmsnorm near-zero [128,32]", {128, 32}, 1404U, 1.0e-5F);
     failures += run_case("gated_rmsnorm unaligned [128,48]", {128, 48}, 1405U, 4.0F, true);
+    for (int columns : {1, 5, 32})
+        failures += run_fp16_case("gated_rmsnorm FP16 [128,48," + std::to_string(columns) + "]",
+                                  {128, 48, columns}, 1500U + columns);
     std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm\n";
     return failures ? 1 : 0;
 }

@@ -93,6 +93,28 @@ __device__ __forceinline__ int causal_small_t_default_splits(int window) {
     return splits < Geometry::SmallTMaximumSplits ? splits : Geometry::SmallTMaximumSplits;
 }
 
+// V100 wave alignment: 80 SMs x 2 CTAs/SM = 160 partial-kernel slots. A 55-split policy on
+// KVHeads=4 is 220 CTAs = 1.375 waves, the last one leaving most of the GPU idle. Round a
+// multi-wave split count to the nearest whole number of waves (ties and overflow go down: fewer
+// splits also means less reduce work). Shared by the host launch capacity and the device
+// active-split policy; aligning only the host side left the device on its unaligned count.
+template <typename Geometry>
+__host__ __device__ __forceinline__ int causal_small_t_wave_aligned_splits(int splits) {
+#ifdef NINFER_VOLTA_BUILD
+    constexpr int kVoltaSlots   = 160;
+    constexpr int kSplitsPerWave = kVoltaSlots / Geometry::KVHeads;
+    if (kSplitsPerWave <= 1 || splits <= kSplitsPerWave) { return splits; }
+    const int rounded_down = (splits / kSplitsPerWave) * kSplitsPerWave;
+    const int rounded_up   = rounded_down + kSplitsPerWave;
+    if (splits - rounded_down <= rounded_up - splits || rounded_up > Geometry::SmallTMaximumSplits) {
+        return rounded_down;
+    }
+    return rounded_up;
+#else
+    return splits;
+#endif
+}
+
 template <typename Geometry, bool Int8>
 __device__ __forceinline__ int causal_small_t_active_splits(int window, int launch_capacity,
                                                             int tokens) {
@@ -111,10 +133,12 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
             splits             = splits > kMin ? splits : kMin;
             splits             = splits < kMax ? splits : kMax;
         } else {
-            splits = causal_small_t_default_splits<Geometry>(window);
+            splits = causal_small_t_wave_aligned_splits<Geometry>(
+                causal_small_t_default_splits<Geometry>(window));
         }
     } else {
-        splits = causal_small_t_default_splits<Geometry>(window);
+        splits = causal_small_t_wave_aligned_splits<Geometry>(
+            causal_small_t_default_splits<Geometry>(window));
     }
     return splits < launch_capacity ? splits : launch_capacity;
 }
@@ -269,8 +293,24 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
                                                 active_split_count, weights, warp_sums, scalars);
     const int d = d_start + tid;
     if (tid >= DChunk || d >= kCausalHeadDim) return;
-    float numerator = 0.0f;
-    for (int split = 0; split < active_split_count; ++split) {
+    // Split loads are issued in batches (the sum keeps its split order, so the result is
+    // unchanged): one dependent load per split made this loop latency bound at long context.
+    constexpr int kSplitBatch = 8;
+    float numerator           = 0.0f;
+    int split                 = 0;
+    for (; split + kSplitBatch <= active_split_count; split += kSplitBatch) {
+        float values[kSplitBatch];
+#pragma unroll
+        for (int j = 0; j < kSplitBatch; ++j) {
+            values[j] =
+                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split + j, tokens)];
+        }
+#pragma unroll
+        for (int j = 0; j < kSplitBatch; ++j) {
+            if (weights[split + j] != 0.0f) numerator += values[j] * weights[split + j];
+        }
+    }
+    for (; split < active_split_count; ++split) {
         if (weights[split] != 0.0f)
             numerator +=
                 partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] *

@@ -20,6 +20,16 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
 inline constexpr std::int32_t kNvfp4VoltaQpnRowsPerTile = 8;
 inline constexpr std::int32_t kNvfp4VoltaQpnMaxTokens   = 32;
 void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+// Same GEMM on an fp16 copy of x staged once by the caller (fp8_stage_bf16_activation_sm70).
+// Volta's mma takes fp16 only, so the bf16 form converts every activation in the inner loop, once
+// per CTA and per quadpair, on the quarter-rate F2F pipe: that conversion, not DRAM, capped the
+// 5120x17408 down projection (114 us with in-loop conversion, 88 us without).
+void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const Weight& w, const void* x_fp16, Tensor& out,
+                                 cudaStream_t stream);
+// residual += x * W^T in the QPN epilogue (one BF16 round, no materialized projection). x_fp16 is
+// the caller's staged fp16 copy of x, or nullptr for the in-loop conversion.
+void launch_nvfp4_volta_qpn_residual(const Tensor& x, const Weight& w, const void* x_fp16,
+                                     Tensor& residual, cudaStream_t stream);
 [[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                              std::int32_t t) noexcept;
 

@@ -231,6 +231,19 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               weights.dt_bias, workspace, hidden, g, beta, execution);
 }
 
+bool Variant::gdn_input_takes_fp16(const GdnProjectionWeights&, std::int32_t, std::int32_t) {
+    return false;
+}
+
+bool Variant::attention_projection_takes_fp16(const FullAttentionProjectionWeights&,
+                                              std::int32_t) {
+    return false;
+}
+
+bool Variant::gdn_output_takes_fp16(const Weight&, std::int32_t) { return false; }
+
+bool Variant::post_mixer_takes_fp16(const PostMixerWeights&, std::int32_t) { return false; }
+
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints& hints,
                          WorkspaceArena& workspace, cudaStream_t stream) {

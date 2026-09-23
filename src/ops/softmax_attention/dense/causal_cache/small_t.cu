@@ -9,7 +9,7 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16_volta.cuh"
-#include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta.cuh"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta_kt.cuh"
 #endif
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/softmax_attention.h"
@@ -74,7 +74,10 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
         const std::int32_t clamped  = (splits > kMin) ? splits : kMin;
         return (clamped < kMax) ? clamped : kMax;
     }
-    return causal_small_t_split_upper_bound<Geometry>(window);
+    // Same wave alignment as the device active-split policy, so the launch capacity always
+    // covers the aligned device count.
+    return causal_small_t_wave_aligned_splits<Geometry>(
+        causal_small_t_split_upper_bound<Geometry>(window));
 }
 
 template <typename Geometry>
@@ -159,43 +162,29 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
 #ifdef NINFER_VOLTA_BUILD
-    // sm_70: the tiled kernel below is an Ampere body (ldmatrix / mma.s8 m16n8k16). Route to the
-    // fork's independent Volta SIMT int8 producer -- the DFlash2 merge dropped this reroute and
-    // its include, which is why every INT8-group64 KV path (no-spec decode included) hit
-    // cudaErrorLaunchFailure at this launch site.
-    const dim3 volta_grid(Geometry::KVHeads, splits, invocation.batch_size);
-    const auto launch_volta = [&]<int WarpsPerCta>() {
-        causal_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                            MultiBatch, Masked, CacheInput>
-            <<<volta_grid, WarpsPerCta * 32, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data), input,
-                static_cast<const std::int32_t*>(pos.data),
-                static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
-                static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
-                static_cast<const std::int32_t*>(cache.block_tables.data),
-                invocation.valid_columns == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-                invocation.table_rows == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.table_rows->data),
-                cache.block_tables.ne[0], invocation.width, invocation.full_width,
-                invocation.column_begin, logical_capacity, scale,
-                static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
-                static_cast<float*>(partial_l.data));
-    };
-    if constexpr (TokenTile == 6 && Geometry::GroupSize == 6) {
-        // Below the 16K graph envelope the fifth-warp setup costs more than the tail pass it
-        // replaces; the next envelope up is where sharing the K/V walk wins.
-        constexpr std::int32_t kCompactTailMinWindow = 16391;
-        if (implementation_window >= kCompactTailMinWindow) {
-            launch_volta.template operator()<5>();
-        } else {
-            launch_volta.template operator()<4>();
-        }
-    } else {
-        launch_volta.template operator()<4>();
-    }
+    // sm_70: the tiled kernel below is an Ampere body (ldmatrix / mma.s8 m16n8k16). Every width
+    // takes the Volta key-major tensor-core kernel instead (small_t_i8_volta_kt.cuh); rows past
+    // five 8-row tiles are split over kKtRowSplits CTAs per (kv_head, split).
+    static_assert(kKtSupported<Geometry, TokenTile>);
+    constexpr int kRowSplits = kKtRowSplits<Geometry, TokenTile>;
+    const dim3 volta_grid(Geometry::KVHeads * kRowSplits, splits, invocation.batch_size);
+    causal_attention_small_t_volta_kt_partial_i8_kernel<Geometry, TokenTile, kRowSplits,
+                                                        MultiBatch, Masked, CacheInput>
+        <<<volta_grid, kKtWarps * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
+            static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
+            static_cast<__half*>(cache_v_scale.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width,
+            invocation.column_begin, logical_capacity, scale, static_cast<float*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
     return;
 #endif
@@ -397,7 +386,13 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
 #undef NINFER_CAUSAL_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
-    constexpr int kDChunk      = Geometry::QHeads == 24 ? 256 : 64;
+#ifdef NINFER_VOLTA_BUILD
+    // One 256-wide block per (head, column) left most of the 80 SMs idle at small widths (24
+    // blocks at width one); 64-dim chunks give four times the blocks for the same reads.
+    constexpr int kDChunk = 64;
+#else
+    constexpr int kDChunk = Geometry::QHeads == 24 ? 256 : 64;
+#endif
     const auto launch_reduce   = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                           invocation.width * invocation.batch_size);
