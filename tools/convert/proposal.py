@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from .model import Parameter
+from .provenance import local_name
 from .recipe import Recipe
 from .sources.logical import array_source, gather_source
 
@@ -85,7 +86,7 @@ def add_proposal(
         Parameter(
             "proposal/token_ids",
             (rows,),
-            array_source(ids, f"shortlist({ranking})"),
+            array_source(ids, f"shortlist({local_name(ranking)})"),
             direct_format="int32",
             residency="proposal",
         )

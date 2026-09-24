@@ -125,7 +125,7 @@ def compressed_matrix_source(
 
     return LogicalSource(
         shape,
-        f"{store.path}:{prefix} ({format})",
+        f"{store.label}:{prefix} ({format})",
         read,
         encoded,
         (lambda: divisor("weight_global_scale")) if format == "nvfp4" else None,
@@ -172,7 +172,7 @@ def matrix_source(
 
     return LogicalSource(
         shape,
-        f"{store.path}:{name}",
+        f"{store.label}:{name}",
         lambda begin, end: resolve().values(begin, end),
         encoded,
         lambda: divisor("weight_divisor"),
