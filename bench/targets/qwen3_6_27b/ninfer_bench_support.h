@@ -25,7 +25,7 @@ inline constexpr int kDefaultRepetitions              = 5;
 inline constexpr int kDefaultWarmup                   = 1;
 inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
-// Sanity bound only; the real per-backend range (mtp 1-4/1-7, dflash/dflash2 1-15) is enforced by
+// Sanity bound only; the real per-backend range (mtp 1-7, dflash/dflash2 1-15) is enforced by
 // product::validate_speculative_cli_options.
 inline constexpr std::uint32_t kMaxDraftTokens = 15;
 

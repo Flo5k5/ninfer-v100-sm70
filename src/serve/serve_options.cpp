@@ -127,13 +127,19 @@ std::string serve_usage_text(const char* argv0) {
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
-           "       --lookup-policy selects MTP context lookup (default fixed): it copies what "
-           "followed an\n"
-           "       earlier occurrence of the last --lookup-min-suffix tokens (default 16) and "
-           "verifies up to\n"
-           "       --lookup-max-proposal copied tokens per round (default 15); adaptive uses "
-           "the suffix only\n"
-           "       to resume an interrupted copy or inside tool calls.\n";
+           "       --lookup-policy selects MTP context lookup (default fixed): a round verifies up "
+           "to\n"
+           "       --lookup-max-proposal tokens (default 15) copied from an earlier occurrence of "
+           "the current\n"
+           "       suffix. fixed needs --lookup-min-suffix recurring tokens (default 16). adaptive "
+           "starts\n"
+           "       tool-call arguments at that suffix and other text at 16 (or the suffix if "
+           "higher), moves\n"
+           "       both toward it after paying rounds, resumes interrupted copies from it, and "
+           "enters copies\n"
+           "       with 7 tokens when --draft-tokens < 7 < --lookup-max-proposal (one more MTP "
+           "graph family).\n"
+           "       off plans no lookup.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
