@@ -106,10 +106,11 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options,
     case SpeculativeBackend::Mtp:
         // The sm_70 width-6+ target-verify regression (draft window >= 5 drifting off the
         // greedy argmax) tracked back to the dedicated Volta small_t_i8/bf16 verify kernels
-        // dropped during the DFlash2 merge; both are restored (small_t_i8_volta_kt.cuh, whose
-        // per-row arithmetic is width-invariant, and small_t_bf16_volta.cuh) and every draft
-        // window through 7 is bit-exact against --spec none again, so sm_70 no longer needs a
-        // narrower cap than upstream.
+        // dropped during the DFlash2 merge; both are restored (small_t_i8_volta_kt.cuh and
+        // small_t_bf16_volta.cuh), so sm_70 accepts the same [1,7] window as upstream. Greedy
+        // output still depends on the verification width near argmax ties: the target picks
+        // every token, but a wider block can round a near tie differently, so two draft
+        // windows (or lookup widths) may diverge from that token on. See docs/v100.md.
         if (options.draft_tokens == 0 || options.draft_tokens > 7) {
             throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,7]");
         }
