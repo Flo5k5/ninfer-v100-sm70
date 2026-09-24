@@ -534,10 +534,10 @@ def convert(builder: ObjectBuilder, out_path: Path, provenance: dict) -> None:
         builder.source.close()
     elapsed = time.perf_counter() - started
     report = {
-        "artifact": str(out_path),
+        "artifact": out_path.name,
         "bytes": out_path.stat().st_size,
-        "template": str(template.path),
-        "source": str(builder.source.model_dir),
+        "template": template.path.name,
+        "source": builder.source.model_dir.name,
         "objects": counts,
         "copy_prefixes": list(COPY_PREFIXES),
         "fp8_bf16_encoder": ENCODER_PROFILE,
