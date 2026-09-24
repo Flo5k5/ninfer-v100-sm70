@@ -62,8 +62,12 @@ struct SamplingConfig {
  * in [1,19] keeps that many candidates; top_k<=0 or top_k>=20 keeps min(20,token_domain).
  * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
- * top_p times the pre-truncation candidate weight. At least the best candidate remains, the
- * support is renormalized, and one id is drawn for that row.
+ * top_p times the pre-truncation candidate weight. Candidates of zero weight, such as a logit of
+ * minus infinity written by apply_token_bitmask, never enter the support, with or without
+ * filters, so a row never draws a token its logits exclude. At least the best candidate remains,
+ * the support is renormalized, and one id is drawn for that row. When every logit of a row is
+ * minus infinity, both modes return the lowest token id, which cannot be told apart from a real
+ * choice: callers that mask logits must keep at least one token allowed per row.
  *
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the

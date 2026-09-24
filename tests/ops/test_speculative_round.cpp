@@ -1074,6 +1074,131 @@ int batched_sampling_workspace_stride_case() {
     return failures;
 }
 
+// Verification columns as a token bitmask leaves them: minus infinity outside each column's
+// allowed set, fewer than twenty tokens allowed, and neither top-p nor min-p filtering. Column 0
+// allows {5, 9} and draft 0 is 5; column 1 allows nineteen equal tokens and draft 1 is masked;
+// column 2 allows one token. A masked draft is never accepted, and every correction or bonus token
+// is allowed in its column. Many initial lengths move the counter RNG across draws.
+int masked_sampling_case(int token_domain, float temperature) {
+    constexpr int k         = 2;
+    const int physical_rows = token_domain == 248077 ? 248320 : token_domain;
+    const std::vector<std::int32_t> drafts{5, 3};
+    std::vector<std::vector<int>> allowed{{5, 9}, {}, {41}};
+    for (int token = 11; token < 30; ++token) { allowed[1].push_back(token); }
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -INFINITY);
+    for (int column = 0; column <= k; ++column) {
+        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        for (const int token : allowed[static_cast<std::size_t>(column)]) {
+            logits[base + static_cast<std::size_t>(token)] =
+                column == 0 && token == 5 ? 0.5f : 0.0f;
+        }
+        for (int padding = token_domain; padding < physical_rows; ++padding) {
+            logits[base + static_cast<std::size_t>(padding)] = 100.0f;
+        }
+    }
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+    // Raw argmax per column; the greedy case adds a penalty so that the kernel reads the logits.
+    const std::vector<std::int32_t> targets{5, 11, 41};
+
+    ops::SamplingConfig config{};
+    config.temperature      = temperature;
+    config.top_k            = 20;
+    config.presence_penalty = temperature > 0.0f ? 0.0f : 0.5f;
+    config.seed             = 0xfeedbeefull;
+    DeviceBuffer d_targets  = to_device(targets);
+    DeviceBuffer d_logits   = to_device(logits_bits);
+    DeviceBuffer d_drafts   = to_device(drafts);
+    DeviceBuffer d_extent   = to_device<std::int32_t>({k});
+    DeviceBuffer d_config   = device_config(config);
+    DeviceBuffer d_length(sizeof(std::int32_t));
+    DeviceBuffer d_anchor(sizeof(std::int32_t));
+    DeviceBuffer d_licensed(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_count(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
+    Tensor targets_tensor(d_targets.p, DType::I32, {k + 1});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {physical_rows, k + 1});
+    Tensor drafts_tensor(d_drafts.p, DType::I32, {k});
+    Tensor extent(d_extent.p, DType::I32, {1});
+    Tensor length(d_length.p, DType::I32, {1});
+    Tensor anchor(d_anchor.p, DType::I32, {1});
+    Tensor licensed(d_licensed.p, DType::I32, {k + 1});
+    Tensor count(d_count.p, DType::I32, {1});
+    Tensor accepted(d_accepted.p, DType::I32, {1});
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+
+    const std::string label = "speculative masked domain=" + std::to_string(token_domain) +
+                              " T=" + std::to_string(temperature);
+    const int trials = temperature > 0.0f ? 256 : 1;
+    for (int trial = 0; trial < trials; ++trial) {
+        const std::int32_t initial_length = 1000 + 3 * trial;
+        d_length.copy_from_host(&initial_length, sizeof(initial_length));
+        ops::speculative_accept_greedy_drafts(
+            targets_tensor, logits_tensor, drafts_tensor, extent, length, anchor, licensed, count,
+            accepted, token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace,
+            nullptr);
+        cuda_synchronize();
+        const std::int32_t a        = from_device<std::int32_t>(d_accepted, 1)[0];
+        const auto tokens           = from_device<std::int32_t>(d_licensed, k + 1);
+        const std::int32_t terminal = a >= 0 && a <= k ? tokens[static_cast<std::size_t>(a)] : -1;
+        const bool drafts_kept      = a < 1 || tokens[0] == drafts[0];
+        const auto& column = a >= 0 && a <= k ? allowed[static_cast<std::size_t>(a)] : allowed[0];
+        const bool terminal_allowed =
+            std::find(column.begin(), column.end(), terminal) != column.end() &&
+            !(a < k && terminal == drafts[static_cast<std::size_t>(a)]);
+        if (a < 0 || a > 1 || !drafts_kept || !terminal_allowed) {
+            std::cerr << label << ": accepted " << a << " terminal " << terminal << " at length "
+                      << initial_length << '\n';
+            return 1;
+        }
+        if (temperature <= 0.0f && (a != 1 || terminal != 11)) {
+            std::cerr << label << ": greedy selected accepted " << a << " terminal " << terminal
+                      << '\n';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// A verification column with every token masked, reached as the bonus column after an accepted
+// draft. Both modes return the lowest token id (the stochastic route no longer normalizes NaN
+// weights); callers never build such a column, and the engine rejects the token at commit.
+int all_masked_bonus_case(int token_domain, float temperature) {
+    constexpr int k         = 1;
+    const int physical_rows = token_domain == 248077 ? 248320 : token_domain;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -INFINITY);
+    logits[5] = 0.0f;
+    for (int column = 0; column <= k; ++column) {
+        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        for (int padding = token_domain; padding < physical_rows; ++padding) {
+            logits[base + static_cast<std::size_t>(padding)] = 100.0f;
+        }
+    }
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+
+    ops::SamplingConfig config{};
+    config.temperature      = temperature;
+    config.top_k            = 20;
+    config.presence_penalty = temperature > 0.0f ? 0.0f : 0.5f;
+    config.seed             = 0x5eedull;
+    const std::vector<std::int32_t> drafts{5};
+    const std::string label =
+        "speculative all-masked bonus domain=" + std::to_string(token_domain) +
+        " T=" + std::to_string(temperature);
+    int failures = 0;
+    for (int trial = 0; trial < (temperature > 0.0f ? 16 : 1); ++trial) {
+        const std::int32_t initial_length = 500 + trial;
+        failures +=
+            execute_accept_case(label, {5, 0}, logits_bits, physical_rows, drafts, initial_length,
+                                token_domain, config, std::vector<std::int32_t>(token_domain, 0),
+                                accept_state_oracle(drafts, 1, 0, initial_length));
+    }
+    return failures;
+}
+
 int select_hidden_case(int rows, int columns, int accepted_value) {
     std::vector<std::uint16_t> hidden(static_cast<std::size_t>(rows) * columns);
     for (int col = 0; col < columns; ++col) {
@@ -1233,6 +1358,12 @@ int main(int argc, char** argv) {
     failures += greedy_penalty_case(257);
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
+    for (const int token_domain : {64, 248077}) {
+        for (const float temperature : {0.0f, 1.0f}) {
+            failures += masked_sampling_case(token_domain, temperature);
+            failures += all_masked_bonus_case(token_domain, temperature);
+        }
+    }
     std::size_t sparse_peak = 0;
     for (int k = 1; k <= 15; ++k) {
         for (int batch = 1; batch <= 8; ++batch) {
