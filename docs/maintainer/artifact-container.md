@@ -11,11 +11,10 @@ and the reader rejects version-2 files. `tools/artifact/schema.py` and `src/arti
 define the v3 directory, and the [weight conversion guide](../weight-conversion.md) its production.
 The Volta binder still addresses the version-2 object names and `(model_id, weights_id)` identities
 below through its v2-to-v3 shim (`src/artifact/typed_binding.cpp`, `Reader::identity`), so they
-remain the contract its bindings check. Today `Reader::identity` resolves the identity of the NVFP4
-recipes only, until the fix in [#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17) lands, and
-the shim cannot yet resolve the Qwen3.6-35B-A3B MoE expert weights; the [weight conversion
-guide](../weight-conversion.md#what-this-port-runs) lists what loads. The framing and directory
-sections describe the version-2 file format that v3 replaced.
+remain the contract its bindings check. `Reader::identity` derives the identity from the v3
+metadata name and the official recipe name. The shim cannot yet resolve the Qwen3.6-35B-A3B MoE
+expert weights; the [weight conversion guide](../weight-conversion.md#what-this-port-runs) lists
+what loads. The framing and directory sections describe the version-2 file format that v3 replaced.
 
 ## 1. Format overview
 
@@ -440,8 +439,9 @@ note at the top. The compact evidence retained for later changes is:
 - exact representative direct-word, Q4/Q5/Q6/Q8 code/scale, NVFP4 block-scale, and row-scaled FP8
   layout round trips (`tests/artifact/test_codecs.py`, `test_fp8_row.py`), with scalar decoding
   oracles for the NVFP4 words (`test_nvfp4_numeric.py`);
-- an independently constructed C++ version-2 fixture covering hierarchical identity, payload spans,
-  encoded sizes, and alignment;
+- independently constructed C++ v3 fixtures covering framing, payload spans, encoded sizes,
+  alignment, and the `(model_id, weights_id)` identity of each official recipe
+  (`tests/test_ninfer_artifact_reader.cpp`);
 - conversion of synthetic checkpoints through the v3 pipeline, from source mapping and recipes to
   written bindings and path-free provenance (`tests/convert/`);
 - C++ binding and public Engine loading for registered runtime capabilities. Companion-specific
