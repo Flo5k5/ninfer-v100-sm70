@@ -19,6 +19,9 @@ counts, and identities below describe the version-2 layout, which the Volta bind
 addresses: its v2-to-v3 shim (`src/artifact/typed_binding.cpp`) resolves each name to the v3
 object that its logical bindings cover, and derives the identity from the v3 metadata name and
 recipe. The source transforms and payload encodings below remain the contract of both artifacts.
+Today only the NVFP4 artifact loads on this port: `Reader::identity` derives `27b` from the
+`qwen3_8_27b` recipe name, and the Engine rejects the `groupwise-int` artifact of Section 13 until
+the identity fix in [#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17) lands.
 
 ## 1. NVFP4 artifact identity and contents
 
@@ -27,7 +30,7 @@ filename   = qwen3_8_27b_nvfp4.ninfer
 model_id   = qwen3.8-27b
 weights_id = nvfp4
 target_key = qwen3_8_27b
-recipe_id  = qwen3_8_27b_nvfp4-v2
+recipe     = qwen3_8_27b_nvfp4
 ```
 
 The current artifact is one complete image containing Text, the optimized proposal head, MTP,
@@ -883,8 +886,11 @@ recipe     = qwen3_8_27b
 
 The artifact contains the same 66-object DFlash2 suffix, 1118 base tensors, and six resources. The
 version-2 converter's inventory defined its base inventory, logical row views, aliases, and writer
-order; the official recipe `qwen3_8_27b` now produces it, and DFlash2 follows Sections 2 through
-12. Its complete format counts are:
+order; the official recipe `qwen3_8_27b` now produces it, and DFlash2 follows Sections 2 through 12.
+On this port the result binds only once the identity fix in
+[#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17) lands: until then `Reader::identity`
+derives `27b` from the recipe name, and `resolve_weights` rejects the artifact. Its complete format
+counts are:
 
 | Format | Tensors |
 |---|---:|
@@ -904,9 +910,9 @@ integer tensors using `row-split-k128-v1`.
 layers use the registered Q4/Q5 allocation; the optimized draft head uses Q4; MTP matrices and
 the Vision merger use W8; and the Vision patch projection uses Q6. All groupwise integer tensors
 use `MAXABS_F16_RECIP_RNE_V1` with `row-split-k128-v1`. Base tensors come solely from the official
-source revision in Section 10.1; DFlash2 tensors come from the fixed companion source. The artifact
-binds through the `Qwen38GroupwiseInt` profile, and its registered NVFP4 peer binds through
-`Qwen38Nvfp4`.
+source revision in Section 10.1; DFlash2 tensors come from the fixed companion source. Once its
+identity resolves, the artifact binds through the `Qwen38GroupwiseInt` profile; its registered
+NVFP4 peer binds through `Qwen38Nvfp4`.
 
 The official recipe writes it:
 

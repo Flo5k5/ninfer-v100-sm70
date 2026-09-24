@@ -8,11 +8,14 @@ artifact references.
 
 Since the v3 artifact port, the tools and the Engine write and read version 3 (`NINFER\x00\x03`),
 and the reader rejects version-2 files. `tools/artifact/schema.py` and `src/artifact/schema.cpp`
-define the v3 directory, and the [weight conversion guide](../weight-conversion.md) its
-production. The Volta binder still addresses the version-2 object names and
-`(model_id, weights_id)` identities below through its v2-to-v3 shim
-(`src/artifact/typed_binding.cpp`, `Reader::identity`), so they remain the contract its bindings
-check. The framing and directory sections describe the version-2 file format that v3 replaced.
+define the v3 directory, and the [weight conversion guide](../weight-conversion.md) its production.
+The Volta binder still addresses the version-2 object names and `(model_id, weights_id)` identities
+below through its v2-to-v3 shim (`src/artifact/typed_binding.cpp`, `Reader::identity`), so they
+remain the contract its bindings check. Today `Reader::identity` resolves the identity of the NVFP4
+recipes only, until the fix in [#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17) lands, and
+the shim cannot yet resolve the Qwen3.6-35B-A3B MoE expert weights; the [weight conversion
+guide](../weight-conversion.md#what-this-port-runs) lists what loads. The framing and directory
+sections describe the version-2 file format that v3 replaced.
 
 ## 1. Format overview
 
