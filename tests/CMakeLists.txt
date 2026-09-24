@@ -304,14 +304,6 @@ if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ninfer_softmax_attention_nvfp4_test
     ninfer_softmax_attention_k8v4_test
     PROPERTIES SKIP_RETURN_CODE 77)
-else()
-  # The Volta prefill attention kernel is selected per process; the default run covers split-D.
-  add_test(NAME ninfer_softmax_attention_flash_test COMMAND ninfer_softmax_attention_test)
-  add_test(NAME ninfer_softmax_attention_reference_test COMMAND ninfer_softmax_attention_test)
-  set_tests_properties(ninfer_softmax_attention_flash_test PROPERTIES
-    ENVIRONMENT "NINFER_VOLTA_PREFILL_ATTENTION=flash" SKIP_RETURN_CODE 77)
-  set_tests_properties(ninfer_softmax_attention_reference_test PROPERTIES
-    ENVIRONMENT "NINFER_VOLTA_PREFILL_ATTENTION=reference" SKIP_RETURN_CODE 77)
 endif()
 ninfer_add_op_test(ninfer_sliding_window_attention_test
   SOURCES ops/test_sliding_window_attention.cpp

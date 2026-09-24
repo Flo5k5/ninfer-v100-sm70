@@ -271,12 +271,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         plan.draft_window >= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("sequence workspace dimensions are invalid");
     }
-    if (workspace_recipe::text_residual_dtype() != DType::BF16 &&
-        !Variant::fp32_residual_supported(plan.weights_profile)) {
-        throw std::invalid_argument(
-            "an FP32 text residual stream needs an FP8 embedding and FP8/NVFP4 residual "
-            "projections on a 5120-wide target; this weights profile has no FP32 form");
-    }
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
@@ -293,7 +287,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
         (void)workspace_recipe::text_prefill_roots<TextConfig>(
-            layout, tokens, plan.features.vision ? 3 : 0, plan.features.vision ? tokens : 0);
+            layout, tokens, plan.features.vision ? 3 : 0, plan.features.vision ? tokens : 0,
+            plan.text_residual);
     };
     const auto attention_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                      std::int32_t last, qwen3_6::TextPhase phase,
@@ -307,7 +302,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_storage, envelope, batch_size, min_width, max_width));
+                            plan.kv_storage, envelope, plan.prefill_attention, batch_size,
+                            min_width, max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };
@@ -374,7 +370,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_storage, envelope, 1, tokens, tokens));
+                            plan.kv_storage, envelope, plan.prefill_attention, 1, tokens,
+                            tokens));
         (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
     };
@@ -410,7 +407,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_storage, text_envelope, 1, 1, 1));
+                            plan.kv_storage, text_envelope, plan.prefill_attention, 1, 1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
@@ -437,7 +434,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
          ++batch) {
         WorkspaceLayoutBuilder ordinary;
-        matrix(ordinary, workspace_recipe::text_residual_dtype(), TextConfig::hidden, batch);
+        matrix(ordinary, workspace_recipe::text_residual_dtype(plan.text_residual),
+               TextConfig::hidden, batch);
         target_body(ordinary, batch, batch, qwen3_6::TextPhase::Verify, GdnWorkspacePath::Snapshot,
                     batch, 1, 1, text_envelope);
         scratch(ordinary,
@@ -482,8 +480,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             const std::int32_t aggregate = batch * lookup_verify;
             WorkspaceLayoutBuilder target;
-            matrix(target, workspace_recipe::text_residual_dtype(), TextConfig::hidden,
-                   aggregate);
+            matrix(target, workspace_recipe::text_residual_dtype(plan.text_residual),
+                   TextConfig::hidden, aggregate);
             target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                         GdnWorkspacePath::ReplayRecord, batch, lookup_verify, lookup_verify,
                         text_envelope);
@@ -499,7 +497,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout,
                         ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_storage, text_envelope, batch, width, width));
+                            plan.kv_storage, text_envelope, plan.prefill_attention, batch,
+                            width, width));
                 (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
             };
@@ -519,9 +518,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.masked_draft()) {
-        if (workspace_recipe::text_residual_dtype() != DType::BF16) {
-            // DFlash reads target features straight from the BF16 residual stream.
-            throw std::invalid_argument("an FP32 text residual stream does not support DFlash");
+        if (plan.text_residual != TextResidualStorage::BFloat16) {
+            // Rejected at startup: DFlash reads target features straight from the BF16 stream.
+            throw std::logic_error("DFlash planning reached an FP32 text residual stream");
         }
         if constexpr (!Variant::supports_dflash) {
             throw std::logic_error("unsupported target reached DFlash scratch planning");
@@ -750,6 +749,31 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
+    switch (options.text_residual) {
+    case TextResidualStorage::BFloat16:
+        break;
+    case TextResidualStorage::Float32:
+#ifndef NINFER_VOLTA_BUILD
+        throw std::invalid_argument("an FP32 text residual stream requires the Volta build");
+#endif
+        break;
+    default:
+        throw std::invalid_argument("unknown text residual storage");
+    }
+    switch (options.prefill_attention) {
+    case PrefillAttentionKernel::Automatic:
+        break;
+    case PrefillAttentionKernel::SplitD:
+    case PrefillAttentionKernel::Flash:
+    case PrefillAttentionKernel::Reference:
+#ifndef NINFER_VOLTA_BUILD
+        throw std::invalid_argument(
+            "a prefill attention kernel selection requires the Volta build");
+#endif
+        break;
+    default:
+        throw std::invalid_argument("unknown prefill attention kernel");
+    }
 #ifdef NINFER_VOLTA_BUILD
     if (options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
         options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value) {
@@ -791,6 +815,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
+    impl->text_residual       = inputs.text_residual;
+    impl->prefill_attention   = inputs.prefill_attention;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -849,6 +875,18 @@ std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile) {
     validate_target_options(device, options);
+    if (options.text_residual == TextResidualStorage::Float32) {
+        if (!Variant::fp32_residual_supported(weights_profile)) {
+            throw std::invalid_argument(
+                "an FP32 text residual stream needs an FP8 embedding and FP8/NVFP4 residual "
+                "projections; this weights profile has no FP32 form (qwen3.8-27b/nvfp4 only)");
+        }
+        if (options.speculative.backend == SpeculativeBackend::DFlash ||
+            options.speculative.backend == SpeculativeBackend::DFlash2) {
+            // DFlash reads target features straight from the BF16 residual stream.
+            throw std::invalid_argument("an FP32 text residual stream does not support DFlash");
+        }
+    }
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -857,6 +895,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
+        .text_residual       = options.text_residual,
+        .prefill_attention   = options.prefill_attention,
         .proposal_head       = options.speculative.proposal_head,
         .context_lookup      = options.speculative.context_lookup,
         .features            = qwen3_6::startup_features(options),

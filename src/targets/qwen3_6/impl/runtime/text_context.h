@@ -116,6 +116,12 @@ enum class GdnStateAction : std::uint8_t {
     RecordForReplay,
 };
 
+// Startup-fixed numerics of the text stack (EngineOptions::text_residual and prefill_attention).
+struct TextNumerics {
+    TextResidualStorage residual             = TextResidualStorage::BFloat16;
+    PrefillAttentionKernel prefill_attention = PrefillAttentionKernel::Automatic;
+};
+
 struct NullTap {
     static constexpr bool enabled = false;
 };
@@ -155,7 +161,7 @@ public:
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
-                std::uint32_t text_kv_base,
+                TextNumerics numerics, std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
@@ -306,6 +312,7 @@ private:
     qwen3_6::RoundState& io_;
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
+    TextNumerics numerics_;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;

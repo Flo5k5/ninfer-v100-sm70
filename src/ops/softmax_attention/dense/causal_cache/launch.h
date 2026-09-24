@@ -134,14 +134,27 @@ inline constexpr std::int32_t kVoltaFlashKeyPad       = 256;
 inline constexpr std::int32_t kVoltaSplitDBlockRows       = 64;
 inline constexpr std::int32_t kVoltaSplitDKeySplitMinimum = 2048;
 
-// Kernel behind the wide BF16/INT8 prompt route, selected once per process by
-// NINFER_VOLTA_PREFILL_ATTENTION (any other value is rejected):
-//   splitd    (default) vendored Split-D kernel, FP32 Q.K^T and P.V accumulators; an inexact
-//             envelope keeps the direct kernel;
-//   flash     vendored llama.cpp MMA kernel, FP32 Q.K^T but FP16 P.V accumulators;
-//   reference the direct FP32 kernel (slow; for numerical A/B only).
-enum class VoltaPrefillAttention : std::uint8_t { SplitD, Flash, Reference };
-VoltaPrefillAttention volta_prefill_attention();
+// Kernel of a Volta causal prompt-route launch:
+//   Direct  the exact FP32 kernel (every storage, masked launches, the Reference selection);
+//   Flash   vendored llama.cpp MMA kernel, FP32 Q.K^T but FP16 P.V accumulators;
+//   SplitD  vendored Split-D kernel, FP32 Q.K^T and P.V accumulators.
+enum class VoltaPromptKernel : std::uint8_t { Direct, Flash, SplitD };
+
+// Staged kernel whose workspace a prompt-route width reserves: Flash or SplitD for a single
+// BF16/INT8 sequence of at least kVoltaFlashMinimumWidth columns on a registered geometry, unless
+// the selection is Reference; Direct otherwise. Automatic selects SplitD for 24 query heads (the
+// measured 27B geometry) and Flash for 16 (35B-A3B).
+VoltaPromptKernel volta_prompt_staging_kernel(PrefillAttentionKernel selection,
+                                              std::int32_t q_heads, std::int32_t width,
+                                              std::int32_t batch_size, KvCacheStorage storage);
+
+// Kernel that actually runs a prompt-route launch: the staging kernel, except that masked launches
+// run the direct kernel, and so does split-D under an inexact envelope, because it derives every
+// row's causal limit from the envelope instead of reading the positions. Test-visible.
+VoltaPromptKernel volta_prompt_kernel(PrefillAttentionKernel selection, std::int32_t q_heads,
+                                      std::int32_t width, std::int32_t batch_size,
+                                      KvCacheStorage storage, bool masked,
+                                      CausalAttentionExecutionEnvelope envelope);
 
 struct VoltaSplitDWorkspaceShape {
     std::int64_t staged_q_halves;

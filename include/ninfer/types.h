@@ -35,6 +35,25 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8KeyNvfp4Value,
 };
 
+// Storage of the text residual stream that every decoder layer updates twice. Float32 keeps the
+// stream out of BF16 between updates; it is available on Volta builds for qwen3.8-27b/nvfp4 without
+// DFlash, and the Engine rejects it anywhere else at construction.
+enum class TextResidualStorage : std::uint8_t {
+    BFloat16,
+    Float32,
+};
+
+// Kernel of the wide causal prefill attention route of Volta builds (BF16 and INT8 KV, one
+// sequence, prompt widths of at least 64 tokens). Automatic selects SplitD for the 27B attention
+// geometry (24 query heads) and Flash for the 35B-A3B one; Reference is the direct FP32 kernel, for
+// numerical comparison. Other builds accept only Automatic.
+enum class PrefillAttentionKernel : std::uint8_t {
+    Automatic,
+    SplitD,
+    Flash,
+    Reference,
+};
+
 enum class EnginePurpose : std::uint8_t {
     Generation,
     CausalScoring,
@@ -190,6 +209,8 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    TextResidualStorage text_residual  = TextResidualStorage::BFloat16;
+    PrefillAttentionKernel prefill_attention = PrefillAttentionKernel::Automatic;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
