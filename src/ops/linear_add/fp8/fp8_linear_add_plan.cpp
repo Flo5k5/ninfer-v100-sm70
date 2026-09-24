@@ -107,6 +107,11 @@ void launch_qpn_residual(const Tensor& x, const Weight& weight, Tensor& residual
         fp8_linear_add_qpn_launch(x, weight, activation.data, residual, stream);
         return;
     }
+    if (residual.dtype == DType::FP32) {
+        // An FP32 residual stream takes the GEMM's FP32 accumulators directly.
+        fp8_cutlass_sm70_residual_launch(x, weight, residual, workspace, stream);
+        return;
+    }
     auto scope       = workspace.scope();
     Tensor projected = allocate_projected(workspace, weight.n, x.ne[1]);
     fp8_cutlass_sm70_launch(x, weight, projected, workspace, stream);
@@ -167,6 +172,11 @@ bool fp8_linear_add_fp16_activation_supported(const Weight& weight, LinearPolicy
                                               std::int32_t tokens) {
     return resolve_route(weight.n, weight.k, policy, tokens) == Fp8LinearAddRoute::QpnResidual &&
            tokens <= kFp8VoltaQpnMaxTokens;
+}
+
+bool fp8_linear_add_fp32_residual_supported(const Weight& weight, LinearPolicy policy,
+                                            std::int32_t tokens) {
+    return resolve_route(weight.n, weight.k, policy, tokens) == Fp8LinearAddRoute::QpnResidual;
 }
 #endif
 

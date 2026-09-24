@@ -73,6 +73,54 @@ int scatter_case(std::int32_t rows, const std::vector<std::int32_t>& indices,
     return failures;
 }
 
+// FP32 destination (an FP32 residual stream): every selected column receives the exactly widened
+// BF16 source values; every other column keeps its FP32 contents.
+int scatter_f32_case(std::int32_t rows, const std::vector<std::int32_t>& indices,
+                     std::int32_t destination_columns) {
+    const std::int32_t source_columns = static_cast<std::int32_t>(indices.size());
+    auto source = bit_pattern(static_cast<std::size_t>(rows) * source_columns, 0x2468'1357u);
+    for (auto& bits : source) { bits &= 0xbfffu; } // finite values only
+    std::vector<float> destination(static_cast<std::size_t>(rows) * destination_columns);
+    for (std::size_t i = 0; i < destination.size(); ++i) {
+        destination[i] = 0.001F * static_cast<float>(i % 9973) - 3.3F;
+    }
+    auto expected = destination;
+    for (std::int32_t source_column = 0; source_column < source_columns; ++source_column) {
+        const std::int32_t destination_column = indices[static_cast<std::size_t>(source_column)];
+        for (std::int32_t row = 0; row < rows; ++row) {
+            expected[static_cast<std::size_t>(destination_column) * rows + row] =
+                bf16_to_f32(source[static_cast<std::size_t>(source_column) * rows + row]);
+        }
+    }
+
+    GuardedDeviceBuffer device_source(source.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_indices(indices.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_destination(destination.size() * sizeof(float));
+    device_source.copy_from_host(source.data(), source.size() * sizeof(std::uint16_t));
+    device_indices.copy_from_host(indices.data(), indices.size() * sizeof(std::int32_t));
+    device_destination.copy_from_host(destination.data(), destination.size() * sizeof(float));
+
+    Tensor source_tensor(device_source.data(), DType::BF16, {rows, source_columns});
+    Tensor indices_tensor(device_indices.data(), DType::I32, {source_columns});
+    Tensor destination_tensor(device_destination.data(), DType::FP32, {rows, destination_columns});
+    ops::scatter(source_tensor, indices_tensor, destination_tensor, nullptr);
+    cuda_synchronize();
+
+    const std::string label =
+        "scatter FP32 destination D=" + std::to_string(rows) + " V=" + std::to_string(source_columns);
+    int failures = 0;
+    failures += verify_exact(label.c_str(),
+                             from_device<float>(device_destination.data(), destination.size()),
+                             expected);
+    failures +=
+        verify_exact((label + " preserves source").c_str(),
+                     from_device<std::uint16_t>(device_source.data(), source.size()), source);
+    failures += device_source.verify_guards((label + " source").c_str());
+    failures += device_indices.verify_guards((label + " indices").c_str());
+    failures += device_destination.verify_guards((label + " destination").c_str());
+    return failures;
+}
+
 int extract_case(std::int32_t source_rows, std::int32_t destination_rows,
                  std::int32_t source_offset, std::int32_t tokens) {
     const auto source = bit_pattern(static_cast<std::size_t>(source_rows) * tokens, 0x1357'9bdfu);
@@ -170,6 +218,8 @@ int main() {
     failures += continuation_case(5, 3);
     failures += scatter_case(5120, {4, 0, 7, 2}, 9);
     failures += scatter_case(2048, {5, 1, 3}, 7);
+    failures += scatter_f32_case(5120, {4, 0, 7, 2}, 9);
+    failures += scatter_f32_case(7, {2, 0}, 3);
     failures += extract_case(10240, 6144, 4096, 6);
     failures += extract_case(8192, 2048, 2048, 1);
     std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";

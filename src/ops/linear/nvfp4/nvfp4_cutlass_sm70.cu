@@ -13,6 +13,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -139,7 +140,6 @@ using ElementAccumulator     = float;
 using ElementComputeEpilogue = ElementAccumulator;
 using ElementInputA          = cutlass::half_t;
 using ElementInputB          = cutlass::half_t;
-using ElementOutput          = cutlass::bfloat16_t;
 using LayoutInputA           = cutlass::layout::RowMajor;
 using LayoutInputB           = cutlass::layout::ColumnMajor;
 using LayoutOutput           = cutlass::layout::RowMajor;
@@ -149,14 +149,19 @@ using ShapeMMAThreadBlock    = cutlass::gemm::GemmShape<128, 128, 32>;
 using ShapeMMAWarp           = cutlass::gemm::GemmShape<64, 64, 32>;
 using ShapeMMAOp             = cutlass::gemm::GemmShape<8, 8, 4>;
 using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
-using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-    ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value, ElementAccumulator,
-    ElementComputeEpilogue>;
 constexpr int kNumStages = 2;
-using Gemm = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, ElementInputB, LayoutInputB,
-                                         ElementOutput, LayoutOutput, ElementAccumulator, MMAOp,
-                                         SmArch, ShapeMMAThreadBlock, ShapeMMAWarp, ShapeMMAOp,
-                                         EpilogueOp, SwizzleThreadBlock, kNumStages>;
+// BF16 output for the plain projection; FP32 output accumulated onto an FP32 residual stream
+// (D = acc + C with C = D) for the residual-update projections.
+template <class ElementOutput>
+using GemmFor = cutlass::gemm::device::Gemm<
+    ElementInputA, LayoutInputA, ElementInputB, LayoutInputB, ElementOutput, LayoutOutput,
+    ElementAccumulator, MMAOp, SmArch, ShapeMMAThreadBlock, ShapeMMAWarp, ShapeMMAOp,
+    cutlass::epilogue::thread::LinearCombination<
+        ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value, ElementAccumulator,
+        ElementComputeEpilogue>,
+    SwizzleThreadBlock, kNumStages>;
+using Gemm    = GemmFor<cutlass::bfloat16_t>;
+using GemmF32 = GemmFor<float>;
 
 template <class Allocator>
 struct CutlassWorkspace {
@@ -176,34 +181,33 @@ CutlassWorkspace<Allocator> allocate_cutlass_workspace(Allocator& allocator, std
     return out;
 }
 
-} // namespace
-
-std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
-                                               std::int32_t cols) {
-    WorkspaceLayoutBuilder layout;
+template <class G>
+std::size_t gemm_workspace_bytes_for(std::int32_t n, std::int32_t k, std::int32_t cols) {
     cutlass::gemm::GemmCoord problem_size(cols, n, k);
-    typename Gemm::Arguments arguments{
+    typename G::Arguments arguments{
         problem_size, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
         {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
-    const std::size_t gemm_workspace_bytes = Gemm::get_workspace_size(arguments);
-    (void)allocate_cutlass_workspace(layout, n, k, cols, gemm_workspace_bytes);
-    return layout.peak_bytes(1);
+    return G::get_workspace_size(arguments);
 }
 
-void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                               cudaStream_t stream) {
+std::size_t gemm_workspace_bytes(std::int32_t n, std::int32_t k, std::int32_t cols) {
+    return std::max(gemm_workspace_bytes_for<Gemm>(n, k, cols),
+                    gemm_workspace_bytes_for<GemmF32>(n, k, cols));
+}
+
+// Stages the FP16 weights and activations, then runs D = acc + beta * C on `out` (C = D).
+template <class G>
+void run(const Tensor& x, const Weight& w, typename G::ElementC* out, float beta,
+         WorkspaceArena& ws, cudaStream_t stream) {
     const std::int32_t k    = x.ne[0];
     const std::int32_t cols = x.ne[1];
     const std::int32_t n    = w.n;
     cutlass::gemm::GemmCoord problem_size(cols, n, k);
-    typename Gemm::Arguments sizing_arguments{
-        problem_size, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
-        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
-    const std::size_t gemm_workspace_bytes = Gemm::get_workspace_size(sizing_arguments);
+    const std::size_t gemm_bytes = gemm_workspace_bytes(n, k, cols);
 
     auto scratch_scope = ws.scope();
     CutlassWorkspace<WorkspaceArena> scratch =
-        allocate_cutlass_workspace(ws, n, k, cols, gemm_workspace_bytes);
+        allocate_cutlass_workspace(ws, n, k, cols, gemm_bytes);
     auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
     auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
 
@@ -233,11 +237,14 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
                                                       x_fp16, x_count);
     CUDA_CHECK(cudaGetLastError());
 
-    Gemm gemm_op;
-    typename Gemm::Arguments arguments{
-        problem_size, {x_fp16, k}, {w_fp16, k}, {static_cast<ElementOutput*>(out.data), n},
-        {static_cast<ElementOutput*>(out.data), n},
-        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
+    G gemm_op;
+    typename G::Arguments arguments{problem_size,
+                                    {x_fp16, k},
+                                    {w_fp16, k},
+                                    {out, n},
+                                    {out, n},
+                                    {ElementComputeEpilogue(1), ElementComputeEpilogue(beta)},
+                                    1};
     cutlass::Status status = gemm_op.can_implement(arguments);
     if (status != cutlass::Status::kSuccess) {
         throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS can_implement failed");
@@ -251,6 +258,25 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
         throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS gemm() failed");
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
+                                               std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_cutlass_workspace(layout, n, k, cols, gemm_workspace_bytes(n, k, cols));
+    return layout.peak_bytes(1);
+}
+
+void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                               cudaStream_t stream) {
+    run<Gemm>(x, w, static_cast<cutlass::bfloat16_t*>(out.data), 0.0F, ws, stream);
+}
+
+void nvfp4_cutlass_sm70_residual_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                        WorkspaceArena& ws, cudaStream_t stream) {
+    run<GemmF32>(x, w, static_cast<float*>(residual.data), 1.0F, ws, stream);
 }
 
 } // namespace ninfer::ops::detail

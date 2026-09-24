@@ -212,6 +212,140 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     return failures;
 }
 
+
+#ifdef NINFER_VOLTA_BUILD
+// FP32 residual stream: both routes accumulate in FP32 and round the sum once, to FP32 (measured
+// relative L2 below 4e-6 on these shapes), so the criterion sits far below the BF16 unit roundoff:
+// a BF16-rounded residual or a BF16-materialized projection (about 1e-3 and 1.6e-3 relative L2
+// here) fails it.
+constexpr ReductionCriterion kFp32ResidualTolerance{1.0e-4, 1.0 / 16384.0, 1.0 / 16384.0};
+
+// FP32 residual stream: the same weight and activation update an FP32 residual. The fused QPN
+// epilogue (T <= 32) and the wide GEMM route (T > 32, accumulating onto the residual from its FP32
+// accumulators) both round the sum once, to FP32.
+int run_fp32_residual_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8,
+                            std::uint32_t seed) {
+    struct Call {
+        std::int32_t tokens;
+        ops::LinearPolicy policy;
+    };
+    // The permissive policy stays on the FP32-accumulating route below the A8 width.
+    const std::array<Call, 5> calls{{{1, ops::LinearPolicy::A16Only},
+                                     {5, ops::LinearPolicy::A16Only},
+                                     {first_a8 - 1, ops::LinearPolicy::AllowA8},
+                                     {33, ops::LinearPolicy::A16Only},
+                                     {64, ops::LinearPolicy::A16Only}}};
+    constexpr std::int32_t kMaximumTokens = 64;
+    quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
+    const std::vector<std::int32_t> rows = sampled_indices(n);
+    const std::vector<float> materialized_weight =
+        quantized_weight::materialize_rows_fp32(host_weight, rows);
+    std::vector<std::uint16_t> activation = make_activation(k, kMaximumTokens, seed + 1U);
+    // Token 2 projects to exact zero, so its residual column must come back bit-identical.
+    constexpr std::int32_t kZeroToken = 2;
+    std::fill_n(activation.begin() + static_cast<std::ptrdiff_t>(kZeroToken) * k, k,
+                f32_to_bf16(0.0F));
+    const std::vector<std::uint16_t> residual_bits = make_residual(n, kMaximumTokens, seed + 2U);
+    std::vector<float> initial_residual(residual_bits.size());
+    for (std::size_t i = 0; i < residual_bits.size(); ++i) {
+        // Values off the BF16 grid, so an FP32 residual that were rounded to BF16 would show.
+        initial_residual[i] = bf16_to_f32(residual_bits[i]) * 1.0009765625F;
+    }
+
+    GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(activation.data(), device_activation.bytes());
+    GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    Weight weight = host_weight.device_weight(device_weight.data());
+    ops::detail::fp8_prepack_qpn_sm70(weight);
+
+    int failures = 0;
+    {
+        // From the A8 width the permissive policy takes the A8 route, which writes BF16:
+        // an FP32 residual is rejected before any launch and keeps its values.
+        const std::int32_t tokens = first_a8;
+        const std::size_t words   = static_cast<std::size_t>(n) * tokens;
+        GuardedDeviceBuffer output(words * sizeof(float));
+        output.copy_from_host(initial_residual.data(), output.bytes());
+        Tensor x(device_activation.data(), DType::BF16, {k, tokens});
+        Tensor residual(output.data(), DType::FP32, {n, tokens});
+        const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::AllowA8, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        const std::string label = std::string("FP8 linear_add FP32 residual A8 route [") +
+                                  std::to_string(n) + "," + std::to_string(k) + "]";
+        try {
+            ops::linear_add(x, weight, residual, ops::LinearPolicy::AllowA8, workspace, nullptr);
+            std::cerr << label << ": an FP32 residual was accepted\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {
+        }
+        cuda_check(cudaDeviceSynchronize(), "synchronize rejected FP32-residual linear_add");
+        std::vector<float> after(words);
+        output.copy_to_host(after.data(), output.bytes());
+        failures += verify_exact((label + " residual unchanged").c_str(), after,
+                                 std::vector<float>(initial_residual.begin(),
+                                                    initial_residual.begin() +
+                                                        static_cast<std::ptrdiff_t>(words)));
+    }
+    for (const Call& call : calls) {
+        const std::int32_t tokens       = call.tokens;
+        const std::size_t output_words = static_cast<std::size_t>(n) * tokens;
+        GuardedDeviceBuffer output(output_words * sizeof(float));
+        output.copy_from_host(initial_residual.data(), output.bytes());
+        Tensor x(device_activation.data(), DType::BF16, {k, tokens});
+        Tensor residual(output.data(), DType::FP32, {n, tokens});
+        const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, n, k, call.policy, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::linear_add(x, weight, residual, call.policy, workspace, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "synchronize FP32-residual linear_add");
+
+        const std::string label =
+            std::string("FP8") + " linear_add FP32 residual [" + std::to_string(n) + "," +
+            std::to_string(k) + "] T=" + std::to_string(tokens) +
+            (call.policy == ops::LinearPolicy::A16Only ? "" : " AllowA8");
+        if (workspace.peak_used() > std::max<std::size_t>(capacity, 256)) {
+            std::cerr << label << ": workspace overrun\n";
+            ++failures;
+        }
+        failures += output.verify_guards(label);
+        std::vector<float> actual_values(output_words);
+        output.copy_to_host(actual_values.data(), output.bytes());
+        std::vector<double> actual;
+        std::vector<double> expected;
+        for (std::size_t sampled_row = 0; sampled_row < rows.size(); ++sampled_row) {
+            const std::int32_t row = rows[sampled_row];
+            const float* weight_row =
+                materialized_weight.data() + sampled_row * static_cast<std::size_t>(k);
+            for (const std::int32_t token : sampled_indices(tokens)) {
+                double sum = 0.0;
+                const std::uint16_t* activation_row =
+                    activation.data() + static_cast<std::size_t>(token) * k;
+                for (std::int32_t column = 0; column < k; ++column) {
+                    sum += static_cast<double>(weight_row[column]) *
+                           static_cast<double>(bf16_to_f32(activation_row[column]));
+                }
+                const std::size_t index = static_cast<std::size_t>(token) * n + row;
+                actual.push_back(static_cast<double>(actual_values[index]));
+                expected.push_back(sum + static_cast<double>(initial_residual[index]));
+            }
+        }
+        failures += verify_reduction(label, actual, expected, kFp32ResidualTolerance);
+        if (tokens > kZeroToken) {
+            const auto column = [&](const std::vector<float>& values) {
+                const auto begin = values.begin() + static_cast<std::ptrdiff_t>(kZeroToken) * n;
+                return std::vector<float>(begin, begin + n);
+            };
+            failures += verify_exact((label + " zero-projection column").c_str(),
+                                     column(actual_values), column(initial_residual));
+        }
+    }
+    failures += device_activation.verify_guards("FP32-residual linear_add activation");
+    failures += device_weight.verify_guards("FP32-residual linear_add weight");
+    return failures;
+}
+#endif
 } // namespace
 
 int main() {
@@ -222,6 +356,10 @@ int main() {
     int failures = 0;
     failures += run_shape(5120, 6144, 22, 861U);
     failures += run_shape(5120, 17408, 25, 863U);
+#ifdef NINFER_VOLTA_BUILD
+    failures += run_fp32_residual_shape(5120, 6144, 22, 865U);
+    failures += run_fp32_residual_shape(5120, 17408, 25, 867U);
+#endif
     std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

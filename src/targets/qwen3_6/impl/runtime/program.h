@@ -527,7 +527,8 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
                                                   std::uint32_t first_target,
-                                                  ScoreLogitsSink* logits_sink);
+                                                  ScoreLogitsSink* logits_sink,
+                                                  CausalScoreOptions options);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -638,6 +639,7 @@ public:
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
+    const schedule::TextNumerics text_numerics;
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;

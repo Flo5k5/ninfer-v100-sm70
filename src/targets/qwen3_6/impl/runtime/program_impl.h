@@ -739,7 +739,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
       context_lookup(plan.context_lookup), lookup_plan(plan.lookup),
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
-      proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
+      proposal_head(plan.proposal_head),
+      text_numerics{.residual = plan.text_residual, .prefill_attention = plan.prefill_attention},
+      vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -1041,7 +1043,8 @@ ProgramImplCore::~ProgramImplCore() noexcept {
 
 std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                                                  std::uint32_t first_target,
-                                                 ScoreLogitsSink* logits_sink) {
+                                                 ScoreLogitsSink* logits_sink,
+                                                 CausalScoreOptions options) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -1146,10 +1149,17 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
 
         std::uint32_t cursor = 0;
         while (cursor < predictor_count) {
-            const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
+            std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
+            if (options.scored_chunk != 0) {
+                // The unscored history keeps prefill chunks; the scored region starts on its own
+                // chunk boundary and advances at the requested decode/verify width.
+                nominal = cursor < scored_predictor_begin
+                              ? std::min(nominal, scored_predictor_begin - cursor)
+                              : std::min(nominal, options.scored_chunk);
+            }
             schedule::PrefillContext schedule_state{
                 {device, model, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head},
+                 prefill_chunk, proposal_head, text_numerics},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -9001,7 +9011,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 schedule::PrefillContext schedule_state{
                     {device, model, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head},
+                     proposal_head, text_numerics},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,
@@ -11198,7 +11208,8 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head,
+                                       text_numerics};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -11531,7 +11542,8 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     schedule::DFlashAppendContext state{{device, model, work, state_images->linear(),
                                          replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head},
+                                         prefill_hidden, prefill_chunk, proposal_head,
+                                         text_numerics},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts,
@@ -11590,7 +11602,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         schedule::PrefillContext schedule_state{
             {device, model, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, text_numerics},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -11915,7 +11927,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                        replay_records ? &*replay_records : nullptr,
                                                        io, prefill_hidden, prefill_chunk,
-                                                       proposal_head},
+                                                       proposal_head, text_numerics},
                                                       decoder->text_kv,
                                                       *io.ordinary,
                                                       *ordinary_host_ingress,
@@ -12124,7 +12136,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                   replay_source, io, prefill_hidden, prefill_chunk,
-                                                  proposal_head},
+                                                  proposal_head, text_numerics},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  frame,
@@ -12333,7 +12345,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head},
+                                                     proposal_head, text_numerics},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

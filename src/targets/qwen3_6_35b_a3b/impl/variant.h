@@ -47,6 +47,9 @@ struct Variant {
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
+    // The FP32 text residual stream is registered for the 5120-wide dense targets only.
+    [[nodiscard]] static constexpr bool fp32_residual_supported(WeightsProfile) { return false; }
+
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);
     [[nodiscard]] static std::vector<GraphExecutionProfile>

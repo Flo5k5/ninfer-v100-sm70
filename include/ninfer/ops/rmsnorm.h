@@ -23,6 +23,9 @@ namespace ninfer::ops {
  * `out` may instead be FP16 for D=5120 (and gated D in 64..256, see gated_rmsnorm): it then holds
  * the BF16-rounded result converted to fp16, which is exactly the activation copy the Volta QPN
  * GEMVs stage from a BF16 output, so a caller that feeds them can skip that staging pass.
+ *
+ * `x` may instead be FP32 for D=5120 with 16-byte aligned x/weight/out (an FP32 residual stream);
+ * the oracle then reads the represented FP32 values and the output contract is unchanged.
  */
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream);

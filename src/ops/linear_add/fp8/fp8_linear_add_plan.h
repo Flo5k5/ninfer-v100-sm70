@@ -33,6 +33,12 @@ void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, const void
 [[nodiscard]] bool fp8_linear_add_fp16_activation_supported(const Weight& weight,
                                                             LinearPolicy policy,
                                                             std::int32_t tokens);
+// True when the resolved route accepts an FP32 residual: the Volta QPN-residual route, whose QPN
+// epilogue (T <= 32) and row-scaled CUTLASS GEMM (T >= 33) update it from FP32 accumulators with
+// one rounding. The A8 route writes BF16 and does not.
+[[nodiscard]] bool fp8_linear_add_fp32_residual_supported(const Weight& weight,
+                                                          LinearPolicy policy,
+                                                          std::int32_t tokens);
 #endif
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);

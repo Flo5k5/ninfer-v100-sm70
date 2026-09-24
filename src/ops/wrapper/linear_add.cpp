@@ -168,7 +168,24 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
     const bool fp16_x = x.dtype == DType::FP16 && linear_add_fp16_activation_supported(w, policy, t);
     require_tensor(x, fp16_x ? DType::FP16 : DType::BF16, w.k, t, "x");
-    require_tensor(residual_out, DType::BF16, w.n, t, "residual_out");
+    // An FP32 residual stream is updated only by the Volta FP8 and NVFP4 routes that accumulate
+    // into it; each format branch below also rejects its BF16-writing A8/W4A4 route.
+    const bool fp32_residual = residual_out.dtype == DType::FP32;
+#ifdef NINFER_VOLTA_BUILD
+    constexpr bool kFp32ResidualBuild = true;
+#else
+    constexpr bool kFp32ResidualBuild = false;
+#endif
+    if (fp32_residual && (!kFp32ResidualBuild || (w.qtype != QType::FP8_E4M3FN_ROW_BF16S &&
+                                                  w.qtype != QType::NVFP4))) {
+        throw std::invalid_argument(
+            "linear_add: an FP32 residual requires an FP8 or NVFP4 weight on a Volta build");
+    }
+    require_tensor(residual_out, fp32_residual ? DType::FP32 : DType::BF16, w.n, t,
+                   "residual_out");
+    if (fp32_residual && !aligned_to(residual_out.data, 16)) {
+        throw std::invalid_argument("linear_add: an FP32 residual must be 16-byte aligned");
+    }
     if (overlaps(x, residual_out)) {
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
     }
@@ -240,6 +257,12 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
         }
+#ifdef NINFER_VOLTA_BUILD
+        if (fp32_residual && !detail::nvfp4_linear_add_fp32_residual_supported(w, policy, t)) {
+            throw std::invalid_argument(
+                "nvfp4 linear_add: the W4A4 route cannot update an FP32 residual");
+        }
+#endif
         detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
         return;
     }
@@ -259,6 +282,12 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
+#ifdef NINFER_VOLTA_BUILD
+        if (fp32_residual && !detail::fp8_linear_add_fp32_residual_supported(w, policy, t)) {
+            throw std::invalid_argument(
+                "fp8 linear_add: the A8 route cannot update an FP32 residual");
+        }
+#endif
         detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
         return;
     }

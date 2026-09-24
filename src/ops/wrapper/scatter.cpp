@@ -9,8 +9,10 @@
 namespace ninfer::ops {
 
 void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
-    if (src.dtype != DType::BF16 || dst.dtype != DType::BF16 || indices.dtype != DType::I32) {
-        throw std::invalid_argument("scatter: src/dst must be BF16 and indices must be I32");
+    if (src.dtype != DType::BF16 || (dst.dtype != DType::BF16 && dst.dtype != DType::FP32) ||
+        indices.dtype != DType::I32) {
+        throw std::invalid_argument(
+            "scatter: src must be BF16, dst BF16 or FP32, and indices must be I32");
     }
     if (src.ne[2] != 1 || src.ne[3] != 1 || dst.ne[2] != 1 || dst.ne[3] != 1 ||
         indices.ne[1] != 1 || indices.ne[2] != 1 || indices.ne[3] != 1 || src.ne[0] != dst.ne[0] ||

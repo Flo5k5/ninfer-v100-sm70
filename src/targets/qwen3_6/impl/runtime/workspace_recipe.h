@@ -10,6 +10,14 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe {
 
+// Storage of the text residual stream that every decoder layer updates twice
+// (EngineOptions::text_residual). BF16 rounds the stream twice per layer (128 times per token on
+// the 64-layer 27B); on Volta the FP8/NVFP4 residual updates, the input norms, the FP8 token
+// embedding and the vision scatter also accept FP32.
+constexpr DType text_residual_dtype(TextResidualStorage storage) noexcept {
+    return storage == TextResidualStorage::Float32 ? DType::FP32 : DType::BF16;
+}
+
 template <class Allocator>
 Tensor matrix(Allocator& allocator, DType dtype, std::int32_t rows, std::int32_t tokens) {
     return allocator.alloc(dtype, {rows, tokens});
@@ -30,12 +38,13 @@ struct TextPrefillRoots {
 
 template <class Config, class Allocator>
 TextPrefillRoots text_prefill_roots(Allocator& allocator, std::int32_t tokens,
-                                    std::int32_t rope_axes, std::int32_t scatter_tokens) {
+                                    std::int32_t rope_axes, std::int32_t scatter_tokens,
+                                    TextResidualStorage residual) {
     TextPrefillRoots out;
     out.ids       = vector(allocator, DType::I32, tokens);
     out.positions = vector(allocator, DType::I32, tokens);
     if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
-    out.residual = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    out.residual = matrix(allocator, text_residual_dtype(residual), Config::hidden, tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
     }

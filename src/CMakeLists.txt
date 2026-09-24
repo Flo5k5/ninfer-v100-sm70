@@ -351,7 +351,16 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
     ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.cu
-    ops/launcher/gqa_attention_volta_flash.cu)
+    ops/launcher/gqa_attention_volta_flash.cu
+    ops/launcher/gqa_attention_volta_splitd.cu)
+  # The vendored FlashAttention headers are private to this translation unit, under their own
+  # namespace so they can never meet another FlashAttention copy at link time.
+  set_source_files_properties(
+    ops/launcher/gqa_attention_volta_splitd.cu
+    TARGET_DIRECTORY ninfer_ops
+    PROPERTIES
+      INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/sm70_flash_d256"
+      COMPILE_DEFINITIONS "FLASH_NAMESPACE=ninfer_sm70_flash")
   set_source_files_properties(
     ops/launcher/gqa_attention_volta_flash.cu
     TARGET_DIRECTORY ninfer_ops

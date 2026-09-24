@@ -28,9 +28,11 @@ function(ninfer_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# GPU tests carry a TIMEOUT so a hung kernel or device fails the run instead of stalling it: Op
+# tests default to 15 minutes, the attention suite and the real-artifact tests set their own.
 function(ninfer_add_op_test name)
   ninfer_add_test(${name} ${ARGN})
-  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${name} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
@@ -168,6 +170,27 @@ ninfer_add_test(ninfer_qwen3_6_27b_context_lookup_real_test
   SOURCES targets/qwen3_6_27b/test_engine_context_lookup_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_context_lookup_real_test PROPERTIES SKIP_RETURN_CODE 77)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  # The FP32 text residual stream (Volta, qwen3.8-27b/nvfp4): scoring in both shapes against a
+  # BF16-residual engine, the production MTP + CUDA Graph decode, and its startup planning.
+  add_test(NAME ninfer_qwen3_6_27b_score_real_fp32_test
+    COMMAND ninfer_qwen3_6_27b_score_real_test --text-residual fp32)
+  ninfer_add_test(ninfer_qwen3_6_27b_residual_real_test
+    SOURCES targets/qwen3_6_27b/test_engine_residual_real.cpp
+    LIBRARIES ninfer_engine)
+  ninfer_add_test(ninfer_qwen3_6_27b_numerics_plan_test
+    SOURCES targets/qwen3_6_27b/test_numerics_plan.cpp
+    LIBRARIES ninfer_engine)
+  target_include_directories(ninfer_qwen3_6_27b_numerics_plan_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+  target_link_libraries(ninfer_qwen3_6_27b_numerics_plan_test PRIVATE CUDA::cudart)
+  set_tests_properties(
+    ninfer_qwen3_6_27b_score_real_fp32_test
+    ninfer_qwen3_6_27b_residual_real_test
+    ninfer_qwen3_6_27b_numerics_plan_test
+    PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
@@ -295,6 +318,7 @@ ninfer_add_op_test(ninfer_softmax_attention_test
           ops/softmax_attention/plain_and_packed.cpp
           ops/softmax_attention/context.cpp
   LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_softmax_attention_test PROPERTIES TIMEOUT 1800)
 if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   add_test(NAME ninfer_softmax_attention_nvfp4_test
     COMMAND ninfer_softmax_attention_test --nvfp4-only)
@@ -303,7 +327,7 @@ if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   set_tests_properties(
     ninfer_softmax_attention_nvfp4_test
     ninfer_softmax_attention_k8v4_test
-    PROPERTIES SKIP_RETURN_CODE 77)
+    PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 endif()
 ninfer_add_op_test(ninfer_sliding_window_attention_test
   SOURCES ops/test_sliding_window_attention.cpp
@@ -319,7 +343,7 @@ if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   set_tests_properties(
     ninfer_kv_cache_append_nvfp4_test
     ninfer_kv_cache_append_k8v4_test
-    PROPERTIES SKIP_RETURN_CODE 77)
+    PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 endif()
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
@@ -347,6 +371,10 @@ endif()
 ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
 if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
 ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
+else()
+ninfer_add_op_test(ninfer_linear_fp8_row_scale_sm70_test
+  SOURCES ops/linear/test_fp8_row_scale_sm70.cpp
+  LIBRARIES ninfer_ops)
 endif()
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
@@ -429,3 +457,33 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+
+# GPU tests outside the Op helper: device contracts and startup planning finish in minutes, while
+# the real-artifact tests load a 27B or 35B model several times.
+set(ninfer_gpu_contract_tests
+  ninfer_artifact_materialization_test
+  ninfer_device_test
+  ninfer_decode_graph_test
+  ninfer_arena_test
+  ninfer_kv_cache_test
+  ninfer_state_store_test
+  ninfer_qwen3_6_state_image_test
+  ninfer_qwen3_6_context_store_test
+  ninfer_qwen3_6_27b_load_plan_test
+  ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
+  ninfer_qwen3_6_27b_visual_scatter_test)
+set(ninfer_real_artifact_tests
+  ninfer_qwen3_6_27b_prefix_real_test
+  ninfer_qwen3_6_27b_dflash2_real_test
+  ninfer_qwen3_6_27b_score_real_test
+  ninfer_qwen3_6_27b_context_lookup_real_test
+  ninfer_qwen3_6_35b_a3b_real_test
+  ninfer_qwen3_6_35b_a3b_dflash_real_test)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  list(APPEND ninfer_gpu_contract_tests ninfer_qwen3_6_27b_numerics_plan_test)
+  list(APPEND ninfer_real_artifact_tests
+    ninfer_qwen3_6_27b_score_real_fp32_test
+    ninfer_qwen3_6_27b_residual_real_test)
+endif()
+set_tests_properties(${ninfer_gpu_contract_tests} PROPERTIES TIMEOUT 600)
+set_tests_properties(${ninfer_real_artifact_tests} PROPERTIES TIMEOUT 3600)

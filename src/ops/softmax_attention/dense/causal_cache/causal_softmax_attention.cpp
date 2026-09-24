@@ -271,16 +271,72 @@ struct SmallTWorkspace {
     Tensor l;
 };
 
+// The selection is an implementation-profile input of the op: every build validates it, and only
+// Volta builds have a wide prompt route for it to select.
+void require_prompt_kernel(PrefillAttentionKernel selection, const char* op) {
+    switch (selection) {
+    case PrefillAttentionKernel::Automatic:
+        return;
+    case PrefillAttentionKernel::SplitD:
+    case PrefillAttentionKernel::Flash:
+    case PrefillAttentionKernel::Reference:
 #ifdef NINFER_VOLTA_BUILD
-bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
-                                std::int32_t batch_size, KvCacheStorage cache_storage) {
+        return;
+#else
+        throw std::invalid_argument(std::string(op) +
+                                    ": a prompt kernel selection requires a Volta build");
+#endif
+    }
+    throw std::invalid_argument(std::string(op) + ": unknown prompt kernel selection");
+}
+
+#ifdef NINFER_VOLTA_BUILD
+} // namespace
+
+namespace detail {
+
+VoltaPromptKernel volta_prompt_staging_kernel(PrefillAttentionKernel selection,
+                                              std::int32_t q_heads, std::int32_t width,
+                                              std::int32_t batch_size, KvCacheStorage storage) {
     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
                                     q_heads == CausalD256H16Kv2::QHeads;
-    return supported_geometry && batch_size == 1 &&
-           (cache_storage == KvCacheStorage::BFloat16 ||
-            cache_storage == KvCacheStorage::Int8Group64) &&
-           width >= detail::kVoltaFlashMinimumWidth;
+    if (!supported_geometry || batch_size != 1 ||
+        (storage != KvCacheStorage::BFloat16 && storage != KvCacheStorage::Int8Group64) ||
+        width < kVoltaFlashMinimumWidth) {
+        return VoltaPromptKernel::Direct;
+    }
+    switch (selection) {
+    case PrefillAttentionKernel::Automatic:
+        // Split-D was measured (accuracy, KLD and throughput) on the 27B geometry only.
+        return q_heads == CausalD256H24Kv4::QHeads ? VoltaPromptKernel::SplitD
+                                                   : VoltaPromptKernel::Flash;
+    case PrefillAttentionKernel::SplitD:
+        return VoltaPromptKernel::SplitD;
+    case PrefillAttentionKernel::Flash:
+        return VoltaPromptKernel::Flash;
+    case PrefillAttentionKernel::Reference:
+        return VoltaPromptKernel::Direct;
+    }
+    throw std::invalid_argument("causal_softmax_attention: unknown prompt kernel selection");
 }
+
+VoltaPromptKernel volta_prompt_kernel(PrefillAttentionKernel selection, std::int32_t q_heads,
+                                      std::int32_t width, std::int32_t batch_size,
+                                      KvCacheStorage storage, bool masked,
+                                      CausalAttentionExecutionEnvelope envelope) {
+    if (masked) { return VoltaPromptKernel::Direct; }
+    const VoltaPromptKernel staging =
+        volta_prompt_staging_kernel(selection, q_heads, width, batch_size, storage);
+    if (staging == VoltaPromptKernel::SplitD &&
+        envelope.min_visible_keys != envelope.max_visible_keys) {
+        return VoltaPromptKernel::Direct;
+    }
+    return staging;
+}
+
+} // namespace detail
+
+namespace {
 
 struct VoltaFlashWorkspace {
     Tensor k_gathered;
@@ -291,19 +347,50 @@ struct VoltaFlashWorkspace {
     Tensor dst_meta;
 };
 
+struct VoltaSplitDWorkspace {
+    Tensor k_gathered;
+    Tensor v_gathered;
+    Tensor staged_q;
+    Tensor staged_out;
+    Tensor partials;
+};
+
+std::int32_t volta_kv_heads(std::int32_t q_heads) {
+    return q_heads == CausalD256H24Kv4::QHeads ? CausalD256H24Kv4::KVHeads
+                                               : CausalD256H16Kv2::KVHeads;
+}
+
+std::int32_t volta_gathered_keys(CausalAttentionExecutionEnvelope envelope) {
+    const auto visible = static_cast<std::int32_t>(envelope.max_visible_keys);
+    return ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
+           detail::kVoltaFlashKeyPad;
+}
+
+template <class Allocator>
+VoltaSplitDWorkspace allocate_volta_splitd_workspace(Allocator& workspace, std::int32_t q_heads,
+                                                     std::int32_t width,
+                                                     CausalAttentionExecutionEnvelope envelope) {
+    const std::int32_t kv_heads = volta_kv_heads(q_heads);
+    const std::int32_t n_kv     = volta_gathered_keys(envelope);
+    const detail::VoltaSplitDWorkspaceShape shape =
+        detail::causal_attention_volta_splitd_workspace_shape(q_heads, width);
+    return {
+        workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
+        workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
+        workspace.alloc(DType::FP16, {static_cast<std::int32_t>(shape.staged_q_halves), 1, 1, 1}),
+        workspace.alloc(DType::FP32, {static_cast<std::int32_t>(shape.output_floats), 1, 1, 1}),
+        workspace.alloc(DType::FP32, {static_cast<std::int32_t>(shape.partial_floats), 1, 1, 1}),
+    };
+}
+
 template <class Allocator>
 VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace,
                                                    std::int32_t q_heads,
                                                    std::int32_t width,
                                                    CausalAttentionExecutionEnvelope envelope) {
-    const std::int32_t kv_heads = q_heads == CausalD256H24Kv4::QHeads
-                                      ? CausalD256H24Kv4::KVHeads
-                                      : CausalD256H16Kv2::KVHeads;
-    const auto visible          = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const std::int32_t n_kv =
-        ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
-        detail::kVoltaFlashKeyPad;
-    const std::int32_t tokens = std::min(width, detail::kVoltaFlashQBlockTokens);
+    const std::int32_t kv_heads = volta_kv_heads(q_heads);
+    const std::int32_t n_kv     = volta_gathered_keys(envelope);
+    const std::int32_t tokens   = std::min(width, detail::kVoltaFlashQBlockTokens);
 
     return {
         workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
@@ -446,9 +533,10 @@ const char* causal_attention_route_name(CausalAttentionRoute route) {
 
 std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
-    CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_width,
-    std::int32_t max_width) {
+    CausalAttentionExecutionEnvelope envelope, PrefillAttentionKernel prompt_kernel,
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     require_causal_geometry(geometry, "causal_softmax_attention workspace");
+    require_prompt_kernel(prompt_kernel, "causal_softmax_attention workspace");
     const std::int32_t q_heads = geometry.query_heads;
     bool supported_dtype       = true;
     try {
@@ -475,10 +563,19 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
                                                    envelope);
         if (route == detail::CausalAttentionRoute::Prompt) {
 #ifdef NINFER_VOLTA_BUILD
-            if (volta_flash_route_possible(q_heads, width, batch_size, cache_storage)) {
-                WorkspaceLayoutBuilder layout;
+            // A split-D selection reserves its staging even when an inexact envelope sends the
+            // launch to the direct kernel, so its staged workspace alone bounds the route.
+            WorkspaceLayoutBuilder layout;
+            switch (detail::volta_prompt_staging_kernel(prompt_kernel, q_heads, width, batch_size,
+                                                        cache_storage)) {
+            case detail::VoltaPromptKernel::SplitD:
+                (void)allocate_volta_splitd_workspace(layout, q_heads, width, envelope);
+                return layout.peak_bytes(1);
+            case detail::VoltaPromptKernel::Flash:
                 (void)allocate_volta_flash_workspace(layout, q_heads, width, envelope);
                 return layout.peak_bytes(1);
+            case detail::VoltaPromptKernel::Direct:
+                break;
             }
 #endif
             return std::size_t{0};
@@ -527,11 +624,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
-                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                              CausalAttentionExecutionEnvelope envelope,
+                              PrefillAttentionKernel prompt_kernel, WorkspaceArena& workspace,
                               Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "causal_softmax_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        geometry, envelope, scale, op);
+    require_prompt_kernel(prompt_kernel, op);
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("causal_softmax_attention: k/v must be BF16");
     }
@@ -547,15 +646,39 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
 #ifdef NINFER_VOLTA_BUILD
-    if (route == detail::CausalAttentionRoute::Prompt && valid_columns.data == nullptr &&
-        volta_flash_route_possible(q.ne[1], width, batch, cache.storage)) {
-        VoltaFlashWorkspace staging =
-            allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
-        detail::causal_attention_volta_flash_launch(
-            q, k, v, positions, kv_table_rows, scale, cache, envelope,
-            detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered,
-            staging.mask, staging.q_f32, staging.out_f32, staging.dst_meta, out, stream);
-        return;
+    if (route == detail::CausalAttentionRoute::Prompt && valid_columns.data == nullptr) {
+        const detail::VoltaPromptKernel kernel = detail::volta_prompt_kernel(
+            prompt_kernel, q.ne[1], width, batch, cache.storage, false, envelope);
+        switch (detail::volta_prompt_staging_kernel(prompt_kernel, q.ne[1], width, batch,
+                                                    cache.storage)) {
+        case detail::VoltaPromptKernel::Flash: {
+            VoltaFlashWorkspace staging =
+                allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
+            detail::causal_attention_volta_flash_launch(
+                q, k, v, positions, kv_table_rows, scale, cache, envelope,
+                detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered,
+                staging.mask, staging.q_f32, staging.out_f32, staging.dst_meta, out, stream);
+            return;
+        }
+        case detail::VoltaPromptKernel::SplitD: {
+            // Split-D derives every row's causal limit from an exact envelope rather than from
+            // the positions; any other envelope runs the direct kernel below, which masks from
+            // them. The staging is reserved either way, so the high-water matches the capacity
+            // query, which covers every exact launch within the envelope.
+            VoltaSplitDWorkspace staging =
+                allocate_volta_splitd_workspace(workspace, q.ne[1], width, envelope);
+            if (kernel == detail::VoltaPromptKernel::SplitD) {
+                detail::causal_attention_volta_splitd_launch(
+                    q, k, v, positions, kv_table_rows, scale, cache, envelope,
+                    volta_kv_heads(q.ne[1]), staging.k_gathered, staging.v_gathered,
+                    staging.staged_q, staging.staged_out, staging.partials, out, stream);
+                return;
+            }
+            break;
+        }
+        case detail::VoltaPromptKernel::Direct:
+            break;
+        }
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows,

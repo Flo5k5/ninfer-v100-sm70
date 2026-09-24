@@ -174,9 +174,10 @@ void require_fp8_metadata(const Weight& table, const Tensor& out) {
     if (table.n != kVocabulary || table.k != kHidden || out.ne[0] != kHidden) {
         throw std::invalid_argument("embedding: unsupported FP8 table shape");
     }
-    if ((reinterpret_cast<std::uintptr_t>(out.data) &
-         (static_cast<std::uintptr_t>(alignof(std::uint32_t)) - 1)) != 0) {
-        throw std::invalid_argument("embedding: FP8 output must be 4-byte aligned");
+    const std::uintptr_t alignment = out.dtype == DType::FP32 ? alignof(float2)
+                                                               : alignof(std::uint32_t);
+    if ((reinterpret_cast<std::uintptr_t>(out.data) & (alignment - 1)) != 0) {
+        throw std::invalid_argument("embedding: FP8 output must be pair aligned");
     }
     (void)detail::validate_fp8_weight(table, "embedding");
 }
@@ -196,7 +197,10 @@ void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
 
 void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
     if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding: ids must be I32"); }
-    if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding: out must be BF16"); }
+    if (out.dtype != DType::BF16 &&
+        !(out.dtype == DType::FP32 && table.qtype == QType::FP8_E4M3FN_ROW_BF16S)) {
+        throw std::invalid_argument("embedding: out must be BF16 (or FP32 for an FP8 table)");
+    }
 
     (void)numel_allow_zero(ids, "ids");
     (void)numel_allow_zero(out, "out");

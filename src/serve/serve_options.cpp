@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/numerics_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -82,6 +83,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--lookup-policy off|fixed|adaptive] [--lookup-min-suffix N] "
            "[--lookup-max-proposal N] "
+           "[--text-residual bf16|fp32] [--prefill-attention auto|splitd|flash|reference] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--default-reasoning-effort LEVEL] [--reasoning-effort-alias FROM=TO] "
            "[--omitted-thinking-as-summarized] "
@@ -108,6 +110,10 @@ std::string serve_usage_text(const char* argv0) {
            "and previous_response_id are rejected, and stored-Response lookups return 404\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --text-residual fp32 keeps the residual stream in FP32 (Volta, "
+           "qwen3.8-27b/nvfp4, no DFlash)\n"
+           "       --prefill-attention selects the Volta wide prefill attention kernel "
+           "(default auto)\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -295,6 +301,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--text-residual") {
+            options.text_residual = product::parse_text_residual(require_value("--text-residual"));
+        } else if (arg == "--prefill-attention") {
+            options.prefill_attention =
+                product::parse_prefill_attention(require_value("--prefill-attention"));
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));

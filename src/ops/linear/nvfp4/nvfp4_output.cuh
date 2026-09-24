@@ -48,6 +48,17 @@ struct Nvfp4ResidualOutput {
     }
 };
 
+// The same fused residual update into an FP32 residual stream: one rounding, to FP32.
+struct Nvfp4ResidualOutputF32 {
+    float* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        data[static_cast<std::int64_t>(token) * rows + parent_row] += value;
+    }
+};
+
 // SwiGLU straight out of the QPN2 epilogue, for a gate/up weight prepacked with
 // QuantLayout::VoltaQpnPrepackedSwiGlu: every CTA's 32 columns are 16 gate features and the same
 // 16 up features, so the kernel hands both halves of a feature to store_pair and the fp32

@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/numerics_options.h"
 
 #include <charconv>
 #include <stdexcept>
@@ -37,7 +38,9 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--prefill-chunk N] [--scored-chunk N]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--text-residual bf16|fp32]\n"
+           "       [--prefill-attention auto|splitd|flash|reference] [--output <directory>]\n"
            "       [--logits-out <file> [--logits-reference <file>] [--chunks N]]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
@@ -85,10 +88,20 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
             stride_set = true;
+        } else if (option == "--prefill-chunk") {
+            out.prefill_chunk =
+                parse_integer<std::uint32_t>(value("--prefill-chunk"), "prefill chunk");
+        } else if (option == "--scored-chunk") {
+            out.scored_chunk =
+                parse_integer<std::uint32_t>(value("--scored-chunk"), "scored chunk");
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--kv-dtype") {
             out.kv = parse_kv_dtype(value("--kv-dtype"));
+        } else if (option == "--text-residual") {
+            out.text_residual = product::parse_text_residual(value("--text-residual"));
+        } else if (option == "--prefill-attention") {
+            out.prefill_attention = product::parse_prefill_attention(value("--prefill-attention"));
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
         } else if (option == "--logits-out") {
@@ -111,6 +124,12 @@ Options parse_options(int argc, char** argv) {
         usage_error("--logits-reference and --chunks require --logits-out");
     }
     if (out.chunks && *out.chunks == 0) { usage_error("--chunks must be positive"); }
+    if (out.prefill_chunk == 0 || out.prefill_chunk % 128 != 0) {
+        usage_error("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (out.scored_chunk > out.prefill_chunk) {
+        usage_error("--scored-chunk must not exceed --prefill-chunk");
+    }
     if (out.logits_out) {
         // The KLD window plan fixes the stride before the generic context/stride check.
         if (!out.text) { usage_error("--logits-out requires --text (one token stream)"); }

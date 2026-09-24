@@ -131,6 +131,60 @@ inline constexpr std::int32_t kVoltaFlashMinimumWidth = 64;
 inline constexpr std::int32_t kVoltaFlashMaskRowPad   = 64;
 inline constexpr std::int32_t kVoltaFlashKeyPad       = 256;
 
+inline constexpr std::int32_t kVoltaSplitDBlockRows       = 64;
+inline constexpr std::int32_t kVoltaSplitDKeySplitMinimum = 2048;
+
+// Kernel of a Volta causal prompt-route launch:
+//   Direct  the exact FP32 kernel (every storage, masked launches, the Reference selection);
+//   Flash   vendored llama.cpp MMA kernel, FP32 Q.K^T but FP16 P.V accumulators;
+//   SplitD  vendored Split-D kernel, FP32 Q.K^T and P.V accumulators.
+enum class VoltaPromptKernel : std::uint8_t { Direct, Flash, SplitD };
+
+// Staged kernel whose workspace a prompt-route width reserves: Flash or SplitD for a single
+// BF16/INT8 sequence of at least kVoltaFlashMinimumWidth columns on a registered geometry, unless
+// the selection is Reference; Direct otherwise. Automatic selects SplitD for 24 query heads (the
+// measured 27B geometry) and Flash for 16 (35B-A3B).
+VoltaPromptKernel volta_prompt_staging_kernel(PrefillAttentionKernel selection,
+                                              std::int32_t q_heads, std::int32_t width,
+                                              std::int32_t batch_size, KvCacheStorage storage);
+
+// Kernel that actually runs a prompt-route launch: the staging kernel, except that masked launches
+// run the direct kernel, and so does split-D under an inexact envelope, because it derives every
+// row's causal limit from the envelope instead of reading the positions. Test-visible.
+VoltaPromptKernel volta_prompt_kernel(PrefillAttentionKernel selection, std::int32_t q_heads,
+                                      std::int32_t width, std::int32_t batch_size,
+                                      KvCacheStorage storage, bool masked,
+                                      CausalAttentionExecutionEnvelope envelope);
+
+struct VoltaSplitDWorkspaceShape {
+    std::int64_t staged_q_halves;
+    std::int64_t output_floats;
+    std::int64_t partial_floats;
+};
+
+VoltaSplitDWorkspaceShape causal_attention_volta_splitd_workspace_shape(std::int32_t q_heads,
+                                                                        std::int32_t tokens);
+
+// Appends a prompt width's K/V to the paged cache and gathers the visible key range into
+// contiguous FP16 [key][kv_head][256] (dequantized for INT8, zero past the visible keys).
+void causal_attention_volta_stage_kv(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                     const Tensor& table_rows, PagedKVBatchLayerView cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     std::int32_t kv_heads, std::int32_t width, Tensor& k_gathered,
+                                     Tensor& v_gathered, cudaStream_t stream);
+
+// Split-D prompt attention. Precondition: an exact envelope (min == max visible keys) and
+// sequential positions, token t of the width at max_visible_keys - width + t; every row's causal
+// limit is derived from that layout rather than read from `positions`.
+void causal_attention_volta_splitd_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                          const Tensor& positions, const Tensor& table_rows,
+                                          float scale, PagedKVBatchLayerView cache,
+                                          CausalAttentionExecutionEnvelope envelope,
+                                          std::int32_t kv_heads, Tensor& k_gathered,
+                                          Tensor& v_gathered, Tensor& staged_q,
+                                          Tensor& staged_out, Tensor& partials, Tensor& out,
+                                          cudaStream_t stream);
+
 std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens);
 
 void causal_attention_volta_flash_launch(

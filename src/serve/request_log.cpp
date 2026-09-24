@@ -1,5 +1,6 @@
 #include "serve/request_log.h"
 #include "product/logging/pretty_format.h"
+#include "product/numerics_options.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
@@ -509,6 +510,9 @@ std::string format_server_start_json(
              {"prefill_chunk", engine_options.prefill_chunk},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             {"text_residual", product::text_residual_name(engine_options.text_residual)},
+             {"prefill_attention",
+              product::prefill_attention_name(engine_options.prefill_attention)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},

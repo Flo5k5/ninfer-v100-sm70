@@ -1,5 +1,6 @@
 #include "ninfer_bench_support.h"
 
+#include "product/numerics_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -298,6 +299,9 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
+        << "  --text-residual <bf16|fp32> text residual stream storage (default: bf16)\n"
+        << "  --prefill-attention <auto|splitd|flash|reference>  Volta wide prefill attention\n"
+        << "                              kernel (default: auto)\n"
         << "  --spec <none|mtp|dflash|dflash2>  speculative backend (default: none)\n"
         << "  --draft-tokens <n>          speculative draft window; range depends on --spec\n"
         << "  --lm-head-draft             use the optimized proposal head; requires --draft-tokens > 0\n"
@@ -351,6 +355,11 @@ BenchOptions parse_args(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
+        } else if (arg == "--text-residual") {
+            options.text_residual = product::parse_text_residual(value("--text-residual"));
+        } else if (arg == "--prefill-attention") {
+            options.prefill_attention =
+                product::parse_prefill_attention(value("--prefill-attention"));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
@@ -597,6 +606,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
         << " kv_cache=" << kv_cache_name(env.kv_cache)
+        << " text_residual=" << product::text_residual_name(env.text_residual)
+        << " prefill_attention=" << product::prefill_attention_name(env.prefill_attention)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_k=" << env.speculative.draft_tokens
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
@@ -704,6 +715,10 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
+        << "    \"text_residual\": \"" << product::text_residual_name(env.text_residual)
+        << "\",\n"
+        << "    \"prefill_attention\": \""
+        << product::prefill_attention_name(env.prefill_attention) << "\",\n"
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"
         << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"
@@ -774,7 +789,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
     std::ostringstream out;
     out << "label,kind,n_prompt,n_gen,target,weights_id,max_context,prefill_chunk,"
            "speculative_backend,draft_tokens,"
-           "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
+           "proposal_head,decode_path,kv_cache,text_residual,prefill_attention,kv_payload_bytes,"
+           "load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
            "cuda_graph_allowance_bytes,"
@@ -802,7 +818,10 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << env.speculative.draft_tokens << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative) << ','
-            << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
+            << kv_cache_name(env.kv_cache) << ','
+            << product::text_residual_name(env.text_residual) << ','
+            << product::prefill_attention_name(env.prefill_attention) << ','
+            << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
             << ','

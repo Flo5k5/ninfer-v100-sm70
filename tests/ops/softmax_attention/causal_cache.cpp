@@ -4,6 +4,9 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1668,13 +1671,31 @@ int verify_attention(const std::string& label, const std::vector<double>& actual
     return verify_reduction(label.c_str(), actual, reference, criterion);
 }
 
+const char* prompt_kernel_name(PrefillAttentionKernel kernel) {
+    switch (kernel) {
+    case PrefillAttentionKernel::Automatic:
+        return "auto";
+    case PrefillAttentionKernel::SplitD:
+        return "splitd";
+    case PrefillAttentionKernel::Flash:
+        return "flash";
+    case PrefillAttentionKernel::Reference:
+        return "reference";
+    }
+    return "unknown";
+}
+
 std::string case_label(const char* entry, const Geometry& geometry, KvCacheStorage storage,
-                       const AttentionCase& test_case, MappingPattern mapping) {
+                       const AttentionCase& test_case, MappingPattern mapping,
+                       PrefillAttentionKernel prompt_kernel = PrefillAttentionKernel::Automatic) {
     return std::string(entry) + " " + geometry.name + " " + cache_name(storage) +
            " mapping=" + mapping_name(mapping) + " T=" + std::to_string(test_case.tokens) +
            " keys=" + std::to_string(test_case.base + test_case.tokens) +
            " envelope_max=" + std::to_string(test_case.envelope_max) +
-           (test_case.graph_replay ? " graph-replay" : "");
+           (test_case.graph_replay ? " graph-replay" : "") +
+           (prompt_kernel == PrefillAttentionKernel::Automatic
+                ? std::string()
+                : std::string(" prompt_kernel=") + prompt_kernel_name(prompt_kernel));
 }
 
 template <class Launch>
@@ -1722,7 +1743,8 @@ void inject_codec_edges(const Geometry& geometry, std::int32_t tokens, std::vect
 }
 
 int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const AttentionCase& test_case,
-                MappingPattern mapping) {
+                MappingPattern mapping,
+                PrefillAttentionKernel prompt_kernel = PrefillAttentionKernel::Automatic) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -1776,7 +1798,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     Tensor ttable_row(dtable_row.data(), DType::I32, {1});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens);
+        op_geometry(geometry), storage, envelope, prompt_kernel, 1, test_case.tokens,
+        test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -1784,12 +1807,13 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         [&](cudaStream_t stream) {
             ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
                                           op_geometry(geometry), kAttentionScale,
-                                          cache.batch_view(), envelope, workspace, tout, stream);
+                                          cache.batch_view(), envelope, prompt_kernel, workspace,
+                                          tout, stream);
         },
         test_case.graph_replay);
 
-    const std::string label =
-        case_label("causal_softmax_attention", geometry, storage, test_case, mapping);
+    const std::string label = case_label("causal_softmax_attention", geometry, storage, test_case,
+                                         mapping, prompt_kernel);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
@@ -1820,6 +1844,40 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     failures += cache.verify_guards(label);
     return failures;
 }
+
+#ifdef NINFER_VOLTA_BUILD
+const char* volta_prompt_kernel_name(ops::detail::VoltaPromptKernel kernel) {
+    switch (kernel) {
+    case ops::detail::VoltaPromptKernel::Direct:
+        return "direct";
+    case ops::detail::VoltaPromptKernel::Flash:
+        return "flash";
+    case ops::detail::VoltaPromptKernel::SplitD:
+        return "splitd";
+    }
+    return "unknown";
+}
+
+// A wide prompt case under an explicit selection, checked for the kernel that executes it.
+int run_prompt_kernel_case(const Geometry& geometry, KvCacheStorage storage,
+                           const AttentionCase& test_case, MappingPattern mapping,
+                           PrefillAttentionKernel selection,
+                           ops::detail::VoltaPromptKernel expected) {
+    const ops::CausalAttentionExecutionEnvelope envelope{
+        static_cast<std::uint32_t>(test_case.base + test_case.tokens), test_case.envelope_max};
+    const ops::detail::VoltaPromptKernel kernel = ops::detail::volta_prompt_kernel(
+        selection, geometry.q_heads, test_case.tokens, 1, storage, false, envelope);
+    int failures = 0;
+    if (kernel != expected) {
+        std::cerr << case_label("causal_softmax_attention", geometry, storage, test_case, mapping,
+                                selection)
+                  << ": runs the " << volta_prompt_kernel_name(kernel) << " kernel, expected "
+                  << volta_prompt_kernel_name(expected) << '\n';
+        ++failures;
+    }
+    return failures + run_a1_case(geometry, storage, test_case, mapping, selection);
+}
+#endif
 
 int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const AttentionCase& test_case,
                 MappingPattern mapping) {
@@ -1856,7 +1914,8 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     Tensor tp(dp.data(), DType::I32, {test_case.tokens});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens);
+        op_geometry(geometry), storage, envelope, PrefillAttentionKernel::Automatic, 1,
+        test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -1921,7 +1980,8 @@ int run_width_invariance_case(const Geometry& geometry, KvCacheStorage storage,
         Tensor tp(dp.data(), DType::I32, {width});
         Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width});
         const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-            op_geometry(geometry), storage, envelope, 1, width, width);
+            op_geometry(geometry), storage, envelope, PrefillAttentionKernel::Automatic, 1, width,
+            width);
         GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
         WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
         launch_attention_case(
@@ -2037,7 +2097,8 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
         tlanes(dlanes.data(), DType::I32, {batch});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
     const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, batch, width, width);
+        op_geometry(geometry), storage, envelope, PrefillAttentionKernel::Automatic, batch, width,
+        width);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
     WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
     DeviceContext device;
@@ -2047,7 +2108,8 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     const auto launch = [&] {
         ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
                                       op_geometry(geometry), kAttentionScale, cache.view(),
-                                      envelope, workspace, tout, device.stream);
+                                      envelope, PrefillAttentionKernel::Automatic, workspace, tout,
+                                      device.stream);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -2371,6 +2433,64 @@ int run_batch_cases() {
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Int8Group64,
                             {6, 9000, 16384, 528u, false, true, 36.0f}, MappingPattern::Fragmented);
 #ifdef NINFER_VOLTA_BUILD
+    // Wide prompts take a staged tensor-core prefill route, selected per call. Every selection runs
+    // the wide cases and names the kernel that must execute each one: the direct kernel meets the
+    // same criterion, so only the selection shows that a staged kernel ran.
+    using ops::detail::VoltaPromptKernel;
+    for (const PrefillAttentionKernel selection :
+         {PrefillAttentionKernel::SplitD, PrefillAttentionKernel::Flash,
+          PrefillAttentionKernel::Reference}) {
+        const VoltaPromptKernel staged = selection == PrefillAttentionKernel::SplitD
+                                             ? VoltaPromptKernel::SplitD
+                                         : selection == PrefillAttentionKernel::Flash
+                                             ? VoltaPromptKernel::Flash
+                                             : VoltaPromptKernel::Direct;
+        // Near-uniform attention over a long prefix is the worst case for P.V accumulation: every
+        // key carries weight, so an FP16 accumulator both grows with the key count and drops the
+        // contributions below its half-ulp. The route must hold the same FP64-oracle criterion as
+        // the short cases. The flash kernel keeps FP16 P.V accumulators and exceeds it here
+        // (relative L2 about 1.1x the limit at 16k keys), which is why it is not the 27B default;
+        // it skips these four cases.
+        if (selection != PrefillAttentionKernel::Flash) {
+            failures += run_prompt_kernel_case(kGeometries[0], KvCacheStorage::BFloat16,
+                                               {64, 16320, 16384, 540u}, MappingPattern::Fragmented,
+                                               selection, staged);
+            failures += run_prompt_kernel_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                                               {96, 16288, 16384, 541u}, MappingPattern::Identity,
+                                               selection, staged);
+            failures += run_prompt_kernel_case(
+                kGeometries[0], KvCacheStorage::Int8Group64,
+                {64, 16320, 16384, 542u, false, false, 36.0f}, MappingPattern::Fragmented,
+                selection, staged);
+            failures += run_prompt_kernel_case(kGeometries[1], KvCacheStorage::Int8Group64,
+                                               {64, 16320, 16384, 543u}, MappingPattern::Fragmented,
+                                               selection, staged);
+        }
+        // Several Q-blocks, a width that is not a multiple of the 64-row tile, and a prefix too
+        // short for the three-way key split, on both geometries.
+        failures += run_prompt_kernel_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                                           {1100, 100, 1200, 544u}, MappingPattern::Fragmented,
+                                           selection, staged);
+        failures += run_prompt_kernel_case(kGeometries[0], KvCacheStorage::BFloat16,
+                                           {130, 0, 130, 545u}, MappingPattern::Identity, selection,
+                                           staged);
+        failures += run_prompt_kernel_case(kGeometries[1], KvCacheStorage::BFloat16,
+                                           {130, 0, 130, 549u}, MappingPattern::Offset, selection,
+                                           staged);
+        // An inexact envelope (more visible keys promised than the prompt reaches): split-D derives
+        // its causal limits from an exact envelope, so this width runs the direct kernel.
+        failures += run_prompt_kernel_case(
+            kGeometries[0], KvCacheStorage::Int8Group64, {96, 400, 2048, 546u},
+            MappingPattern::Fragmented, selection,
+            selection == PrefillAttentionKernel::SplitD ? VoltaPromptKernel::Direct : staged);
+    }
+    // The automatic selection is split-D on the measured 27B geometry and flash on 35B-A3B.
+    failures += run_prompt_kernel_case(
+        kGeometries[0], KvCacheStorage::Int8Group64, {130, 0, 130, 547u},
+        MappingPattern::Identity, PrefillAttentionKernel::Automatic, VoltaPromptKernel::SplitD);
+    failures += run_prompt_kernel_case(
+        kGeometries[1], KvCacheStorage::Int8Group64, {130, 0, 130, 548u},
+        MappingPattern::Identity, PrefillAttentionKernel::Automatic, VoltaPromptKernel::Flash);
     failures +=
         run_width_invariance_case(kGeometries[0], KvCacheStorage::Int8Group64, 9000, 8, 530u);
     failures +=
@@ -2544,11 +2664,12 @@ int verify_workspace_capacity_contract() {
         constexpr ops::CausalAttentionExecutionEnvelope envelope{1, 1025};
         constexpr ops::AttentionHeadGeometry geometry{kHeadDim, 16, 2};
         const std::size_t interval = ops::causal_softmax_attention_workspace_capacity_bytes(
-            geometry, storage, envelope, 1, 1, 17);
+            geometry, storage, envelope, PrefillAttentionKernel::Automatic, 1, 1, 17);
         std::size_t witness = 0;
         for (std::int32_t tokens = 1; tokens <= 17; ++tokens) {
             witness = std::max(witness, ops::causal_softmax_attention_workspace_capacity_bytes(
-                                            geometry, storage, envelope, 1, tokens, tokens));
+                                            geometry, storage, envelope,
+                                            PrefillAttentionKernel::Automatic, 1, tokens, tokens));
         }
         if (interval != witness) {
             std::cerr << "causal_softmax_attention interval capacity has no exact route witness\n";
@@ -2558,7 +2679,8 @@ int verify_workspace_capacity_contract() {
     try {
         (void)ops::causal_softmax_attention_workspace_capacity_bytes(
             {kHeadDim, 16, 2}, KvCacheStorage::BFloat16,
-            {1, ops::kCausalAttentionMaximumVisibleKeys}, 1, 1, 1);
+            {1, ops::kCausalAttentionMaximumVisibleKeys}, PrefillAttentionKernel::Automatic, 1, 1,
+            1);
     } catch (const std::invalid_argument&) {
         std::cerr << "causal_softmax_attention rejected its maximum visible-key envelope\n";
         ++failures;
@@ -2566,10 +2688,46 @@ int verify_workspace_capacity_contract() {
     try {
         (void)ops::causal_softmax_attention_workspace_capacity_bytes(
             {kHeadDim, 16, 2}, KvCacheStorage::BFloat16,
-            {1, ops::kCausalAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
+            {1, ops::kCausalAttentionMaximumVisibleKeys + 1}, PrefillAttentionKernel::Automatic, 1,
+            1, 1);
         std::cerr << "causal_softmax_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+    const auto rejects_selection = [&](PrefillAttentionKernel selection) {
+        try {
+            (void)ops::causal_softmax_attention_workspace_capacity_bytes(
+                {kHeadDim, 24, 4}, KvCacheStorage::Int8Group64, {1, 4096}, selection, 1, 1, 128);
+            return false;
+        } catch (const std::invalid_argument&) { return true; }
+    };
+    if (!rejects_selection(static_cast<PrefillAttentionKernel>(9))) {
+        std::cerr << "causal_softmax_attention accepted an unknown prompt kernel\n";
+        ++failures;
+    }
+#ifdef NINFER_VOLTA_BUILD
+    // The wide prompt widths reserve the selected kernel's staging, and the direct kernel none.
+    const auto wide_capacity = [](PrefillAttentionKernel selection) {
+        return ops::causal_softmax_attention_workspace_capacity_bytes(
+            {kHeadDim, 24, 4}, KvCacheStorage::Int8Group64, {1, 4096}, selection, 1, 64, 2048);
+    };
+    if (wide_capacity(PrefillAttentionKernel::Reference) != 0 ||
+        wide_capacity(PrefillAttentionKernel::SplitD) == 0 ||
+        wide_capacity(PrefillAttentionKernel::Flash) == 0 ||
+        wide_capacity(PrefillAttentionKernel::Automatic) !=
+            wide_capacity(PrefillAttentionKernel::SplitD)) {
+        std::cerr << "causal_softmax_attention wide prompt capacity does not follow the kernel\n";
+        ++failures;
+    }
+#else
+    for (const PrefillAttentionKernel selection :
+         {PrefillAttentionKernel::SplitD, PrefillAttentionKernel::Flash,
+          PrefillAttentionKernel::Reference}) {
+        if (!rejects_selection(selection)) {
+            std::cerr << "causal_softmax_attention accepted a Volta prompt kernel selection\n";
+            ++failures;
+        }
+    }
+#endif
     return failures;
 }
 

@@ -10,6 +10,7 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -22,10 +23,11 @@ inline constexpr std::int32_t kEmbedGatherW8D              = 2048;
 inline constexpr std::int32_t kEmbedGatherW8Groups         = kEmbedGatherW8D / kEmbedGatherW8Group;
 inline constexpr std::int32_t kEmbedGatherFp8D             = 5120;
 
-template <int BlocksPerToken, int Threads>
+// `Out` is BF16, or FP32 for an FP32 residual stream (the exact code * scale product).
+template <int BlocksPerToken, int Threads, class Out = __nv_bfloat16>
 __launch_bounds__(Threads) __global__
     void embed_gather_fp8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                 const __nv_bfloat16* scales, __nv_bfloat16* out) {
+                                 const __nv_bfloat16* scales, Out* out) {
     static_assert(kEmbedGatherFp8D % BlocksPerToken == 0);
     constexpr int kValuesPerBlock = kEmbedGatherFp8D / BlocksPerToken;
     static_assert(kValuesPerBlock % 4 == 0);
@@ -48,8 +50,13 @@ __launch_bounds__(Threads) __global__
             __nv_fp8x2_e4m3 values;
             values.__x           = static_cast<std::uint16_t>(word >> (pair * 16));
             const float2 decoded = static_cast<float2>(values);
-            reinterpret_cast<__nv_bfloat162*>(output_column + offset + pair * 2)[0] =
-                __floats2bfloat162_rn(decoded.x * scale, decoded.y * scale);
+            if constexpr (std::is_same_v<Out, float>) {
+                reinterpret_cast<float2*>(output_column + offset + pair * 2)[0] =
+                    make_float2(decoded.x * scale, decoded.y * scale);
+            } else {
+                reinterpret_cast<__nv_bfloat162*>(output_column + offset + pair * 2)[0] =
+                    __floats2bfloat162_rn(decoded.x * scale, decoded.y * scale);
+            }
         }
     }
 }
