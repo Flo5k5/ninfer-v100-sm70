@@ -31,6 +31,12 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
 [[nodiscard]] bool nvfp4_linear_add_fp16_activation_supported(const Weight& weight,
                                                               LinearPolicy policy,
                                                               std::int32_t tokens);
+// True when the resolved route accepts an FP32 residual: the Volta linear-then-add route, whose
+// QPN epilogue (T <= 32) and CUTLASS GEMM (T >= 33) update it from FP32 accumulators with one
+// rounding. The W4A4 route writes BF16 and does not.
+[[nodiscard]] bool nvfp4_linear_add_fp32_residual_supported(const Weight& weight,
+                                                            LinearPolicy policy,
+                                                            std::int32_t tokens);
 #endif
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
