@@ -7,7 +7,6 @@
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
 #include "ninfer_bench_common.h"
-#include "ops/softmax_attention/sliding_window/launch.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
@@ -65,10 +64,6 @@ struct Result {
     std::int32_t batch;
     std::int32_t context;
     std::int32_t envelope_max;
-    std::int32_t key_block;
-    std::int32_t reduce_warps;
-    ops::detail::SlidingWindowAttentionRoute route;
-    std::int32_t split_capacity;
     std::size_t graph_nodes;
     int graph_calls;
     Execution execution;
@@ -353,16 +348,14 @@ void report(const Result& result) {
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
     std::printf("entry=sliding_window execution=%-5s cache=%-4s W=%d T=%2d B=%d L=%6d "
-                "max_L=%d key_block=%d reduce_warps=%d route=%s splits=%d graph_nodes=%zu "
-                "graph_calls=%d workspace=%8zu "
+                "max_L=%d graph_nodes=%zu graph_calls=%d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us "
                 "useful=%8.1f GB/s (%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
                 execution_name(result.execution), cache_name(result.cache), result.window,
-                result.tokens, result.batch, result.context, result.envelope_max, result.key_block,
-                result.reduce_warps, ops::detail::sliding_window_attention_route_name(result.route),
-                result.split_capacity, result.graph_nodes, result.graph_calls,
-                result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
+                result.tokens, result.batch, result.context, result.envelope_max,
+                result.graph_nodes, result.graph_calls, result.workspace_bytes,
+                result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
+                gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
                 tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
 }
 
@@ -372,19 +365,16 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
-    output << "entry,execution,cache,window,T,B,context,envelope_max,key_block,reduce_warps,route,"
-              "split_capacity,graph_nodes,graph_calls,"
+    output << "entry,execution,cache,window,T,B,context,envelope_max,graph_nodes,graph_calls,"
               "workspace_bytes,useful_bytes,useful_flops,median_us,min_us,p95_us\n";
     for (const Result& result : results) {
         output << "sliding_window," << execution_name(result.execution) << ','
                << cache_name(result.cache) << ',' << result.window << ',' << result.tokens << ','
                << result.batch << ',' << result.context << ',' << result.envelope_max << ','
-               << result.key_block << ',' << result.reduce_warps << ','
-               << ops::detail::sliding_window_attention_route_name(result.route) << ','
-               << result.split_capacity << ',' << result.graph_nodes << ',' << result.graph_calls
-               << ',' << result.workspace_bytes << ',' << result.useful_bytes << ','
-               << result.useful_flops << ',' << result.timing.median_us << ','
-               << result.timing.min_us << ',' << result.timing.p95_us << '\n';
+               << result.graph_nodes << ',' << result.graph_calls << ',' << result.workspace_bytes
+               << ',' << result.useful_bytes << ',' << result.useful_flops << ','
+               << result.timing.median_us << ',' << result.timing.min_us << ','
+               << result.timing.p95_us << '\n';
     }
 }
 
@@ -447,10 +437,6 @@ int main(int argc, char** argv) {
                 for (const std::int32_t batch : options.batches) {
                     const int maximum = options.envelope_max < 0 ? context : options.envelope_max;
                     Case data(options.window, tokens, batch, context, maximum);
-                    const ops::SlidingWindowAttentionExecutionEnvelope envelope{
-                        0, static_cast<std::uint32_t>(maximum)};
-                    const auto plan = ops::detail::sliding_window_attention_resolve_plan(
-                        static_cast<std::uint32_t>(options.window), tokens, batch, envelope);
                     bench::TimedGraph graph;
                     if (options.execution != Execution::Eager) {
                         data.launch(stream);
@@ -478,10 +464,6 @@ int main(int argc, char** argv) {
                                 batch,
                                 context,
                                 maximum,
-                                plan.key_block,
-                                plan.reduce_warps,
-                                plan.route,
-                                plan.split_capacity,
                                 execution == Execution::Graph ? graph.nodes() : 0,
                                 options.graph_calls,
                                 execution,
