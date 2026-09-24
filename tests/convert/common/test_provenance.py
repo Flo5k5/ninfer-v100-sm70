@@ -1,10 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+from pathlib import Path
 
 import pytest
 
-from tools.convert.common.provenance import input_label, is_local_path, strip_local_paths
+from tools.convert.common.provenance import (
+    file_record,
+    input_label,
+    is_local_path,
+    local_name,
+    strip_local_paths,
+)
+
+from ..path_fragments import assert_no_path_fragments
 
 
 # Values an older tool could have written where a repository id or artifact id was expected --
@@ -33,6 +44,15 @@ NON_PATH_LABELS = [
     "qwen3_8_27b_nvfp4",
     "base.ninfer",
     "org/name-v1.2",
+]
+
+# Paths a converter receives for an input or output, and the name it records for each instead.
+NAMED_PATHS = [
+    ("out/qwen3_8_27b.ninfer", "qwen3_8_27b.ninfer"),
+    ("/data/models/Qwen3.8-27B/", "Qwen3.8-27B"),
+    ("~/models/Qwen3.8-27B-DFlash2", "Qwen3.8-27B-DFlash2"),
+    ("models/Qwen3.8-27B/base-hf-bf16/..", "Qwen3.8-27B"),
+    ("models/./base-hf-bf16", "base-hf-bf16"),
 ]
 
 
@@ -91,3 +111,39 @@ def test_strip_local_paths_keeps_repository_ids_and_artifact_ids() -> None:
     stripped, removed = strip_local_paths(provenance)
     assert stripped == provenance
     assert removed == []
+
+
+@pytest.mark.parametrize(("path", "name"), NAMED_PATHS)
+def test_local_name_records_the_last_component_only(path: str, name: str) -> None:
+    assert local_name(path) == local_name(Path(path)) == name
+    assert not is_local_path(name)
+
+
+def test_local_name_names_the_directory_a_dot_component_denotes(tmp_path, monkeypatch) -> None:
+    # A bare "." or ".." names no file of its own (Path.name gives "" and ".."): record the name
+    # of the directory it stands for.
+    working = tmp_path / "checkpoints" / "Qwen3.8-27B"
+    working.mkdir(parents=True)
+    monkeypatch.chdir(working)
+    assert local_name(".") == "Qwen3.8-27B"
+    assert local_name("..") == "checkpoints"
+
+
+def test_local_name_refuses_a_path_without_a_name() -> None:
+    with pytest.raises(ValueError, match="no file or directory name"):
+        local_name("/")
+
+
+def test_file_record_names_the_file_and_digests_its_contents(tmp_path) -> None:
+    data = bytes(range(256)) * 1024
+    path = tmp_path / "fixtures" / "ranking.train.counts.i64"
+    path.parent.mkdir()
+    path.write_bytes(data)
+
+    record = file_record(path)
+
+    assert record == {
+        "name": "ranking.train.counts.i64",
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    assert_no_path_fragments(json.dumps(record), tmp_path)

@@ -112,17 +112,19 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
         source_shard_count=1,
         source_dtype_counts={"BF16": 1},
     )
+    ranking = tmp_path / "ranking.i64"
+    ranking.write_bytes(bytes(8))
     report = convert.build_conversion_report(
         model_dir=tmp_path / "model",
         out_path=path,
-        arguments={"model": "model", "out": str(path), "device": "cpu"},
+        requested_device="cpu",
         config_summary={"text": {"hidden_size": 4}},
         source_preflight=source,
         objects=plan_objects(artifact_specs),
         elapsed_seconds=0.5,
         final_bytes=path.stat().st_size,
         device=torch.device("cpu"),
-        ranking_path=tmp_path / "ranking.i64",
+        ranking_path=ranking,
         revision="test-revision",
         environment={"python": "test", "torch": "test", "device": "cpu"},
     )
@@ -132,7 +134,6 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
     }
     assert report["target_key"] == inventory.TARGET_KEY
     assert report["recipe_id"] == convert.RECIPE_ID
-    assert report["source"]["model_path"].endswith("/model")
     assert report["arguments"]["device"] == "cpu"
     assert report["source_preflight"] == {
         "recipes": 2,

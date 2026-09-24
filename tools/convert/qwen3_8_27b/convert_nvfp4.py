@@ -30,6 +30,7 @@ from tools.artifact.layouts import (
     encode_fp8_row_scaled,
     encode_nvfp4,
 )
+from tools.convert.common import provenance
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
@@ -304,11 +305,11 @@ def _materialize_official(
     return tensor
 
 
-def _build_report(
+def build_conversion_report(
     *,
     preflight: ConversionPreflight,
     output: Path,
-    arguments: Mapping[str, object],
+    requested_device: str,
     objects: Sequence[ArtifactObject],
     elapsed_seconds: float,
     final_bytes: int,
@@ -320,9 +321,31 @@ def _build_report(
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
-        model_dir=preflight.official_dir,
+        sources={
+            "official": {
+                "repository": recipe.BASE_REPOSITORY,
+                "revision": recipe.BASE_REVISION,
+                "name": provenance.local_name(preflight.official_dir),
+            },
+            "quantized": {
+                "repository": recipe.QUANTIZED_REPOSITORY,
+                "revision": recipe.QUANTIZED_REVISION,
+                "name": provenance.local_name(preflight.quantized_dir),
+            },
+            "dflash2": {
+                "repository": dflash2_recipe.REPOSITORY,
+                "revision": dflash2_recipe.REVISION,
+                "name": provenance.local_name(preflight.dflash2_model_dir),
+            },
+        },
         out_path=output,
-        arguments=arguments,
+        arguments={
+            "model": provenance.local_name(preflight.official_dir),
+            "quantized_model": provenance.local_name(preflight.quantized_dir),
+            "dflash2_model": provenance.local_name(preflight.dflash2_model_dir),
+            "out": provenance.local_name(output),
+            "device": requested_device,
+        },
         config_summary={
             "base": preflight.base_config_summary,
             "dflash2": preflight.dflash2_config_summary,
@@ -334,24 +357,6 @@ def _build_report(
         device=device,
         ranking_path=ranking,
     )
-    report["source"] = {
-        "official": {
-            "repository": recipe.BASE_REPOSITORY,
-            "revision": recipe.BASE_REVISION,
-            "model_path": str(preflight.official_dir.resolve()),
-        },
-        "quantized": {
-            "repository": recipe.QUANTIZED_REPOSITORY,
-            "revision": recipe.QUANTIZED_REVISION,
-            "model_path": str(preflight.quantized_dir.resolve()),
-        },
-        "dflash2": {
-            "repository": dflash2_recipe.REPOSITORY,
-            "revision": dflash2_recipe.REVISION,
-            "model_path": str(preflight.dflash2_model_dir.resolve()),
-        },
-        "ranking_path": str(ranking.resolve()),
-    }
     report["source_preflight"] = {
         "official": {
             "recipes": preflight.official_source.recipe_count,
@@ -484,17 +489,10 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    arguments = {
-        "model": str(official_dir),
-        "quantized_model": str(quantized_dir),
-        "dflash2_model": str(dflash2_model_dir),
-        "out": str(out_path),
-        "device": requested_device,
-    }
-    report = _build_report(
+    report = build_conversion_report(
         preflight=preflight,
         output=output,
-        arguments=arguments,
+        requested_device=requested_device,
         objects=preflight.object_plan.objects,
         elapsed_seconds=elapsed,
         final_bytes=final_bytes,

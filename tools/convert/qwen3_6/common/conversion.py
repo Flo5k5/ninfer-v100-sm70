@@ -28,6 +28,7 @@ from tools.artifact.container import (
     plan_objects,
 )
 from tools.artifact.layouts import align_up, encode_direct, encoded_size
+from tools.convert.common import provenance
 from tools.convert.common.quantize import quantize_and_encode
 
 from .inventory import DIRECT_FORMATS, ResourceSpec, StoredObjectSpec, TensorSpec
@@ -190,7 +191,7 @@ def build_conversion_report(
     target_key: str,
     recipe_id: str,
     repo_root: str | Path,
-    model_dir: str | Path,
+    sources: Mapping[str, Mapping[str, object]],
     out_path: str | Path,
     arguments: Mapping[str, object],
     config_summary: Mapping[str, object],
@@ -203,7 +204,12 @@ def build_conversion_report(
     revision: str | None = None,
     environment_summary: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Build the shared report envelope without defining target validity."""
+    """Build the shared report envelope without defining target validity.
+
+    The report travels apart from the machine that wrote it, so it records no local path:
+    ``sources`` and ``arguments`` arrive path-free from the target, the ranking is recorded by
+    name and SHA-256 digest, and the artifact by name.
+    """
 
     return {
         "identity": {
@@ -213,8 +219,8 @@ def build_conversion_report(
         "target_key": target_key,
         "recipe_id": recipe_id,
         "source": {
-            "model_path": str(Path(model_dir).resolve()),
-            "ranking_path": str(Path(ranking_path).resolve()),
+            **{role: dict(record) for role, record in sources.items()},
+            "ranking": provenance.file_record(ranking_path),
         },
         "arguments": dict(arguments),
         "config_summary": dict(config_summary),
@@ -237,7 +243,7 @@ def build_conversion_report(
         "objects": object_statistics(objects),
         "elapsed_seconds": elapsed_seconds,
         "artifact": {
-            "path": str(Path(out_path)),
+            "name": provenance.local_name(out_path),
             "bytes": final_bytes,
         },
     }
