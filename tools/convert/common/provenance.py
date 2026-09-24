@@ -47,9 +47,13 @@ def local_name(path: str | Path) -> str:
 def file_record(path: str | Path) -> dict[str, str]:
     """Record of a local input file: its name and the SHA-256 digest of its contents."""
 
+    # A chunked loop rather than hashlib.file_digest, which needs Python 3.11: the conversion
+    # hosts still run Python 3.10.
+    digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
-        digest = hashlib.file_digest(handle, "sha256").hexdigest()
-    return {"name": local_name(path), "sha256": digest}
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return {"name": local_name(path), "sha256": digest.hexdigest()}
 
 
 def input_label(value: str) -> str:
