@@ -806,7 +806,7 @@ enum spellings or private kernel layout. The retained codec and encoder evidence
 - exact representative BF16, FP32, and I32 word round trips, including signed zeros, subnormals, NaN
   payload bits, and integer extrema, plus rejection of implicit cross-type encoding;
 - Q4, Q5, Q6, and W8 plane bit order, legal interval endpoints, encoded-size geometry, partial-K zero
-  padding, consecutive row views, and arbitrary row gathers;
+  padding, and consecutive row views;
 - all 16 E2M1 words, all 256 E4M3FN words, NVFP4 scale/divisor validity, the exact divisor-based
   reconstruction equation, and known block-scale swizzle offsets;
 - finite E4M3FN weight-code validity, BF16 row-scale validity, signed-zero rows, exact code/scale
