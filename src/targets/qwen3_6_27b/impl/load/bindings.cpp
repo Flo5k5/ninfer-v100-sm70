@@ -87,8 +87,9 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
         {static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns)},
         artifact::TensorPlacement::Device);
 
-    // v3 : le diviseur de poids est le mot FP32 en queue d'objet (lu seul, sans rapatrier les
-    // 100 Mo du poids côté hôte) ; le diviseur d'entrée est l'auxiliaire du Use v3.
+    // v3: the weight divisor is the FP32 word at the end of the object, read on its own without
+    // copying the whole weight (up to ~100 MB) to the host. The input divisor is the auxiliary of
+    // the v3 Use.
     const artifact::ObjectHandle input_divisor =
         artifact::bind_tensor(binder, input_divisor_name, NumericFormat::FP32, {},
                               artifact::TensorPlacement::Host);
@@ -123,8 +124,8 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
     }
     (void)prepack_for_qpn;
 
-    // v3 : le parent device porte déjà le diviseur de poids lu par le matérialiseur ; on
-    // vérifie qu'il est celui validé au binding avant de le laisser sortir vers le kernel.
+    // v3: the device parent already carries the weight divisor read by the materializer. Check
+    // that it is the one validated at binding before the weight reaches a kernel.
     Weight out = artifact::materialized_nvfp4_weight(
         materialized, plan.object, rows, columns,
         std::bit_cast<float>(plan.input_scale_divisor_bits));
