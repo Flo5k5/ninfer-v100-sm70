@@ -56,11 +56,30 @@ std::string canonical_v3_name(std::string_view name) {
         replace_all(out, "/norm2/", "/norm2_");
         replace_all(out, "/norm/", "/norm_");
     }
+    constexpr std::string_view kSharedDown = "/moe/shared_down";
+    if (out.ends_with(kSharedDown)) {
+        out.replace(out.size() - kSharedDown.size(), kSharedDown.size(), "/moe/shared/down");
+    }
+    return out;
+}
+
+// Routed experts of each Qwen3.6-35B-A3B MoE block. A v2 routed parent is expert-major
+// (docs/maintainer/qwen3.6-35b-a3b-artifact.md, section 9.2): every role of expert 0, then every
+// role of expert 1, and so on.
+constexpr std::size_t kRoutedExperts = 256;
+
+std::vector<std::string> routed_expert_leaves(std::initializer_list<std::string_view> roles) {
+    std::vector<std::string> out;
+    out.reserve(kRoutedExperts * roles.size());
+    for (std::size_t expert = 0; expert < kRoutedExperts; ++expert) {
+        const std::string prefix = "experts/" + std::to_string(expert) + "/";
+        for (const auto role : roles) { out.push_back(prefix + std::string(role)); }
+    }
     return out;
 }
 
 // Un tenseur fusionné v2 = la concaténation, dans cet ordre, de ces feuilles v3.
-std::vector<std::string_view> fused_leaves(std::string_view suffix) {
+std::vector<std::string> fused_leaves(std::string_view suffix) {
     if (suffix == "query_key_gate_value") { return {"query", "key", "gate", "value"}; }
     if (suffix == "query_key_value_z") { return {"query", "key", "value", "z"}; }
     if (suffix == "query_key_value") { return {"query", "key", "value"}; }
@@ -71,6 +90,11 @@ std::vector<std::string_view> fused_leaves(std::string_view suffix) {
     if (suffix == "a_b_projection") { return {"a_projection", "b_projection"}; }
     if (suffix == "qkv") { return {"query", "key", "value"}; }
     if (suffix == "qkv_bias") { return {"query_bias", "key_bias", "value_bias"}; }
+    // MoE: router rows, then the shared-expert score row; shared gate rows, then shared up rows.
+    if (suffix == "router_shared_gate") { return {"router", "shared_score"}; }
+    if (suffix == "shared_gate_up") { return {"shared/gate", "shared/up"}; }
+    if (suffix == "routed_gate_up") { return routed_expert_leaves({"gate", "up"}); }
+    if (suffix == "routed_down") { return routed_expert_leaves({"down"}); }
     return {};
 }
 
@@ -79,13 +103,9 @@ std::vector<std::string> logical_names(const Directory& directory, std::string_v
     if (directory.bindings.contains(v3_name)) { return {std::string(v3_name)}; }
     const auto slash = v3_name.rfind('/');
     if (slash == std::string_view::npos) { return {}; }
-    const auto leaves = fused_leaves(v3_name.substr(slash + 1));
-    std::vector<std::string> out;
-    out.reserve(leaves.size());
-    for (const auto leaf : leaves) {
-        out.emplace_back(std::string(v3_name.substr(0, slash + 1)) + std::string(leaf));
-    }
-    return out;
+    auto leaves = fused_leaves(v3_name.substr(slash + 1));
+    for (auto& leaf : leaves) { leaf.insert(0, v3_name.substr(0, slash + 1)); }
+    return leaves;
 }
 
 std::uint64_t object_elements(const Directory& directory, ObjectHandle handle) {
