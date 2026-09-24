@@ -57,9 +57,10 @@ Fp8GdnConvPlan b1_a16_plan(std::int32_t width) {
 bool materialized(Fp8GdnConvPlan plan) { return plan.schedule != Fp8GdnConvScheduleId::FusedA16; }
 
 #ifdef NINFER_VOLTA_BUILD
-// A materialized A16 projection runs fp8_gdn_input_a16_dispatch over all aggregate columns: one
-// QPN pass (an activation staging buffer) up to kFp8VoltaQpnMaxTokens columns, the CUTLASS route
-// (its own projection tile and GEMM scratch) beyond. Only the dispatch's own capacity covers both.
+// A materialized A16 projection runs fp8_gdn_input_a16_dispatch over all aggregate columns: QPN
+// passes of up to kFp8VoltaQpnMaxTokens columns through one activation staging buffer, then from
+// the dispatch's width frontier the CUTLASS route (its own projection tile and GEMM scratch). Only
+// the dispatch's own capacity covers both.
 std::size_t volta_a16_projection_capacity(std::int32_t aggregate_columns) {
     return fp8_gdn_input_workspace_capacity_bytes(LinearPolicy::A16Only, aggregate_columns,
                                                   aggregate_columns);
