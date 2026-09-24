@@ -222,13 +222,13 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_
 TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                          qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                          qwen3_6::RoundState& io, Tensor& prefill_hidden,
-                         std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
-                         qwen3_6::PagedKVCacheView mtp_kv,
+                         std::uint32_t prefill_chunk, TextNumerics numerics,
+                         std::uint32_t text_kv_base, qwen3_6::PagedKVCacheView mtp_kv,
                          const qwen3_6::PagedKVCache* batch_text_kv,
                          const qwen3_6::PagedKVCache* batch_mtp_kv)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
-      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
-      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
+      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), numerics_(numerics),
+      text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -401,11 +401,13 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
             *active_backend_kv_table_rows_, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+            batch_mtp_kv_->batch_layer_view(0), envelope, numerics_.prefill_attention, work_,
+            a_batch, s);
     } else {
         ops::causal_softmax_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
                                       {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                      batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+                                      batch_mtp_kv_->batch_layer_view(0), envelope,
+                                      numerics_.prefill_attention, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -680,7 +682,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
-        Tensor x = work_.alloc(workspace_recipe::text_residual_dtype(), {kCfg.hidden, batch});
+        Tensor x = work_.alloc(workspace_recipe::text_residual_dtype(numerics_.residual),
+                               {kCfg.hidden, batch});
         ops::embedding(ids, *embed_, x, stream);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
@@ -733,7 +736,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
 
-        Tensor x = work_.alloc(workspace_recipe::text_residual_dtype(), {kCfg.hidden, columns});
+        Tensor x = work_.alloc(workspace_recipe::text_residual_dtype(numerics_.residual),
+                               {kCfg.hidden, columns});
         Tensor flat_ids = ids.view({columns});
         ops::embedding(flat_ids, *embed_, x, stream);
         if constexpr (Tap::enabled) { tap.begin(x); }
@@ -870,12 +874,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
                                       kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
                                       kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                      *active_causal_attention_envelope_, work_, a_batch, s);
+                                      *active_causal_attention_envelope_,
+                                      numerics_.prefill_attention, work_, a_batch, s);
     } else {
         ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
                                       {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
                                       batch_text_kv_->batch_layer_view(fidx),
-                                      *active_causal_attention_envelope_, work_, a, s);
+                                      *active_causal_attention_envelope_,
+                                      numerics_.prefill_attention, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -1172,7 +1178,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             const std::int32_t rope_axes = multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0);
             const auto roots             = workspace_recipe::text_prefill_roots<TextConfig>(
-                work_, len, rope_axes, static_cast<std::int32_t>(local_scatter_indices.size()));
+                work_, len, rope_axes, static_cast<std::int32_t>(local_scatter_indices.size()),
+                numerics_.residual);
             Tensor ids_device = roots.ids;
             copy_i32(ids.data() + t0, ids_device, s);
 

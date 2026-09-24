@@ -80,6 +80,8 @@ struct SequencePlanningInputs {
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    TextResidualStorage text_residual      = TextResidualStorage::BFloat16;
+    PrefillAttentionKernel prefill_attention = PrefillAttentionKernel::Automatic;
     ProposalHead proposal_head             = ProposalHead::Full;
     ContextLookupOptions context_lookup;
     StartupFeatures features;
@@ -104,6 +106,8 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    TextResidualStorage text_residual      = TextResidualStorage::BFloat16;
+    PrefillAttentionKernel prefill_attention = PrefillAttentionKernel::Automatic;
     ProposalHead proposal_head             = ProposalHead::Full;
     ContextLookupOptions context_lookup;
     // MTP verification frames derived from the backend, draft window and lookup options.

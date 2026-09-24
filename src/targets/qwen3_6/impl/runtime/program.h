@@ -639,6 +639,7 @@ public:
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
+    const schedule::TextNumerics text_numerics;
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;
