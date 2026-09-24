@@ -36,7 +36,7 @@ DType dtype_for(NumericFormat format) {
 std::string quote_name(std::string_view text) { return "'" + std::string(text) + "'"; }
 
 // ---------------------------------------------------------------------------------------------
-// Nommage : v2 (plat, fusionné) -> v3 (logique, par sous-tenseur)
+// Naming: v2 (flat, fused) -> v3 (logical, one per sub-tensor)
 // ---------------------------------------------------------------------------------------------
 
 void replace_all(std::string& text, std::string_view from, std::string_view to) {
@@ -45,7 +45,7 @@ void replace_all(std::string& text, std::string_view from, std::string_view to) 
     }
 }
 
-// Renommages purs (un nom v2 -> un binding v3 de même couverture).
+// Pure renames (one v2 name -> one v3 binding with the same coverage).
 std::string canonical_v3_name(std::string_view name) {
     if (name == "text/draft_head") { return "proposal/head"; }
     if (name == "text/draft_head_token_ids") { return "proposal/token_ids"; }
@@ -78,7 +78,7 @@ std::vector<std::string> routed_expert_leaves(std::initializer_list<std::string_
     return out;
 }
 
-// Un tenseur fusionné v2 = la concaténation, dans cet ordre, de ces feuilles v3.
+// A fused v2 tensor is the concatenation, in this order, of these v3 leaves.
 std::vector<std::string> fused_leaves(std::string_view suffix) {
     if (suffix == "query_key_gate_value") { return {"query", "key", "gate", "value"}; }
     if (suffix == "query_key_value_z") { return {"query", "key", "value", "z"}; }
@@ -98,7 +98,7 @@ std::vector<std::string> fused_leaves(std::string_view suffix) {
     return {};
 }
 
-// Développe un nom v3 canonique en la liste des bindings logiques v3 qui le composent.
+// Expands a canonical v3 name into the v3 logical bindings that compose it.
 std::vector<std::string> logical_names(const Directory& directory, std::string_view v3_name) {
     if (directory.bindings.contains(v3_name)) { return {std::string(v3_name)}; }
     const auto slash = v3_name.rfind('/');
@@ -112,8 +112,8 @@ std::uint64_t object_elements(const Directory& directory, ObjectHandle handle) {
     return weight_element_count(directory.tensor(handle).shape);
 }
 
-// Un Binding v3 doit couvrir intégralement un seul objet physique pour être exposable
-// comme tenseur v2 (les porteurs adressent des objets entiers, jamais des tranches).
+// A v3 Binding must cover exactly one whole physical object to be exposed as a v2 tensor (the
+// target packages address whole objects, never slices).
 ObjectHandle whole_object_of(const Directory& directory, const Binding& binding,
                              std::string_view label) {
     if (binding.parts.size() != 1) {
@@ -136,7 +136,7 @@ const Binding& require_binding(const Directory& directory, std::string_view v3_n
     return found->second;
 }
 
-// Résout un nom de tenseur v2 vers l'objet physique v3 que ses feuilles couvrent bout à bout.
+// Resolves a v2 tensor name to the physical v3 object that its leaves cover end to end.
 ObjectHandle resolve_tensor_object(const Directory& directory, std::string_view v2_name) {
     const std::string v3_name = canonical_v3_name(v2_name);
     const auto leaves         = logical_names(directory, v3_name);
@@ -174,7 +174,7 @@ ObjectHandle resolve_tensor_object(const Directory& directory, std::string_view 
     return object;
 }
 
-// ".../<group>/<x>_projection/input_scale_divisor" -> nom v2 du poids consommateur.
+// ".../<group>/<x>_projection/input_scale_divisor" -> v2 name of the consuming weight.
 std::string divisor_owner_name(std::string_view v2_name) {
     std::string owner(v2_name.substr(0, v2_name.size() - kInputDivisorSuffix.size()));
     constexpr std::string_view kProjection = "_projection";
@@ -193,7 +193,7 @@ std::string divisor_owner_name(std::string_view v2_name) {
         if (prefix.ends_with("gdn/")) { return prefix + "query_key_value_z"; }
         throw ArtifactError(quote_name(v2_name) + ": input projection group is unknown");
     }
-    return owner; // gate_up, down, output : déjà le nom v2 du poids
+    return owner; // gate_up, down, output: already the v2 weight name
 }
 
 std::uint32_t read_u32_le_bytes(std::span<const std::byte> bytes, std::string_view label) {
@@ -204,9 +204,9 @@ std::uint32_t read_u32_le_bytes(std::span<const std::byte> bytes, std::string_vi
     return read_u32_le(bytes.data());
 }
 
-// Résout un diviseur d'entrée v2 vers l'auxiliaire `activation_input_divisor` v3. Un poids
-// fusionné v2 (gate_up) a une feuille v3 par sous-tenseur, chacune avec son auxiliaire ; le
-// kernel Volta n'en consomme qu'un, on exige donc qu'ils soient identiques.
+// Resolves a v2 input divisor to the v3 `activation_input_divisor` auxiliary. A fused v2 weight
+// (gate_up) has one v3 leaf per sub-tensor, each with its own auxiliary; the Volta kernel consumes
+// only one, so they must be identical.
 ObjectHandle resolve_input_divisor(Binder& binder, std::string_view v2_name) {
     const Directory& directory = binder.reader().directory();
     const std::string owner    = divisor_owner_name(v2_name);
@@ -352,8 +352,8 @@ ObjectHandle bind_device_tensor(Binder& binder, std::string_view name, NumericFo
 }
 
 ObjectHandle bind_raw_resource(Binder& binder, std::string_view name) {
-    // v2 : "frontend/<role>" ; v3 : chaque composant porte ses propres ressources
-    // (tokenizer sous "text", preprocessor sous "vision").
+    // v2: "frontend/<role>"; v3: each component carries its own resources (tokenizer under
+    // "text", preprocessor under "vision").
     const auto slash            = name.rfind('/');
     const std::string_view role = slash == std::string_view::npos ? name : name.substr(slash + 1);
     const Directory& directory  = binder.reader().directory();
@@ -391,7 +391,7 @@ std::uint32_t nvfp4_weight_divisor_bits(Binder& binder, ObjectHandle handle) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Matérialisation
+// Materialization
 // ---------------------------------------------------------------------------------------------
 
 Tensor materialized_tensor(const MaterializedArtifact& materialized, ObjectHandle handle,
