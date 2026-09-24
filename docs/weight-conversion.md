@@ -45,6 +45,9 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 
+On this port, only the two NVFP4 recipes produce artifacts that load today; see
+[what this port runs](#what-this-port-runs).
+
 For a Qwen3.8-27B NVFP4/FP8 artifact with DFlash2:
 
 ```bash
@@ -84,8 +87,10 @@ still produces a valid file, but the Engine refuses it when it binds the profile
 
 At present the profile is resolved for the two NVFP4 recipes only. `Reader::identity`
 (`src/artifact/reader.cpp`) takes the text after the recipe name's last underscore as the profile.
-The three `groupwise-int` recipes therefore fail at load, and so do the published `groupwise-int`
-v3 artifacts.
+The three `groupwise-int` recipes therefore fail at load, and so do the published `groupwise-int` v3
+artifacts, until the identity fix in [#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17)
+lands. Qwen3.6-35B-A3B needs more than that fix: the v2-to-v3 shim cannot resolve the MoE expert
+weights its binder addresses, so no v3 artifact of that model loads yet.
 
 ## Change part of a recipe
 

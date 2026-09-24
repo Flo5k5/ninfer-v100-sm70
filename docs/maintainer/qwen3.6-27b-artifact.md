@@ -15,6 +15,9 @@ counts, and identities below describe the version-2 layout, which the Volta bind
 addresses: its v2-to-v3 shim (`src/artifact/typed_binding.cpp`) resolves each name to the v3
 object that its logical bindings cover, and derives the identity from the v3 metadata name and
 recipe. The source transforms and payload encodings below remain the contract of both artifacts.
+Today only the NVFP4 artifact of Section 13 loads on this port: `Reader::identity` derives `27b`
+from the `qwen3_6_27b` recipe name, and the Engine rejects the groupwise-int artifact until the
+identity fix in [#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17) lands.
 
 ## 1. Artifact identity and contents
 
