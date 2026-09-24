@@ -620,30 +620,6 @@ public:
 
     void reset_memory_peaks() noexcept;
 
-    // Which frame verified an MTP row; planning keeps the three widths distinct.
-    enum class MtpVerification : std::uint8_t {
-        Drafts,
-        LookupEntry,
-        Lookup,
-    };
-
-    // Learned drafts a lookup round proposes for the next round. The entry tier regenerates the
-    // configured window, since the copy it probes often ends inside the round; the full tier only
-    // runs while a copy continues and keeps one draft as the next agreement guard.
-    [[nodiscard]] std::uint32_t lookup_proposal_window(bool entry) const noexcept {
-        return entry ? draft_window : 1U;
-    }
-
-    [[nodiscard]] MtpVerification mtp_verification(std::uint32_t row_stride) const noexcept {
-        if (lookup_window != 0 && row_stride == lookup_window + 1U) {
-            return MtpVerification::Lookup;
-        }
-        if (lookup_entry_window != 0 && row_stride == lookup_entry_window + 1U) {
-            return MtpVerification::LookupEntry;
-        }
-        return MtpVerification::Drafts;
-    }
-
     friend struct qwen3_6::detail::PressurePlanningSessionImpl<Variant>;
 
     const LoadedModelData& model;
@@ -657,10 +633,8 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const ContextLookupOptions context_lookup;
-    // Copied tokens verified per MTP lookup round; zero when no lookup frame is planned.
-    const std::uint32_t lookup_window;
-    // Copied tokens verified by the narrower tier that enters a copy; zero when not planned.
-    const std::uint32_t lookup_entry_window;
+    // MTP verification frames; no lookup frame is planned unless the backend is MTP.
+    const ContextLookupPlan lookup_plan;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
