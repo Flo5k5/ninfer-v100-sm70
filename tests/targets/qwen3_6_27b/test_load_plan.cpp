@@ -7,13 +7,16 @@
 #include <ninfer/targets/qwen3_6_27b/package.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
 
 namespace {
@@ -47,6 +50,8 @@ features(ninfer::SpeculativeBackend backend,
     };
 }
 
+using ObjectSet = std::set<std::size_t>;
+
 bool is_device_object(const ninfer::artifact::MaterializationPlan& plan,
                       ninfer::artifact::ObjectHandle handle) {
     return std::ranges::any_of(plan.device_objects, [handle](const auto& object) {
@@ -54,13 +59,94 @@ bool is_device_object(const ninfer::artifact::MaterializationPlan& plan,
     });
 }
 
+ObjectSet planned_objects(const auto& placements) {
+    ObjectSet out;
+    for (const auto& placement : placements) { out.insert(placement.object.index); }
+    return out;
+}
+
+// v3 object IDs are opaque, so a component's objects are the parents of its logical bindings.
+ObjectSet bound_objects(const ninfer::artifact::Reader& reader, std::string_view prefix) {
+    ObjectSet out;
+    for (const auto& [name, binding] : reader.directory().bindings) {
+        if (!name.starts_with(prefix)) { continue; }
+        for (const auto& part : binding.parts) { out.insert(part.object.index); }
+    }
+    return out;
+}
+
+// NVFP4 activation input divisors are FP32 scalars referenced by Use auxiliaries.
+ObjectSet activation_divisors(const ninfer::artifact::Reader& reader) {
+    ObjectSet out;
+    for (const auto& [key, use] : reader.directory().uses) {
+        const auto found = use.auxiliaries.find("activation_input_divisor");
+        if (found == use.auxiliaries.end()) { continue; }
+        for (const auto& part : found->second.parts) { out.insert(part.object.index); }
+    }
+    return out;
+}
+
 std::size_t dflash2_device_objects(const ninfer::artifact::Reader& reader,
                                    const ninfer::artifact::MaterializationPlan& plan) {
+    const ObjectSet dflash2 = bound_objects(reader, "dflash2/");
     return static_cast<std::size_t>(
         std::ranges::count_if(plan.device_objects, [&](const auto& item) {
-            return ninfer::artifact::object_name(reader.objects().at(item.object.index))
-                .starts_with("dflash2/");
+            return dflash2.contains(item.object.index);
         }));
+}
+
+std::string describe_object(const ninfer::artifact::Reader& reader, std::size_t index) {
+    const auto& directory = reader.directory();
+    const std::string id  = ninfer::artifact::object_id(directory.objects.at(index));
+    for (const auto& [name, binding] : directory.bindings) {
+        for (const auto& part : binding.parts) {
+            if (part.object.index == index) { return id + " (" + name + ")"; }
+        }
+    }
+    return id;
+}
+
+std::string first_difference(const ninfer::artifact::Reader& reader, const ObjectSet& actual,
+                             const ObjectSet& expected) {
+    for (const std::size_t index : actual) {
+        if (!expected.contains(index)) { return "unexpected " + describe_object(reader, index); }
+    }
+    for (const std::size_t index : expected) {
+        if (!actual.contains(index)) { return "missing " + describe_object(reader, index); }
+    }
+    return "none";
+}
+
+// With every startup feature selected, the plan uploads every weight parent once. The Host keeps
+// the frontend resources and the objects validated there: the proposal token IDs and, for NVFP4,
+// the activation input divisors.
+bool verify_full_residency(const ninfer::artifact::Reader& reader, const ArtifactLoadPlan& plan,
+                           std::string_view label) {
+    const auto& objects      = reader.directory().objects;
+    const ObjectSet divisors = activation_divisors(reader);
+    ObjectSet expected_device;
+    ObjectSet expected_host = divisors;
+    expected_host.insert(plan.bindings.draft_head_token_ids.index);
+    for (std::size_t index = 0; index < objects.size(); ++index) {
+        if (std::holds_alternative<ninfer::artifact::ResourceObject>(objects[index])) {
+            expected_host.insert(index);
+        } else if (!divisors.contains(index)) {
+            expected_device.insert(index);
+        }
+    }
+    const auto& materialization = plan.materialization;
+    const ObjectSet device      = planned_objects(materialization.device_objects);
+    const ObjectSet host        = planned_objects(materialization.host_objects);
+    if (device.size() != materialization.device_objects.size() || device != expected_device ||
+        host != expected_host) {
+        std::cerr << label << " materialization plan is incomplete: device="
+                  << materialization.device_objects.size() << '/' << expected_device.size()
+                  << " host=" << host.size() << '/' << expected_host.size()
+                  << " device_difference=" << first_difference(reader, device, expected_device)
+                  << " host_difference=" << first_difference(reader, host, expected_host) << '\n';
+        return false;
+    }
+    return true;
 }
 
 bool valid_divisors(const WeightPlan& weight) {
@@ -80,13 +166,7 @@ int verify_groupwise(const std::filesystem::path& path) {
     ninfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
         bind_artifact(binder, WeightsProfile::Qwen36GroupwiseInt, all_features());
-    if (plan.materialization.object_count != 1124 ||
-        plan.materialization.device_objects.size() != 1118 ||
-        plan.materialization.host_objects.size() != 6 ||
-        plan.materialization.device_capacity_bytes == 0) {
-        std::cerr << "groupwise materialization plan is incomplete\n";
-        return 1;
-    }
+    if (!verify_full_residency(reader, plan, "groupwise")) { return 1; }
     if (plan.bindings.token_embedding.format != NumericFormat::Q6G64_F16S ||
         plan.bindings.output_head.format != NumericFormat::Q6G64_F16S) {
         std::cerr << "groupwise vocabulary endpoints have the wrong storage profile\n";
@@ -121,19 +201,7 @@ int verify_nvfp4(const std::filesystem::path& path) {
     ninfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
         bind_artifact(binder, WeightsProfile::Qwen36Nvfp4, all_features());
-    if (plan.materialization.object_count != 1307 ||
-        plan.materialization.device_objects.size() != 1054 ||
-        plan.materialization.host_objects.size() != 6 ||
-        plan.materialization.object_count - plan.materialization.device_objects.size() -
-                plan.materialization.host_objects.size() !=
-            247 ||
-        plan.materialization.device_capacity_bytes == 0) {
-        std::cerr << "NVFP4 materialization plan is incomplete: objects="
-                  << plan.materialization.object_count
-                  << " device=" << plan.materialization.device_objects.size()
-                  << " host=" << plan.materialization.host_objects.size() << '\n';
-        return 1;
-    }
+    if (!verify_full_residency(reader, plan, "NVFP4")) { return 1; }
     if (plan.bindings.token_embedding.format != NumericFormat::W8G32_F16S ||
         plan.bindings.output_head.format != NumericFormat::W8G32_F16S) {
         std::cerr << "NVFP4 vocabulary endpoints have the wrong storage profile\n";
@@ -247,7 +315,9 @@ int verify_dflash2_bundle(const std::filesystem::path& path, WeightsProfile prof
     const ArtifactLoadPlan plan = bind_artifact(
         binder, profile,
         features(ninfer::SpeculativeBackend::DFlash2, ninfer::ProposalHead::Optimized));
-    if (!plan.bindings.dflash2 || dflash2_device_objects(reader, plan.materialization) != 66 ||
+    const std::size_t dflash2_objects = bound_objects(reader, "dflash2/").size();
+    if (!plan.bindings.dflash2 || dflash2_objects == 0 ||
+        dflash2_device_objects(reader, plan.materialization) != dflash2_objects ||
         is_device_object(plan.materialization, plan.bindings.mtp.input_projection) ||
         !is_device_object(plan.materialization, plan.bindings.draft_head) ||
         !is_device_object(plan.materialization, plan.bindings.draft_head_token_ids)) {
@@ -327,9 +397,7 @@ int verify_vision_workspace_planning() {
     return 0;
 }
 
-} // namespace
-
-int main() {
+int run() {
     const std::filesystem::path groupwise =
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
     const std::filesystem::path nvfp4 =
@@ -357,32 +425,39 @@ int main() {
         result != 0) {
         return result;
     }
-    const std::array dflash2_artifacts{qwen38_groupwise, qwen38_nvfp4, qwen38_groupwise_dflash2,
-                                       qwen38_nvfp4_dflash2};
-    if (!std::ranges::all_of(dflash2_artifacts, [](const auto& path) {
-            return std::filesystem::is_regular_file(path);
-        })) {
-        std::cerr << "skip DFlash2 binding matrix: old and new Qwen3.8 artifacts are required\n";
-        return 0;
-    }
-    if (const int result = verify_legacy_dflash2_compatibility(qwen38_groupwise,
-                                                               WeightsProfile::Qwen38GroupwiseInt);
-        result != 0) {
-        return result;
-    }
-    if (const int result =
-            verify_legacy_dflash2_compatibility(qwen38_nvfp4, WeightsProfile::Qwen38Nvfp4);
-        result != 0) {
-        return result;
-    }
-    if (const int result =
-            verify_dflash2_bundle(qwen38_groupwise_dflash2, WeightsProfile::Qwen38GroupwiseInt);
-        result != 0) {
-        return result;
-    }
-    if (const int result = verify_dflash2_bundle(qwen38_nvfp4_dflash2, WeightsProfile::Qwen38Nvfp4);
-        result != 0) {
-        return result;
+    // Each Qwen3.8 artifact present is checked on its own. The published v3 form carries the
+    // DFlash2 bundle. The legacy form is a v3 conversion without the dflash2 component; a v2 file
+    // no longer opens, and main reports the Reader's error.
+    struct Qwen38Artifact {
+        std::filesystem::path path;
+        WeightsProfile profile;
+        bool dflash2;
+    };
+    const std::array qwen38_artifacts{
+        Qwen38Artifact{qwen38_groupwise, WeightsProfile::Qwen38GroupwiseInt, false},
+        Qwen38Artifact{qwen38_nvfp4, WeightsProfile::Qwen38Nvfp4, false},
+        Qwen38Artifact{qwen38_groupwise_dflash2, WeightsProfile::Qwen38GroupwiseInt, true},
+        Qwen38Artifact{qwen38_nvfp4_dflash2, WeightsProfile::Qwen38Nvfp4, true},
+    };
+    for (const auto& [path, profile, dflash2] : qwen38_artifacts) {
+        if (!std::filesystem::is_regular_file(path)) {
+            std::cerr << "skip Qwen3.8 DFlash2 binding check: " << path << " is absent\n";
+            continue;
+        }
+        const int result = dflash2 ? verify_dflash2_bundle(path, profile)
+                                   : verify_legacy_dflash2_compatibility(path, profile);
+        if (result != 0) { return result; }
     }
     return 0;
+}
+
+} // namespace
+
+int main() {
+    try {
+        return run();
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
 }
