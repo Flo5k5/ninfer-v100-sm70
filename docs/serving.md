@@ -976,24 +976,42 @@ raw counters and seconds over rounded stderr rates.
 
 ## Zero data retention
 
-Start the server with `--no-response-store` to keep no prompt or completion content beyond the HTTP
-exchange that carries it. The remaining retention surfaces hold technical data or volatile model
-state only:
+Zero data retention (ZDR) here has the industry-standard meaning used by hosted APIs such as
+OpenAI's and Anthropic's: request and response content is never written to disk or to a log, and no
+response is stored for later retrieval, while volatile caches in GPU and Host memory may keep recent
+conversations until eviction or restart. Start the server with `--no-response-store` for this mode.
+Logging needs no option: no log carries request content at any `--log-level`.
 
-| Surface | Retained data |
+| Surface | What it keeps with `--no-response-store` |
 |---|---|
-| Responses store | nothing with `--no-response-store`; see [Local response state and resources](#local-response-state-and-resources) |
+| Responses store | nothing; see [Local response state and resources](#local-response-state-and-resources) |
 | Chat Completions and Anthropic Messages | nothing; Chat Completions rejects `store: true` |
-| Operational stderr log, every `--log-level` | request IDs, protocol, message/tool/media counts, token counts, timings, HTTP status and error codes |
+| Operational stderr log, every `--log-level` | request IDs, protocol, message/tool/media counts, token counts, timings, HTTP status, error codes, and content-free failure causes |
 | `--request-log-jsonl FILE` | the same classes of fields at full precision, the redacted `argv`, the served model ID, and the client's model alias only when it is identifier-shaped |
-| Engine context cache | token IDs, KV, and model state of reusable prefixes in Device and pinned Host memory; bounded, evicted under pressure, and lost at exit; `--no-prefix-reuse` disables it |
-| Media cache | prepared image and video tensors keyed by a content digest in Host memory; bounded and lost at exit; `--media-cache-mib 0` disables it |
+| Engine context cache (prefix reuse) | token IDs, KV, and recurrent state of recent conversations, in GPU and pinned Host memory: prompts and the replies generated for them, since a finished request keeps a checkpoint at the end of its output. Token IDs decode back to the exact text, including system prompts, tool definitions, earlier turns, and generated reasoning. Entries stay until resource pressure evicts them or the process exits, and are never written to disk or to a log |
+| Media cache, with `--vision` | prepared tensors of recent images and videos, keyed by a content digest, in Host memory up to `--media-cache-mib`. Entries stay until least-recently-used eviction or process exit, and are never written to disk or to a log |
 
-Error messages can quote client input or model output, so they are returned only in the HTTP
-response and never logged. The server writes no dumps, traces, or crash reports of its own. Process
-memory can still reach disk through the host: disable core dumps (for example `ulimit -c 0`, or
-`--ulimit core=0` for a container) and use no swap or encrypted swap where zero retention is
-required.
+These caches are what keep agent sessions fast: a follow-up turn reuses its cached prefix and
+prefills only the new suffix.
+
+For a strict mode that retains nothing from one request to the next, disable both caches as well:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --no-response-store --no-prefix-reuse --media-cache-mib 0
+```
+
+`--no-prefix-reuse` retains no checkpoint after a request, and `--media-cache-mib 0` retains no
+prepared media. The cost is prefill: every turn of an agent conversation re-prefills its whole
+context. On one V100, Qwen3.8-27B NVFP4 spends about 27 s re-prefilling a 26k-token context on every
+turn, where prefix reuse would compute only the new tokens.
+
+In both modes, the memory of a finished request is released for reuse, not scrubbed, so it can hold
+that request's data until it is overwritten. Error messages can quote client input or model output,
+so they are returned only in the HTTP response and never logged. The server writes no dumps,
+traces, or crash reports of its own, but process memory can still reach disk through the host:
+disable core dumps (for example `ulimit -c 0`, or `--ulimit core=0` for a container) and use no swap
+or encrypted swap.
 
 ## Execution behavior
 

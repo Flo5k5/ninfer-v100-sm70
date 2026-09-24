@@ -47,7 +47,8 @@ public:
 
     // A disabled store retains nothing: get() never finds a Response, erase() never removes one,
     // and put() is a logic error because request validation must already have rejected store=true.
-    // Serve uses it for --no-response-store so no Responses content outlives its request.
+    // Serve uses it for --no-response-store, so no Response object, input Item, or continuation
+    // context outlives its request.
     [[nodiscard]] static OpenAIResponsesStore disabled();
 
     [[nodiscard]] bool enabled() const noexcept { return max_records_ != 0; }
