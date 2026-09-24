@@ -6,6 +6,14 @@ binder. Numeric formats are defined in [`tensor-formats.md`](tensor-formats.md),
 in [`storage-layouts.md`](storage-layouts.md), and exact object inventories in the target
 artifact references.
 
+Since the v3 artifact port, the tools and the Engine write and read version 3 (`NINFER\x00\x03`),
+and the reader rejects version-2 files. `tools/artifact/schema.py` and `src/artifact/schema.cpp`
+define the v3 directory, and the [weight conversion guide](../weight-conversion.md) its
+production. The Volta binder still addresses the version-2 object names and
+`(model_id, weights_id)` identities below through its v2-to-v3 shim
+(`src/artifact/typed_binding.cpp`, `Reader::identity`), so they remain the contract its bindings
+check. The framing and directory sections describe the version-2 file format that v3 replaced.
+
 ## 1. Format overview
 
 A `.ninfer` artifact is one file:
@@ -421,19 +429,18 @@ correctly without carrying it.
 
 ## 11. Required implementation evidence
 
-The native implementation in `tools/artifact/`, `tools/convert/`, and `src/artifact/` satisfies
-this layer. The compact evidence retained for later changes is:
+`tools/artifact/`, `tools/convert/`, and `src/artifact/` now write and read version 3; see the
+note at the top. The compact evidence retained for later changes is:
 
-- Python version-2 round trips for all nine numeric formats and a raw resource;
-- representative framing, schema, offset/alignment, overlap, bounds, and encoded-size failures;
-- exact representative direct-word, Q4/Q5/Q6/W8 code/scale, NVFP4 block-scale, and row-scaled FP8
-  layout round trips;
+- Python v3 directory, framing, and sharding round trips, with representative directory and range
+  failures (`tests/artifact/test_container.py`);
+- exact representative direct-word, Q4/Q5/Q6/Q8 code/scale, NVFP4 block-scale, and row-scaled FP8
+  layout round trips (`tests/artifact/test_codecs.py`, `test_fp8_row.py`), with scalar decoding
+  oracles for the NVFP4 words (`test_nvfp4_numeric.py`);
 - an independently constructed C++ version-2 fixture covering hierarchical identity, payload spans,
   encoded sizes, and alignment;
-- the complete registered target inventories, including the 1124-object Qwen3.6 groupwise and
-  1307-object Qwen3.6 NVFP4 forms, the 940-object 35B-A3B form, and Qwen3.8's accepted 1124-object
-  core-only and current 1190-object core-plus-DFlash2 forms;
-- inspection, representative source probes, and real converter completion for produced artifacts;
+- conversion of synthetic checkpoints through the v3 pipeline, from source mapping and recipes to
+  written bindings and path-free provenance (`tests/convert/`);
 - C++ binding and public Engine loading for registered runtime capabilities. Companion-specific
   selection and residency remain target integration evidence rather than container evidence.
 

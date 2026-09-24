@@ -7,7 +7,11 @@ benchmark-report, and external protocol behavior. Repository verification princi
 
 ## Organization
 
-- `artifact/` — Python container, registered layout, quantization, and resource behavior;
+- `artifact/` — Python v3 directory, file framing and sharding, codecs, and exact NVFP4/FP8
+  decoding;
+- `convert/` — the conversion pipeline from Qwen3.5 source mapping, recipes, methods and
+  quantizers to the written artifact, its CLI and path-free provenance, and the Qwen3.8 tools
+  that rewrite a published artifact;
 - `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
   using independent numerical/state-transition oracles at real supported shapes;
 - `ops/linear/` — weight/activation-profile-specific public Linear conformance tests plus their
@@ -18,12 +22,12 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
   stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
   alignment, Vision control, and family runtime mechanisms;
-- `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
-  bindings, reference diagnostics, family Program/multimodal/MTP behavior, and the opt-in real-Engine
-  prefix test and causal-scoring State/KV isolation test;
-- `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
-  reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
-  and the opt-in real public-Engine route;
+- `targets/qwen3_6_27b/` — registered inventory, artifact bindings, reference diagnostics, family
+  Program/multimodal/MTP behavior, and the opt-in real-Engine prefix test and causal-scoring
+  State/KV isolation test;
+- `targets/qwen3_6_35b_a3b/` — registered inventory, artifact-native diagnostic reference, MoE
+  oracle, typed binding, selected-expert row access, 256K INT8 memory calculation, and the opt-in
+  real public-Engine route;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
 - `test_openai_schema.cpp`, `test_openai_responses.cpp`,
@@ -112,12 +116,10 @@ python3 -m pytest \
   tests/test_bench_matrix.py tests/test_serve_corpus.py tests/test_context_lookup_bench.py
 ```
 
-The Python suites cover generic artifact framing and exact converter inventories, source recipes,
-encoders, and payload verification. Model execution and real-artifact binding are tested through
-the C++ target and Engine suites below; there is no Python inference implementation. The two
-official source-resource preflight checks are opt-in: set `NINFER_QWEN3_6_27B_MODEL` and/or
-`NINFER_QWEN3_6_35B_A3B_MODEL` to the corresponding source checkpoint directory. Only those
-source-dependent checks are skipped when their variable is absent.
+The Python suites cover generic artifact framing, codecs and quantizers, conversion from synthetic
+checkpoints to written artifacts, and the tools that rewrite a published artifact. Model execution
+and real-artifact binding are tested through the C++ target and Engine suites below; there is no
+Python inference implementation.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:
