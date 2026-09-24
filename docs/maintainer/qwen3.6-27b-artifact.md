@@ -697,9 +697,11 @@ A consumable NVFP4 `Weight` has `group_size = group = 16`, `qdata` at the E2M1 c
 2. exact-read and validate the associated site-level `d_x`;
 3. retain both host FP32 values in the target-private binding plan.
 
-The site scalar is validation-only and receives no independent device allocation. During loaded
-model construction, the binder writes the parent `d_w` and the site's `d_x` into every associated
-immutable NVFP4 `Weight`; missing values must remain an error and must never default to `1.0`.
+The site scalar receives no independent device allocation. A v3 artifact stores it as the
+`activation_input_divisor` auxiliary of each Use, and the binder keeps those auxiliaries in Host
+memory with the loaded model. During loaded model construction, the binder writes the parent `d_w`
+and the site's `d_x` into every associated immutable NVFP4 `Weight`; missing values must remain an
+error and must never default to `1.0`.
 
 The fused Attention and GDN input Ops consume their complete NVFP4 parents. Their target-private
 binding and call boundaries do not construct query/key/gate/value/z `Weight` row views and do not
@@ -736,9 +738,10 @@ All NVFP4 Text parents and BF16 exceptions described above are bound and executa
 phase passes `AllowA4` for NVFP4 weights and `A16Only` for all other formats. Each semantic Op then
 resolves its qualified route from the exact geometry and T; Prefill, ordinary decode, and
 speculative target verify do not create separate activation-policy variants. MTP and Vision use
-their registered storage and execution paths. With all startup features enabled, 1054 tensors and six
-resources are materialized; the 247 site-level `d_x` scalars are consumed and validated but receive
-no device allocation.
+their registered storage and execution paths. With all startup features enabled, 1054 tensors are
+materialized on device. The Host keeps the six resources and a copy of the validated proposal token
+IDs, which are also on device. The activation input divisors stay on the Host and receive no device
+allocation; a v3 artifact stores one divisor per NVFP4 Use (485) rather than one per site (247).
 
 ### 13.5 Production and verification
 
@@ -760,8 +763,9 @@ invalid method output before or while writing; the
 [weight conversion guide](../weight-conversion.md) describes the pipeline.
 
 Native qualification additionally validates both real 27B artifacts through their exact C++
-load plans. The NVFP4 plan consumes 1307 objects, retains six frontend resources, places 1054
-tensors on device when Text, Vision, MTP, and the optimized proposal head are enabled, and leaves
-exactly 247 `d_x` scalars validation-only. Public Engine smoke covers Text, MTP, Vision, prefix
+load plans. When Text, Vision, MTP, and the optimized proposal head are enabled, each plan places
+every weight parent on device once. It retains on the Host the six frontend resources, the
+validated proposal token IDs, and, for NVFP4, the activation input divisor of every NVFP4 Use; no
+divisor receives a device allocation. Public Engine smoke covers Text, MTP, Vision, prefix
 reuse, and CUDA Graph decode for both `weights_id` values. CUDA Graph capture records the route
 already selected for each exact call shape; it does not add an A16/A4 graph dimension.
