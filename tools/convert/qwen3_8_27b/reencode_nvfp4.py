@@ -286,7 +286,7 @@ def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Enco
         writer.abort()
         raise
     return {
-        "artifact": str(arguments.out),
+        "artifact": arguments.out.name,
         "bytes": arguments.out.stat().st_size,
         "recipe": provenance.get("recipe"),
         "reencode_record_sha256": hashlib.sha256(

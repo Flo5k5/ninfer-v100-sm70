@@ -296,17 +296,23 @@ def _stored_sha256(directory: Path) -> dict[str, str]:
             for name, meta in header.items() if name != "__metadata__"}
 
 
+def _assert_no_path_fragments(text: str, tmp_path: Path) -> None:
+    """No JSON string (member name or value) is, or starts like, a local filesystem path."""
+
+    for fragment in (str(tmp_path), str(Path.home()), tempfile.gettempdir(), "/home/", "/tmp/",
+                     "/private/", "/Users/", "/data/", "/var/"):
+        assert fragment not in text, fragment
+    # A JSON string (member name or value) that starts like an absolute or home path.
+    assert not re.findall(r'"(?:/|~|\\\\|[A-Za-z]:)', text)
+
+
 def _assert_no_local_paths(artifact: Path, tmp_path: Path) -> None:
     """No directory JSON string is a filesystem path or names a home or temporary directory."""
 
     with artifact.open("rb") as handle:
         _, json_bytes, _ = HEADER.unpack(handle.read(HEADER.size))
         text = handle.read(json_bytes).decode("utf-8")
-    for fragment in (str(tmp_path), str(Path.home()), tempfile.gettempdir(), "/home/", "/tmp/",
-                     "/private/", "/Users/", "/data/", "/var/"):
-        assert fragment not in text, fragment
-    # A JSON string (member name or value) that starts like an absolute or home path.
-    assert not re.findall(r'"(?:/|~|\\\\|[A-Za-z]:)', text)
+    _assert_no_path_fragments(text, tmp_path)
 
 
 def _report(tmp_path) -> dict:
@@ -398,6 +404,19 @@ def test_output_metadata_names_inputs_without_paths(tmp_path) -> None:
     assert record["removed_base_paths"] == REMOVED_BASE_PATHS
 
     _assert_no_local_paths(out_path, tmp_path)
+
+
+def test_reencode_report_names_the_artifact_by_name_only(tmp_path) -> None:
+    """<out>.reencode.json travels separately from the artifact: it must stay path-free too,
+    naming the output by file name only."""
+
+    fixture = _build(tmp_path)
+    out_path = tmp_path / "out.ninfer"
+    assert reencode_nvfp4.main(_arguments(fixture, out_path, "--round", "down", weights=True)) == 0
+    report = _report(tmp_path)
+    assert report["artifact"] == out_path.name
+    assert "/" not in report["artifact"] and "\\" not in report["artifact"]
+    _assert_no_path_fragments(json.dumps(report), tmp_path)
 
 
 def test_donor_words_everywhere_without_weights(tmp_path) -> None:

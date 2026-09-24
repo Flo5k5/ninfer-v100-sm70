@@ -13,18 +13,24 @@ from pathlib import PureWindowsPath
 
 
 def is_local_path(value: str) -> bool:
-    """Whether ``value`` is an absolute, home-relative or Windows drive/UNC filesystem path."""
+    """Whether ``value`` is an absolute, home-relative, Windows drive/UNC, or explicitly relative
+    filesystem path -- one with a literal ``.`` or ``..`` component, such as ``..``,
+    ``../checkpoints/model`` or ``./model``.
 
-    return value.startswith(("/", "~", "\\")) or bool(PureWindowsPath(value).drive)
+    A Hugging Face repository id (``org/model``) or an artifact id has no such component and is
+    not a path, even though it may contain ``/`` or ``.`` characters within a segment.
+    """
+
+    if value.startswith(("/", "~", "\\")) or bool(PureWindowsPath(value).drive):
+        return True
+    parts = value.replace("\\", "/").split("/")
+    return "." in parts or ".." in parts
 
 
 def input_label(value: str) -> str:
     """``argparse`` type of an input label: a repository id or name, never a local path."""
 
-    parts = value.replace("\\", "/").split("/")
-    if not value.strip() or value != value.strip() or is_local_path(value) or (
-        "." in parts or ".." in parts
-    ):
+    if not value.strip() or value != value.strip() or is_local_path(value):
         raise argparse.ArgumentTypeError(
             f"{value!r} is not an input label: name the input by repository id or name "
             "(for example org/model), not by a filesystem path"
