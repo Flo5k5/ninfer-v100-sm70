@@ -8,6 +8,8 @@ import pytest
 
 from tools.artifact.reader import Artifact
 from tools.artifact.framing import HEADER, MAGIC, PART_MAGIC
+from tools.artifact.inspect import artifact_summary
+from tools.artifact.layouts import encoded_size
 from tools.artifact.schema import (
     ArtifactError,
     ResourceSpec,
@@ -87,6 +89,68 @@ def test_single_file_known_header_payload_and_refs(tmp_path):
             reader.read_range(reader.payload_bytes, 1)
 
 
+def test_every_registered_storage_round_trips_with_its_summary(tmp_path):
+    path = tmp_path / "storages.ninfer"
+    specs = [
+        ResourceSpec("frontend/tokenizer.json", 2),
+        TensorSpec("direct/bf16", (2,), "bf16", "contiguous_le_v1"),
+        TensorSpec("direct/fp32", (1,), "fp32", "contiguous_le_v1"),
+        TensorSpec("direct/int32", (1,), "int32", "contiguous_le_v1"),
+        TensorSpec("quant/q4", (1, 64), "q4_g64_fp16", "row_split_k128_v1"),
+        TensorSpec("quant/q5", (1, 64), "q5_g64_fp16", "row_split_k128_v1"),
+        TensorSpec("quant/q6", (1, 64), "q6_g64_fp16", "row_split_k128_v1"),
+        TensorSpec("quant/q8", (1, 32), "q8_g32_fp16", "row_split_k128_v1"),
+        TensorSpec("quant/nvfp4", (128, 64), "nvfp4", "block_scale_k16_m128x4_v1"),
+        TensorSpec("quant/fp8_row", (2, 4), "fp8_e4m3fn_row_bf16", "row_scale_v1"),
+    ]
+    payloads = {
+        spec.id: (
+            b"{}"
+            if isinstance(spec, ResourceSpec)
+            else bytes([index]) * encoded_size(spec.layout, spec.format, spec.shape)
+        )
+        for index, spec in enumerate(specs)
+    }
+    with ArtifactWriter(
+        path,
+        specs,
+        components={
+            "text": {
+                "config": {},
+                "resources": {"tokenizer.json": "frontend/tokenizer.json"},
+            }
+        },
+        bindings={},
+        metadata={"name": "test-model"},
+    ) as writer:
+        for object_id, payload in payloads.items():
+            writer.write_object(object_id, payload)
+
+    with Artifact(path) as reader:
+        for object_id, payload in payloads.items():
+            assert reader.read_object(object_id) == payload
+        summary = artifact_summary(reader)
+    assert summary["name"] == "test-model"
+    assert (summary["objects"], summary["tensors"], summary["resources"]) == (10, 9, 1)
+    assert summary["formats"] == {
+        "bf16": 1,
+        "fp32": 1,
+        "fp8_e4m3fn_row_bf16": 1,
+        "int32": 1,
+        "nvfp4": 1,
+        "q4_g64_fp16": 1,
+        "q5_g64_fp16": 1,
+        "q6_g64_fp16": 1,
+        "q8_g32_fp16": 1,
+    }
+    assert summary["layouts"] == {
+        "block_scale_k16_m128x4_v1": 1,
+        "contiguous_le_v1": 3,
+        "row_scale_v1": 1,
+        "row_split_k128_v1": 4,
+    }
+
+
 def test_shards_use_recorded_names_and_open_only_when_needed(tmp_path):
     path = tmp_path / "large.ninfer"
     payload = bytes(range(251)) * 110
@@ -156,6 +220,24 @@ def test_existing_output_is_preserved(tmp_path):
     assert path.read_bytes() == b"old"
 
 
+def test_reader_rejects_foreign_magic_and_directory_beyond_the_entry(tmp_path):
+    path = tmp_path / "entry.ninfer"
+    _small(path)
+    raw = path.read_bytes()
+    _, json_bytes, identity = HEADER.unpack(raw[: HEADER.size])
+
+    path.write_bytes(
+        HEADER.pack(b"NINFER\0\2", json_bytes, identity) + raw[HEADER.size :]
+    )
+    with pytest.raises(ArtifactError, match="entry magic"):
+        Artifact(path)
+
+    beyond = len(raw) - HEADER.size + 1
+    path.write_bytes(HEADER.pack(MAGIC, beyond, identity) + raw[HEADER.size :])
+    with pytest.raises(ArtifactError, match="exceeds entry file"):
+        Artifact(path)
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -165,6 +247,10 @@ def test_existing_output_is_preserved(tmp_path):
         pytest.param(
             lambda d: d["bindings"]["text/reordered"]["parts"][0].update(range=[0, 5]),
             id="binding-outside-parent",
+        ),
+        pytest.param(
+            lambda d: d.update(source_recipe="must not enter the artifact"),
+            id="unknown-root-key",
         ),
     ],
 )
@@ -183,6 +269,17 @@ def test_unknown_codec_is_deferred_until_object_is_consumed(tmp_path):
     with Artifact(path) as reader:
         assert reader.read_object("template") == b"hello"
         with pytest.raises(ArtifactError, match="future_codec"):
+            reader.read_object("w")
+
+
+def test_encoded_size_mismatch_is_deferred_until_object_is_consumed(tmp_path):
+    path = tmp_path / "resized.ninfer"
+    directory = _small(path)
+    directory["objects"][0]["bytes"] = 6
+    _rewrite(path, directory)
+    with Artifact(path) as reader:
+        assert reader.read_object("template") == b"hello"
+        with pytest.raises(ArtifactError, match="expected 8 encoded bytes"):
             reader.read_object("w")
 
 
