@@ -26,6 +26,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
   and the opt-in real public-Engine route;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
+- `test_artifact_v2_rejection.cpp` — rejection of a v2 entry with guidance to the published v3
+  artifacts, distinct from other entry versions;
 - `test_openai_schema.cpp`, `test_openai_responses.cpp`,
   `test_openai_responses_store.cpp`, `test_anthropic_schema.cpp`, and
   `test_tool_call_parser.cpp` — current protocol translation, Responses Item/state/SSE behavior,

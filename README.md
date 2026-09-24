@@ -17,6 +17,10 @@ It supports text, image, and video input through a local CLI or OpenAI-/Anthropi
 | Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
 
 Artifacts contain the exact model weights, tokenizer, chat template, and required media frontend resources.
+NInfer loads only version-3 artifacts, which replaced the version-2 files in these repositories on
+2026-09-15. Download any artifact obtained before that date again. On this Volta port, the two `nvfp4`
+artifacts load today; the `groupwise-int` artifacts need a loader fix that is in progress, and the
+Qwen3.6-35B-A3B MoE weights have no v3 binding yet.
 
 ## Performance
 
