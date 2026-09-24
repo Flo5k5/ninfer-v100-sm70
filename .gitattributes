@@ -2,3 +2,6 @@
 # default whitespace checks.
 /third_party/spdlog/include/** -whitespace
 /third_party/spdlog/src/** -whitespace
+/third_party/xgrammar/include/** -whitespace
+/third_party/xgrammar/cpp/** -whitespace
+/third_party/xgrammar/3rdparty/** -whitespace

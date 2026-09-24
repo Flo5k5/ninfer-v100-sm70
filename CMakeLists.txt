@@ -113,6 +113,8 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   # not configure or link it.
   add_subdirectory(third_party/spdlog)
 endif()
+# Grammar-constrained decoding compiles and matches grammars with a repository-pinned xgrammar.
+add_subdirectory(third_party/xgrammar)
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

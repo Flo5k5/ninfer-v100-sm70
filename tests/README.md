@@ -40,6 +40,13 @@ benchmark-report, and external protocol behavior. Repository verification princi
   `test_tool_call_parser.cpp` — current protocol translation, Responses Item/state/SSE behavior,
   schema-guided tool-argument normalization, structural fallback, and chunk-invariant incremental
   tool-call behavior;
+- `test_grammar.cpp` — grammar-constrained decoding on a byte-level toy vocabulary: the enforced
+  JSON Schema subset (every schema xgrammar would weaken is rejected, and output that would be
+  invalid JSON is refused), schemas no finite value satisfies, the regex and schema compile-cost
+  units and limits, including a referenced schema compiled twice, the deepest reference chain the
+  limits admit compiled on the compile thread's stack, compilation, grammars that allow no output,
+  the single-flight byte-bounded cache and cached rejections, handover of an abandoned compilation,
+  token masks and the draft walk against a manual accept loop, and silence of xgrammar diagnostics;
 - `test_request_log.cpp` — the consumed request JSONL schema and exact measurement fields, plus
   representative Serve request/throughput pretty records, failure severity, zero-field elision,
   and exclusion of arbitrary client error text;

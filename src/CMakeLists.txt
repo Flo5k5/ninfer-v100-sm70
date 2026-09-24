@@ -406,6 +406,15 @@ ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
 
+# Grammar compilation and matching for constrained decoding: JSON Schema admission, a bounded
+# compile pool with a byte-bounded cache, and per-request token matchers. Host-only.
+add_library(ninfer_grammar STATIC
+  grammar/grammar_service.cpp
+  grammar/regex_cost.cpp
+  grammar/schema_admission.cpp)
+ninfer_internal_includes(ninfer_grammar)
+target_link_libraries(ninfer_grammar PUBLIC ninfer_core xgrammar::xgrammar)
+
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
   text/unicode.cpp
