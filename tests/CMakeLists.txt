@@ -63,6 +63,9 @@ ninfer_add_test(ninfer_artifact_v2_rejection_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_artifact_typed_binding_test
+  SOURCES test_artifact_typed_binding.cpp
+  LIBRARIES ninfer_artifact)
 ninfer_add_test(ninfer_media_decode_test
   SOURCES test_media_decode.cpp
   LIBRARIES ninfer_media_decode)
