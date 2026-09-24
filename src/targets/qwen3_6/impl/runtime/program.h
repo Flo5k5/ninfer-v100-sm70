@@ -11,6 +11,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/context_lookup.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
@@ -464,6 +465,7 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    ContextLookupController lookup;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
@@ -618,6 +620,30 @@ public:
 
     void reset_memory_peaks() noexcept;
 
+    // Which frame verified an MTP row; planning keeps the three widths distinct.
+    enum class MtpVerification : std::uint8_t {
+        Drafts,
+        LookupEntry,
+        Lookup,
+    };
+
+    // Learned drafts a lookup round proposes for the next round. The entry tier regenerates the
+    // configured window, since the copy it probes often ends inside the round; the full tier only
+    // runs while a copy continues and keeps one draft as the next agreement guard.
+    [[nodiscard]] std::uint32_t lookup_proposal_window(bool entry) const noexcept {
+        return entry ? draft_window : 1U;
+    }
+
+    [[nodiscard]] MtpVerification mtp_verification(std::uint32_t row_stride) const noexcept {
+        if (lookup_window != 0 && row_stride == lookup_window + 1U) {
+            return MtpVerification::Lookup;
+        }
+        if (lookup_entry_window != 0 && row_stride == lookup_entry_window + 1U) {
+            return MtpVerification::LookupEntry;
+        }
+        return MtpVerification::Drafts;
+    }
+
     friend struct qwen3_6::detail::PressurePlanningSessionImpl<Variant>;
 
     const LoadedModelData& model;
@@ -630,6 +656,11 @@ public:
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    const ContextLookupOptions context_lookup;
+    // Copied tokens verified per MTP lookup round; zero when no lookup frame is planned.
+    const std::uint32_t lookup_window;
+    // Copied tokens verified by the narrower tier that enters a copy; zero when not planned.
+    const std::uint32_t lookup_entry_window;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -659,6 +690,8 @@ public:
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<GdnReplayRecords> mtp_lookup_replay_records;
     std::optional<ops::GdnReplayFoldPlan> mtp_lookup_replay_fold;
+    std::optional<GdnReplayRecords> mtp_lookup_entry_replay_records;
+    std::optional<ops::GdnReplayFoldPlan> mtp_lookup_entry_replay_fold;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
@@ -677,6 +710,7 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily mtp_lookup_graphs;
+    DecodeGraphFamily mtp_lookup_entry_graphs;
     DecodeGraphFamily dflash_graphs;
 
     PinnedHostBuffer round_host;

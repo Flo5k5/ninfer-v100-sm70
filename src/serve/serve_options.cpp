@@ -80,6 +80,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--no-response-store] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--lookup-policy off|fixed|adaptive] [--lookup-min-suffix N] "
+           "[--lookup-max-proposal N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--default-reasoning-effort LEVEL] [--reasoning-effort-alias FROM=TO] "
            "[--omitted-thinking-as-summarized] "
@@ -124,7 +126,14 @@ std::string serve_usage_text(const char* argv0) {
            "visible Thinking instead of rejecting it\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --lookup-policy selects MTP context lookup (default fixed): it copies what "
+           "followed an\n"
+           "       earlier occurrence of the last --lookup-min-suffix tokens (default 16) and "
+           "verifies up to\n"
+           "       --lookup-max-proposal copied tokens per round (default 15); adaptive uses "
+           "the suffix only\n"
+           "       to resume an interrupted copy or inside tool calls.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -285,6 +294,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--lookup-policy") {
+            options.speculative.context_lookup.policy =
+                product::parse_context_lookup_policy(require_value("--lookup-policy"));
+        } else if (arg == "--lookup-min-suffix") {
+            options.speculative.context_lookup.min_suffix = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lookup-min-suffix"), "lookup-min-suffix"));
+        } else if (arg == "--lookup-max-proposal") {
+            options.speculative.context_lookup.max_proposal =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--lookup-max-proposal"), "lookup-max-proposal"));
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");

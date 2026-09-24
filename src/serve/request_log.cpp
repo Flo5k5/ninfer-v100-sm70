@@ -344,7 +344,13 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"drafted_tokens", metrics.speculative_draft_tokens},
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
-                {"accepted_per_position", metrics.speculative_accepted_per_position}};
+                {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"mtp_round_seconds", metrics.speculative_mtp_round_seconds},
+                {"lookup", Json{{"rounds", metrics.speculative_lookup_rounds},
+                                {"entry_rounds", metrics.speculative_lookup_entry_rounds},
+                                {"drafted_tokens", metrics.speculative_lookup_draft_tokens},
+                                {"accepted_tokens", metrics.speculative_lookup_accepted_tokens},
+                                {"round_seconds", metrics.speculative_lookup_round_seconds}}}};
 }
 
 Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
@@ -510,6 +516,11 @@ std::string format_server_start_json(
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
              {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
+             {"context_lookup",
+              Json{{"policy", product::context_lookup_policy_name(
+                                  engine_options.speculative.context_lookup.policy)},
+                   {"min_suffix", engine_options.speculative.context_lookup.min_suffix},
+                   {"max_proposal", engine_options.speculative.context_lookup.max_proposal}}},
              {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
                                                            context_cost.transfer_source)},
                                    {"prefill_source", ninfer::context_cost_preset_source_name(

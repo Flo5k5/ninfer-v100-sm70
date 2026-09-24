@@ -207,6 +207,9 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--lookup-policy off\|fixed\|adaptive` | MTP context lookup; see [V100 context lookup](v100.md#context-lookup-mtp) | `fixed` |
+| `--lookup-min-suffix N` | `2..64`; fixed: recurring suffix length; adaptive: shortest suffix, used to resume an interrupted copy and inside tool calls | `16` |
+| `--lookup-max-proposal N` | copied tokens verified per lookup round, above the MTP window and at most `15` | `15` |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |

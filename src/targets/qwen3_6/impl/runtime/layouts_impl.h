@@ -164,18 +164,24 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          .key_dim         = TextConfig::gdn_key_head_dim,
                          .value_dim       = TextConfig::gdn_value_head_dim,
                      });
-        if (plan.speculative_backend == SpeculativeBackend::Mtp) {
-            out.mtp_lookup_replay_records = plan_gdn_replay_records(
+        const auto lookup_records = [&](std::uint32_t window) {
+            return plan_gdn_replay_records(
                 builder, GdnReplayRecordSpec{
                              .layers          = TextConfig::gdn_layers(),
                              .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
-                             .width = static_cast<std::int32_t>(qwen3_6::kMtpLookupMaximumWidth),
-                             .conv_channels = TextConfig::convolution_dim,
-                             .qk_heads      = TextConfig::gdn_key_heads,
-                             .value_heads   = TextConfig::gdn_value_heads,
-                             .key_dim       = TextConfig::gdn_key_head_dim,
-                             .value_dim     = TextConfig::gdn_value_head_dim,
+                             .width           = static_cast<std::int32_t>(window + 1U),
+                             .conv_channels   = TextConfig::convolution_dim,
+                             .qk_heads        = TextConfig::gdn_key_heads,
+                             .value_heads     = TextConfig::gdn_value_heads,
+                             .key_dim         = TextConfig::gdn_key_head_dim,
+                             .value_dim       = TextConfig::gdn_value_head_dim,
                          });
+        };
+        if (plan.lookup_window != 0) {
+            out.mtp_lookup_replay_records = lookup_records(plan.lookup_window);
+        }
+        if (plan.lookup_entry_window != 0) {
+            out.mtp_lookup_entry_replay_records = lookup_records(plan.lookup_entry_window);
         }
     }
     if constexpr (Variant::supports_dflash) {
@@ -225,11 +231,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
 
     out.round = qwen3_6::begin_round_state_layout(
-        builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
-                                         .output_rows    = TextConfig::output_rows,
-                                         .batch_capacity = plan.max_concurrency,
-                                         .draft_window   = plan.draft_window,
-                                         .backend        = plan.speculative_backend});
+        builder, qwen3_6::RoundStateSpec{.hidden              = TextConfig::hidden,
+                                         .output_rows         = TextConfig::output_rows,
+                                         .batch_capacity      = plan.max_concurrency,
+                                         .draft_window        = plan.draft_window,
+                                         .lookup_window       = plan.lookup_window,
+                                         .lookup_entry_window = plan.lookup_entry_window,
+                                         .backend             = plan.speculative_backend});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     if (plan.causal_scoring) {
@@ -432,8 +440,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.mtp()) {
-        constexpr std::int32_t lookup_verify =
-            static_cast<std::int32_t>(qwen3_6::kMtpLookupMaximumWidth);
+        // Batched rounds verify either the learned window or, when planned, the lookup window.
+        const std::int32_t batch_drafts =
+            static_cast<std::int32_t>(std::max(plan.draft_window, plan.lookup_window));
+        const std::int32_t lookup_verify = batch_drafts + 1;
         WorkspaceLayoutBuilder mtp_prefill;
         text_common_root(mtp_prefill, chunk);
         target_body(mtp_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, GdnWorkspacePath::Prefill,
@@ -496,8 +506,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             proposal_scratch(proposal, batch);
             const std::size_t batch_accept =
                 ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                    TextConfig::token_domain, qwen3_6::kMtpLookupMaximumDrafts,
-                    qwen3_6::kMtpLookupMaximumDrafts, batch, batch);
+                    TextConfig::token_domain, batch_drafts, batch_drafts, batch, batch);
             out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment), finish(ar),
                                       finish(proposal), batch_accept});
         }
@@ -701,12 +710,23 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
                 "disabled speculative decoding requires draft_tokens=0 and the full proposal head");
         }
         break;
-    case SpeculativeBackend::Mtp:
+    case SpeculativeBackend::Mtp: {
         if (options.speculative.draft_tokens == 0 ||
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
             throw std::invalid_argument("MTP draft window must be in [1,7]");
         }
+        const ContextLookupOptions& lookup = options.speculative.context_lookup;
+        if (lookup.min_suffix < kContextLookupMinimumSuffix ||
+            lookup.min_suffix > kContextLookupMaximumSuffix) {
+            throw std::invalid_argument("MTP context-lookup suffix must be in [2,64]");
+        }
+        if (lookup.max_proposal <= options.speculative.draft_tokens ||
+            lookup.max_proposal > kContextLookupMaximumProposal) {
+            throw std::invalid_argument(
+                "MTP context-lookup proposal must exceed the draft window and be at most 15");
+        }
         break;
+    }
     case SpeculativeBackend::DFlash:
     case SpeculativeBackend::DFlash2:
         if (options.speculative.backend != DFlashConfig::backend) {
@@ -750,6 +770,17 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
+    impl->context_lookup      = inputs.context_lookup;
+    const bool lookup_planned = inputs.speculative_backend == SpeculativeBackend::Mtp &&
+                                inputs.context_lookup.policy != ContextLookupPolicy::Off;
+    impl->lookup_window       = lookup_planned ? inputs.context_lookup.max_proposal : 0U;
+    // Adaptive lookup enters copies through a narrower tier when one fits strictly between the
+    // learned-draft window and the full lookup window.
+    constexpr std::uint32_t entry_window = kContextLookupEntryProposal;
+    const bool entry_planned  = inputs.context_lookup.policy == ContextLookupPolicy::Adaptive &&
+                                entry_window > inputs.draft_window &&
+                                entry_window < impl->lookup_window;
+    impl->lookup_entry_window = entry_planned ? entry_window : 0U;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
@@ -766,21 +797,22 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles =
-                mtp_graph_profiles(impl->capacity, qwen3_6::kMtpLookupMaximumDrafts);
-            const std::size_t per_batch_allowance = graph_topology_allowance(
+            // The widest planned verification bounds every family: the learned-draft family and,
+            // when lookup is planned, the lookup family.
+            const std::uint32_t widest   = std::max(impl->draft_window, impl->lookup_window);
+            const auto profiles          = mtp_graph_profiles(impl->capacity, widest);
+            const std::size_t per_family = graph_topology_allowance(
                 profiles,
                 [&](GraphExecutionProfile profile) {
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) +
-                            2ULL * qwen3_6::kMtpLookupMaximumDrafts);
+                        impl->capacity, static_cast<std::uint64_t>(profile.max) + 2ULL * widest);
                     return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                 },
                 "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(2ULL * per_batch_allowance,
-                                                      impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            const std::uint64_t families = 1ULL + (impl->lookup_window != 0 ? 1ULL : 0ULL) +
+                                           (impl->lookup_entry_window != 0 ? 1ULL : 0ULL);
+            impl->graph_allowance_bytes  = checked_mul(families * per_family, impl->max_concurrency,
+                                                       "MTP exact-b graph allowance");
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =
@@ -824,6 +856,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,
+        .context_lookup      = options.speculative.context_lookup,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
