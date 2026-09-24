@@ -586,12 +586,15 @@ cmake --build build --parallel --target ninfer_context_softmax_attention_bench
 
 `ninfer_sliding_window_attention_bench` measures the public Q32/KV8/D128 symmetric sliding-window
 contract over a 2048- or 4096-slot cyclic BF16-K/FP16-V cache and a complete non-causal query
-block with nonzero represented K/V values. It reports the production route, key tile, split capacity,
-merge warp count, Graph node count, workspace, and exact batch shape. `--envelope-max N` holds the
-Graph resource envelope fixed while the actual context varies. `--graph-calls 32 --execution graph`
-measures 32 public calls in one Graph and reports latency per call; this removes host submission
-gaps from short warm-cache measurements. For a cold bundle, L2 is flushed once before the bundle,
-so only its first call starts cold. Profiling uses one public call (`--graph-calls 1`).
+block with nonzero represented K/V values. It reports the Graph node count, workspace, and exact
+batch shape. It does not report the private launch plan, whose route does not name the kernels
+that run on sm_70: there the launcher runs split-KV only for a split plan at T=8 over the 2048-slot
+window, and one single-pass kernel in every other case. The Graph node count shows which one ran.
+`--envelope-max N` holds the Graph resource envelope fixed while the actual context varies.
+`--graph-calls 32 --execution graph` measures 32 public calls in one Graph and reports latency per
+call; this removes host submission gaps from short warm-cache measurements. For a cold bundle, L2
+is flushed once before the bundle, so only its first call starts cold. Profiling uses one public
+call (`--graph-calls 1`).
 
 ```bash
 cmake --build build --parallel --target ninfer_sliding_window_attention_bench
