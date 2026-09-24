@@ -2085,7 +2085,8 @@ int32_t JSONSchemaConverter::BuildTrieBody(const TrieNode& node, const std::stri
   }
   choices.push_back(Sequence({builder_.AddCharacterClass(excluded, true), RuleRef(kBasicStringSub)})
   );
-  choices.push_back(Sequence({ByteString("\\"), RuleRef(kBasicEscape), RuleRef(kBasicStringSub)}));
+  // NInfer: no escape while the key still spells a prefix of a declared property name: the escape
+  // could spell the rest of that name, and the object would repeat a declared property.
   for (const auto& [character, child] : node.children) {
     choices.push_back(Sequence(
         {ByteString(std::string(1, static_cast<char>(character))), BuildTrieBody(child, rule_name)}
@@ -2236,6 +2237,12 @@ int32_t JSONSchemaConverter::RegexExpression(
         return builder_.AddRegex(regex, json_string);
       }
     }
+  }
+
+  // NInfer: the CFG expansion keeps the characters a JSON string must escape, so it would emit
+  // invalid JSON. A pattern inside a JSON string that the automaton cannot enforce is rejected.
+  if (json_string) {
+    XGRAMMAR_LOG(FATAL) << "The pattern cannot be enforced inside a JSON string";
   }
 
   // Keep regex conversion independent. Only the uncommon fallback path converts its existing
@@ -2389,8 +2396,10 @@ int32_t JSONSchemaConverter::GenerateString(const StringSpec& spec, const std::s
   }
   // Check for length constraints
   if (spec.min_length != 0 || spec.max_length != -1) {
+    // NInfer: exclude every control character, which a JSON string must escape, not only CR
+    // and LF.
     int32_t character =
-        builder_.AddCharacterClass({{'"', '"'}, {'\\', '\\'}, {'\r', '\r'}, {'\n', '\n'}}, true);
+        builder_.AddCharacterClass({{0, 0x1f}, {'"', '"'}, {'\\', '\\'}}, true);
     int32_t body = Repeat(rule_name + "_characters", character, spec.min_length, spec.max_length);
     return Sequence({ByteString("\""), body, ByteString("\"")});
   }
@@ -3230,12 +3239,12 @@ std::optional<std::string> JSONSchemaConverter::JSONFormatToRegexPattern(const s
 
     std::string atext = "[\\w!#$%&'*+/=?^`{|}~-]";
     std::string dot_string = "(" + atext + "+(\\." + atext + "+)*)";
-    std::string quoted_string =
-        "\\\\\"(\\\\[\\x20-\\x7E]|[\\x20\\x21\\x23-\\x5B\\x5D-\\x7E])*\\\\\"";
     std::string domain =
         "([A-Za-z0-9]([\\-A-Za-z0-9]*[A-Za-z0-9])?)((\\.[A-Za-z0-9][\\-A-Za-z0-9]*[A-Za-z0-9])*"
         ")";
-    m["email"] = "^(" + dot_string + "|" + quoted_string + ")@" + domain + "$";
+    // NInfer: a quoted local part escapes any printable character with a backslash, which is not
+    // a JSON escape. Only the dot-atom local part is kept.
+    m["email"] = "^" + dot_string + "@" + domain + "$";
 
     m["date"] = "^(\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2]\\d|3[01]))$";
     m["time"] =
