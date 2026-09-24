@@ -168,6 +168,27 @@ ninfer_add_test(ninfer_qwen3_6_27b_context_lookup_real_test
   SOURCES targets/qwen3_6_27b/test_engine_context_lookup_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_context_lookup_real_test PROPERTIES SKIP_RETURN_CODE 77)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  # The FP32 text residual stream (Volta, qwen3.8-27b/nvfp4): scoring in both shapes against a
+  # BF16-residual engine, the production MTP + CUDA Graph decode, and its startup planning.
+  add_test(NAME ninfer_qwen3_6_27b_score_real_fp32_test
+    COMMAND ninfer_qwen3_6_27b_score_real_test --text-residual fp32)
+  ninfer_add_test(ninfer_qwen3_6_27b_residual_real_test
+    SOURCES targets/qwen3_6_27b/test_engine_residual_real.cpp
+    LIBRARIES ninfer_engine)
+  ninfer_add_test(ninfer_qwen3_6_27b_numerics_plan_test
+    SOURCES targets/qwen3_6_27b/test_numerics_plan.cpp
+    LIBRARIES ninfer_engine)
+  target_include_directories(ninfer_qwen3_6_27b_numerics_plan_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+  target_link_libraries(ninfer_qwen3_6_27b_numerics_plan_test PRIVATE CUDA::cudart)
+  set_tests_properties(
+    ninfer_qwen3_6_27b_score_real_fp32_test
+    ninfer_qwen3_6_27b_residual_real_test
+    ninfer_qwen3_6_27b_numerics_plan_test
+    PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
