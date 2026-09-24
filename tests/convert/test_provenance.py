@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.convert.common.provenance import (
+from tools.convert.provenance import (
     file_record,
     input_label,
     is_local_path,
@@ -15,7 +15,7 @@ from tools.convert.common.provenance import (
     strip_local_paths,
 )
 
-from ..path_fragments import assert_no_path_fragments
+from .path_fragments import assert_no_path_fragments
 
 
 # Values an older tool could have written where a repository id or artifact id was expected --

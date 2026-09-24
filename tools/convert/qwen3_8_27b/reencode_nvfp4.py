@@ -74,7 +74,7 @@ from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, encode_nvfp4
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
 from tools.artifact.writer import ArtifactWriter
-from tools.convert.common.provenance import input_label, local_name, strip_local_paths
+from tools.convert.provenance import input_label, local_name, strip_local_paths
 from tools.convert.qwen3_8_27b.graft_single_source import SourceCheckpoint
 from tools.convert.qwen3_8_27b.reencode_nvfp4_numeric import (
     RelativeError,
