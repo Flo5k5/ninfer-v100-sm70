@@ -4,7 +4,7 @@
 
 #include <algorithm>
 #include <set>
-#include <unordered_set>
+#include <utility>
 
 namespace ninfer::artifact {
 
@@ -93,26 +93,94 @@ const Component& Directory::component(std::string_view name) const {
     return found->second;
 }
 
-Json parse_json(std::string_view text, std::string_view label) {
-    std::vector<std::unordered_set<std::string>> member_stack;
-    const auto callback = [&](int, Json::parse_event_t event, Json& parsed) {
-        if (event == Json::parse_event_t::object_start) {
-            member_stack.emplace_back();
-        } else if (event == Json::parse_event_t::key) {
-            const auto& key = parsed.get_ref<const std::string&>();
-            if (!member_stack.back().insert(key).second) {
-                throw ArtifactError(std::string(label) + ": duplicate JSON member " + key);
-            }
-        } else if (event == Json::parse_event_t::object_end) {
-            member_stack.pop_back();
+namespace {
+
+// Builds the value nlohmann::json::parse returns and rejects a repeated member name in any object:
+// each object's member map is the set of names read so far. A parser callback could make the same
+// check, but nlohmann's callback parser rescans the enclosing container whenever an object ends,
+// which is quadratic in the number of sibling objects.
+class UniqueMemberBuilder final : public nlohmann::json_sax<Json> {
+public:
+    explicit UniqueMemberBuilder(std::string_view label) : label_(label) {}
+
+    bool null() override { return scalar(nullptr); }
+
+    bool boolean(bool value) override { return scalar(value); }
+
+    bool number_integer(number_integer_t value) override { return scalar(value); }
+
+    bool number_unsigned(number_unsigned_t value) override { return scalar(value); }
+
+    bool number_float(number_float_t value, const string_t&) override { return scalar(value); }
+
+    bool string(string_t& value) override { return scalar(std::move(value)); }
+
+    bool binary(binary_t& value) override { return scalar(Json::binary(std::move(value))); }
+
+    bool start_object(std::size_t) override { return open(Json::object()); }
+
+    bool key(string_t& name) override {
+        auto& members                 = open_.back()->get_ref<Json::object_t&>();
+        const auto [member, inserted] = members.try_emplace(std::move(name));
+        if (!inserted) {
+            throw ArtifactError(std::string(label_) + ": duplicate JSON member " + member->first);
         }
+        member_ = &member->second;
         return true;
-    };
-    try {
-        return Json::parse(text.begin(), text.end(), callback);
-    } catch (const Json::exception& error) {
-        throw ArtifactError(std::string(label) + ": " + error.what());
     }
+
+    bool end_object() override { return close(); }
+
+    bool start_array(std::size_t) override { return open(Json::array()); }
+
+    bool end_array() override { return close(); }
+
+    bool parse_error(std::size_t, const std::string&, const Json::exception& error) override {
+        throw ArtifactError(std::string(label_) + ": " + error.what());
+    }
+
+    Json take() { return std::move(root_); }
+
+private:
+    // Stores a value where it was read: as the root, as the next element of the innermost open
+    // array, or as the member whose name was read last.
+    Json& place(Json value) {
+        if (open_.empty()) { return root_ = std::move(value); }
+        if (open_.back()->is_array()) {
+            return open_.back()->get_ref<Json::array_t&>().emplace_back(std::move(value));
+        }
+        return *member_ = std::move(value);
+    }
+
+    bool scalar(Json value) {
+        place(std::move(value));
+        return true;
+    }
+
+    bool open(Json container) {
+        open_.push_back(&place(std::move(container)));
+        return true;
+    }
+
+    bool close() {
+        open_.pop_back();
+        return true;
+    }
+
+    std::string_view label_;
+    Json root_;
+    std::vector<Json*> open_; // objects and arrays still being read, innermost last
+    Json* member_ = nullptr;
+};
+
+} // namespace
+
+Json parse_json(std::string_view text, std::string_view label) {
+    UniqueMemberBuilder builder(label);
+    // The builder throws on every error instead of returning false, so this returns only after
+    // the complete text has been read.
+    Json::sax_parse(text.begin(), text.end(), &builder);
+    return builder.take();
 }
 
 namespace {
