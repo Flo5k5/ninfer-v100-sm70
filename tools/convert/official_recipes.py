@@ -174,6 +174,8 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
+# The Volta Engine resolves an artifact's weights profile from these names; a recipe
+# added here loads only once kOfficialRecipes in src/artifact/reader.cpp maps it.
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
