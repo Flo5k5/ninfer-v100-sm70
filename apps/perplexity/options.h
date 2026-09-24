@@ -27,6 +27,8 @@ struct Options {
     std::uint32_t scored_chunk  = 0;
     int device                  = 0;
     KvCacheStorage kv           = KvCacheStorage::Fp8E4M3Row256;
+    TextResidualStorage text_residual        = TextResidualStorage::BFloat16;
+    PrefillAttentionKernel prefill_attention = PrefillAttentionKernel::Automatic;
     bool quick                  = false;
     product::LogLevel log_level = product::LogLevel::Info;
 };

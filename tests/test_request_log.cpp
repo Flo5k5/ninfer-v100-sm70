@@ -263,6 +263,20 @@ int main() {
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
     failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
+    failures += check(server.at("engine").at("text_residual") == "bf16" &&
+                          server.at("engine").at("prefill_attention") == "auto",
+                      "default numerics options missing");
+    {
+        ninfer::EngineOptions numerics_options = engine_options;
+        numerics_options.text_residual         = ninfer::TextResidualStorage::Float32;
+        numerics_options.prefill_attention     = ninfer::PrefillAttentionKernel::SplitD;
+        const Json numerics_server             = Json::parse(format_server_start_json(
+            "serve-test", 1000, options, numerics_options, sampling_defaults, "deployment-alias",
+            load, memory, environment, std::uint64_t{123456}));
+        failures += check(numerics_server.at("engine").at("text_residual") == "fp32" &&
+                              numerics_server.at("engine").at("prefill_attention") == "splitd",
+                          "numerics options were not recorded");
+    }
     options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache = options.kv_cache;
     memory.kv_cache         = options.kv_cache;

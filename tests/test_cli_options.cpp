@@ -188,5 +188,38 @@ int main() {
               }),
               "CLI accepted top_k beyond the executable candidate domain");
     failures += check_context_lookup_flags();
+    const ninfer::cli::Options numerics_default =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"});
+    failures += check(numerics_default.text_residual == ninfer::TextResidualStorage::BFloat16 &&
+                          numerics_default.prefill_attention ==
+                              ninfer::PrefillAttentionKernel::Automatic,
+                      "CLI numerics defaults are not bf16/auto");
+    const ninfer::cli::Options numerics =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--text-residual", "fp32",
+               "--prefill-attention", "reference"});
+    failures += check(numerics.text_residual == ninfer::TextResidualStorage::Float32 &&
+                          numerics.prefill_attention == ninfer::PrefillAttentionKernel::Reference,
+                      "--text-residual/--prefill-attention were not parsed");
+    for (const char* kernel : {"auto", "splitd", "flash", "reference"}) {
+        failures += check(!rejects([kernel] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                           "--prefill-attention", kernel});
+                          }),
+                          "CLI rejected a prefill attention kernel");
+    }
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--text-residual", "fp16"});
+                      }),
+                      "CLI accepted an unknown text residual storage");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--prefill-attention", "SplitD"});
+                      }),
+                      "CLI accepted an unknown prefill attention kernel");
+    failures += check(help.find("--text-residual bf16|fp32") != std::string::npos &&
+                          help.find("--prefill-attention auto|splitd|flash|reference") !=
+                              std::string::npos,
+                      "CLI help omits the numerics controls");
     return failures == 0 ? 0 : 1;
 }

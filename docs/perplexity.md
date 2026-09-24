@@ -56,6 +56,12 @@ DeltaNet input projection and convolution keep their prefill forms. The scored r
 forward call per N tokens, so it is slower than the prefill route. Both values are recorded under
 `execution` in `report.json`.
 
+`--text-residual bf16|fp32` and `--prefill-attention auto|splitd|flash|reference` select the
+scoring engine's text residual storage and Volta wide prefill attention kernel, with the same
+meaning and startup validation as in `ninfer` and `ninfer-serve` (see
+[V100 long-context numerics](v100.md#long-context-numerics)); `execution` in `report.json` records
+both.
+
 ## Metric
 
 For a stream `x[0..N)`, every token after `x[0]` is scored exactly once. A window `[b,e)` with target

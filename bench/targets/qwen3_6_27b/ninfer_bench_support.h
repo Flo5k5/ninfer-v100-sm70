@@ -65,6 +65,8 @@ struct BenchOptions {
     std::optional<std::uint32_t> max_context;
     std::uint32_t prefill_chunk = kDefaultPrefillChunk;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    TextResidualStorage text_residual        = TextResidualStorage::BFloat16;
+    PrefillAttentionKernel prefill_attention = PrefillAttentionKernel::Automatic;
     SpeculativeOptions speculative;
     int device             = 0;
     bool use_cuda_graph    = true;
@@ -107,6 +109,8 @@ struct BenchEnvironment {
     std::uint32_t max_context   = 0;
     std::uint32_t prefill_chunk = kDefaultPrefillChunk;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    TextResidualStorage text_residual        = TextResidualStorage::BFloat16;
+    PrefillAttentionKernel prefill_attention = PrefillAttentionKernel::Automatic;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;
     bool decode_graph_primed                       = false;

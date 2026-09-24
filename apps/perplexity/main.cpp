@@ -8,6 +8,7 @@
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
+#include "product/numerics_options.h"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
@@ -105,6 +106,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
     engine_options.prefill_chunk    = options.prefill_chunk;
+    engine_options.text_residual    = options.text_residual;
+    engine_options.prefill_attention = options.prefill_attention;
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
@@ -336,7 +339,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"prefill_chunk_tokens", options.prefill_chunk},
           {"scored_chunk_tokens", options.scored_chunk},
           {"score_tile_tokens", 1024},
-          {"kv_dtype", ninfer::perplexity::kv_dtype_name(options.kv)}}},
+          {"kv_dtype", ninfer::perplexity::kv_dtype_name(options.kv)},
+          {"text_residual", ninfer::product::text_residual_name(options.text_residual)},
+          {"prefill_attention",
+           ninfer::product::prefill_attention_name(options.prefill_attention)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"read_and_tokenize_seconds", preflight_seconds},

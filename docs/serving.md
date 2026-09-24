@@ -797,6 +797,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--no-response-store` | retain no Responses; see [Zero data retention](#zero-data-retention) | store on |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
+| `--text-residual bf16\|fp32` | text residual stream storage; `fp32` on Volta for Qwen3.8-27B NVFP4 without DFlash | `bf16` |
+| `--prefill-attention auto\|splitd\|flash\|reference` | Volta wide prefill attention kernel | `auto` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..7`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -844,6 +846,11 @@ independent startup-fixed pinned-memory capacities; Host KV is shared by Main an
 Backend pool and is consumed in physical page extents. `--no-prefix-reuse` selects root-only Engine
 mode and cannot be combined with any of the seven explicit context-cache capacity flags, including
 zero-valued flags.
+
+`--text-residual` and `--prefill-attention` are the Volta numerics controls described in
+[V100 long-context numerics](v100.md#long-context-numerics); Engine startup rejects `fp32` for other
+artifacts, with DFlash, or outside the Volta build, and any kernel other than `auto` outside the
+Volta build. The `server_start` record reports both.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 

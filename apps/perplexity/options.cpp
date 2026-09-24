@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/numerics_options.h"
 
 #include <charconv>
 #include <stdexcept>
@@ -38,7 +39,8 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--prefill-chunk N] [--scored-chunk N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--text-residual bf16|fp32]\n"
+           "       [--prefill-attention auto|splitd|flash|reference] [--output <directory>]\n"
            "       [--logits-out <file> [--logits-reference <file>] [--chunks N]]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
@@ -96,6 +98,10 @@ Options parse_options(int argc, char** argv) {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--kv-dtype") {
             out.kv = parse_kv_dtype(value("--kv-dtype"));
+        } else if (option == "--text-residual") {
+            out.text_residual = product::parse_text_residual(value("--text-residual"));
+        } else if (option == "--prefill-attention") {
+            out.prefill_attention = product::parse_prefill_attention(value("--prefill-attention"));
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
         } else if (option == "--logits-out") {
