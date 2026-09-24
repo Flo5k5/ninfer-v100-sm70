@@ -134,8 +134,10 @@ def test_local_name_refuses_a_path_without_a_name() -> None:
         local_name("/")
 
 
-def test_file_record_names_the_file_and_digests_its_contents(tmp_path) -> None:
-    data = bytes(range(256)) * 1024
+# Empty, under one read chunk, and several chunks with a partial last one.
+@pytest.mark.parametrize("size", [0, 256 * 1024, (5 << 20) // 2], ids=["empty", "one-chunk", "chunks"])
+def test_file_record_names_the_file_and_digests_its_contents(tmp_path, size) -> None:
+    data = (bytes(range(256)) * (size // 256 + 1))[:size]
     path = tmp_path / "fixtures" / "ranking.train.counts.i64"
     path.parent.mkdir()
     path.write_bytes(data)
