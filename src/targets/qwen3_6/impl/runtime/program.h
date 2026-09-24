@@ -11,6 +11,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/context_lookup.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
@@ -464,6 +465,7 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    ContextLookupController lookup;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
@@ -630,6 +632,9 @@ public:
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    const ContextLookupOptions context_lookup;
+    // MTP verification frames; no lookup frame is planned unless the backend is MTP.
+    const ContextLookupPlan lookup_plan;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -659,6 +664,8 @@ public:
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<GdnReplayRecords> mtp_lookup_replay_records;
     std::optional<ops::GdnReplayFoldPlan> mtp_lookup_replay_fold;
+    std::optional<GdnReplayRecords> mtp_lookup_entry_replay_records;
+    std::optional<ops::GdnReplayFoldPlan> mtp_lookup_entry_replay_fold;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
@@ -677,6 +684,7 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily mtp_lookup_graphs;
+    DecodeGraphFamily mtp_lookup_entry_graphs;
     DecodeGraphFamily dflash_graphs;
 
     PinnedHostBuffer round_host;

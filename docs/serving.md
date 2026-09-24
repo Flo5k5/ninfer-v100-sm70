@@ -798,8 +798,11 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-response-store` | retain no Responses; see [Zero data retention](#zero-data-retention) | store on |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--draft-tokens N` | MTP `1..7`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--lookup-policy off\|fixed\|adaptive` | MTP context lookup, requires `--spec mtp`; see [V100 context lookup](v100.md#context-lookup-mtp) | `fixed` |
+| `--lookup-min-suffix N` | `2..64`, requires `fixed` or `adaptive`; fixed: recurring suffix length; adaptive: floor of the per-request suffix thresholds (tool-call arguments start at it, other text starts at 16, or at N if higher, and moves toward it after paying rounds) and the suffix that resumes an interrupted copy | `16` |
+| `--lookup-max-proposal N` | copied tokens verified per lookup round, above the MTP window and at most `15`, requires `fixed` or `adaptive`; adaptive also plans a 7-token entry tier (one more MTP graph family) when `--draft-tokens` < 7 < N | `15` |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
@@ -914,7 +917,10 @@ Aborted planning attempts are not published.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, and
+`mtp_round_seconds`; its nested `lookup` object counts the MTP context-lookup subset (`rounds`,
+`entry_rounds`, `drafted_tokens`, `accepted_tokens`, `round_seconds`). Round seconds are
+submit-to-completion wall time of rounds without and with a copied continuation. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
 For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.

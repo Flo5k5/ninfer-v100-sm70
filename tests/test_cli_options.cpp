@@ -1,9 +1,11 @@
 #include "options.h"
 
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -27,6 +29,87 @@ int check(bool condition, const char* message) {
     std::cerr << message << '\n';
     return 1;
 }
+
+// The rejection message of a command line, or empty when it parses.
+std::string rejection(std::vector<std::string> arguments) {
+    try {
+        (void)parse(std::move(arguments));
+    } catch (const std::invalid_argument& error) { return error.what(); }
+    return {};
+}
+
+std::vector<std::string> mtp_prompt(std::initializer_list<std::string> extra) {
+    std::vector<std::string> arguments{"ninfer-cli", "model.ninfer", "--prompt", "hello"};
+    arguments.insert(arguments.end(), extra.begin(), extra.end());
+    return arguments;
+}
+
+int check_context_lookup_flags() {
+    int failures = 0;
+    const ninfer::cli::Options defaults =
+        parse(mtp_prompt({"--spec", "mtp", "--draft-tokens", "4"}));
+    failures +=
+        check(defaults.speculative.context_lookup.policy == ninfer::ContextLookupPolicy::Fixed &&
+                  defaults.speculative.context_lookup.min_suffix == 16 &&
+                  defaults.speculative.context_lookup.max_proposal == 15,
+              "MTP context lookup defaults do not preserve the fixed 16-token rule");
+    const ninfer::cli::Options adaptive =
+        parse(mtp_prompt({"--spec", "mtp", "--draft-tokens", "4", "--lookup-policy", "adaptive",
+                          "--lookup-min-suffix", "4", "--lookup-max-proposal", "8"}));
+    failures +=
+        check(adaptive.speculative.context_lookup.policy == ninfer::ContextLookupPolicy::Adaptive &&
+                  adaptive.speculative.context_lookup.min_suffix == 4 &&
+                  adaptive.speculative.context_lookup.max_proposal == 8,
+              "CLI did not preserve the context lookup flags");
+    const ninfer::cli::Options off =
+        parse(mtp_prompt({"--spec", "mtp", "--draft-tokens", "7", "--lookup-policy", "off"}));
+    failures += check(off.speculative.context_lookup.policy == ninfer::ContextLookupPolicy::Off,
+                      "--lookup-policy off was rejected with a seven-token draft window");
+    const std::string help = ninfer::cli::usage_text("ninfer-cli");
+    failures += check(help.find("--lookup-policy off|fixed|adaptive") != std::string::npos &&
+                          help.find("--lookup-min-suffix") != std::string::npos &&
+                          help.find("--lookup-max-proposal") != std::string::npos,
+                      "CLI help omits a context lookup flag");
+
+    // Explicit flags are validated even when their value equals the default.
+    for (const auto& flag : {std::vector<std::string>{"--lookup-policy", "fixed"},
+                             std::vector<std::string>{"--lookup-min-suffix", "16"},
+                             std::vector<std::string>{"--lookup-max-proposal", "15"}}) {
+        std::vector<std::string> without_mtp = mtp_prompt({});
+        without_mtp.insert(without_mtp.end(), flag.begin(), flag.end());
+        failures += check(rejection(without_mtp).find("require --spec mtp") != std::string::npos,
+                          "CLI accepted an explicit context lookup flag without MTP");
+        std::vector<std::string> with_dflash =
+            mtp_prompt({"--spec", "dflash", "--draft-tokens", "7"});
+        with_dflash.insert(with_dflash.end(), flag.begin(), flag.end());
+        failures += check(rejection(with_dflash).find("require --spec mtp") != std::string::npos,
+                          "CLI accepted an explicit context lookup flag with DFlash");
+    }
+    // With lookup off, sizes are rejected as unused rather than checked against the draft window.
+    failures +=
+        check(rejection(mtp_prompt({"--spec", "mtp", "--draft-tokens", "7", "--lookup-policy",
+                                    "off", "--lookup-max-proposal", "6"}))
+                      .find("--lookup-policy fixed or adaptive") != std::string::npos,
+              "CLI did not reject a lookup proposal with --lookup-policy off as unused");
+    failures += check(rejection(mtp_prompt({"--spec", "mtp", "--draft-tokens", "4",
+                                            "--lookup-policy", "off", "--lookup-min-suffix", "4"}))
+                              .find("--lookup-policy fixed or adaptive") != std::string::npos,
+                      "CLI did not reject a lookup suffix with --lookup-policy off as unused");
+    for (const auto& invalid : {std::vector<std::string>{"--lookup-policy", "greedy"},
+                                std::vector<std::string>{"--lookup-min-suffix", "0"},
+                                std::vector<std::string>{"--lookup-min-suffix", "1"},
+                                std::vector<std::string>{"--lookup-min-suffix", "65"},
+                                std::vector<std::string>{"--lookup-max-proposal", "4"},
+                                std::vector<std::string>{"--lookup-max-proposal", "16"},
+                                std::vector<std::string>{"--lookup-max-proposal"}}) {
+        std::vector<std::string> arguments = mtp_prompt({"--spec", "mtp", "--draft-tokens", "4"});
+        arguments.insert(arguments.end(), invalid.begin(), invalid.end());
+        failures += check(!rejection(std::move(arguments)).empty(),
+                          "CLI accepted an invalid context lookup flag");
+    }
+    return failures;
+}
+
 
 } // namespace
 
@@ -104,5 +187,6 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    failures += check_context_lookup_flags();
     return failures == 0 ? 0 : 1;
 }

@@ -20,6 +20,43 @@ client, stages the NVFP4 artifact once in `/dev/shm`, stores raw/progress/Serve 
 JSON, and CSV summaries. The case catalog, exact profiles, TTFT boundary, and fixture qualification
 are documented in the dedicated README.
 
+## Context-lookup A/B
+
+`run_context_lookup.py` compares MTP context-lookup policies on an already running `ninfer-serve`.
+It builds five fixed workloads from public Python standard-library sources and one long document:
+`rewrite` (return a whole file after two small edits), `edits` and `write` (a coding-agent turn
+after a `cat -n` Read result, answered with Edit or Write tool calls), `prose`, and `summary`.
+The prose questions deliberately alternate French and English, and the summary instruction is
+French like the document of the published runs ([V100 port](../../docs/v100.md#context-lookup-mtp)),
+so lookup is also measured on ordinary non-English text; they stay as published for
+reproducibility. `run` only uses the public Chat Completions endpoint; start one server per policy
+with `--request-log-jsonl` to also collect the exact decode rounds and the lookup counters.
+
+```bash
+python3 tools/bench/run_context_lookup.py workloads --source-dir /usr/lib/python3.10 \
+  --document long_document.txt --output lookup_workloads.json
+python3 tools/bench/run_context_lookup.py run --server http://127.0.0.1:8080 \
+  --workloads lookup_workloads.json --label fixed --temperature 1 --output sampled.jsonl
+python3 tools/bench/run_context_lookup.py run --server http://127.0.0.1:8081 \
+  --workloads lookup_workloads.json --label adaptive --temperature 1 --output sampled.jsonl
+python3 tools/bench/run_context_lookup.py summarize sampled.jsonl \
+  --request-log fixed requests-fixed.jsonl --request-log adaptive requests-adaptive.jsonl \
+  --compare fixed adaptive
+```
+
+`run` seeds every request from `--seed`, the workload and the request index, so two policies
+sample with the same random numbers and every request is identified in the request log.
+`summarize` joins each record to its request-log entry on that seed and on the token counts both
+sides report, and refuses a record whose entry is missing or ambiguous. Decode tok/s pools the
+tokens after the first one (prefill produces it) over the decode time; ms and tokens per step
+divide by the logged decode rounds, which the response alone cannot count. The per-label table
+adds a bootstrap interval over requests, the widened-round share and the per-round costs.
+`--compare BASELINE CANDIDATE` pairs the candidate's requests with the baseline's by workload and
+index and reports the tok/s, ms/step and tok/step ratios with 95% paired bootstrap intervals that
+resample prompts; comma-separated label lists pair replicate runs in order, for example the same
+two policies run again with their GPUs swapped. Greedy (`--temperature 0`) outputs are compared
+against `--greedy-reference`.
+
 ## Corpus baker
 
 `ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
