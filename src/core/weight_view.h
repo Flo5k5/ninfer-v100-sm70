@@ -11,7 +11,7 @@
 namespace ninfer {
 
 // Existing dense Op ABI uses Weight axes directly; callers establish BF16/FP32 and layout.
-// as_dense: definition unique dans core/weight.h (inclu ci-dessus)
+// as_dense is defined once, in core/weight.h (included above).
 
 // Geometry describes one complete encoded parent. Regions address its logical elements;
 // padding and scale words do not belong to that element domain.
