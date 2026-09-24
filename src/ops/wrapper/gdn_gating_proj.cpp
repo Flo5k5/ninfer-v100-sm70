@@ -76,6 +76,18 @@ void require_sequence_tensor(const Tensor& t, DType dtype, std::int32_t n0, std:
     }
 }
 
+// x is the BF16 residual stream, or an FP32 one on the 48x5120 geometry only, 16-byte aligned for
+// the fused 27B kernel's vector loads.
+void require_norm_input(const Tensor& x, std::int32_t heads, std::int32_t input_rows,
+                        std::int32_t tokens, const char* op) {
+    if (x.dtype == DType::FP32 && (heads != 48 || input_rows != 5120 || !aligned_to(x.data, 16))) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": FP32 x requires the 16-byte aligned 48x5120 geometry");
+    }
+    require_sequence_tensor(x, x.dtype == DType::FP32 ? DType::FP32 : DType::BF16, input_rows,
+                            tokens, op, "x");
+}
+
 void require_execution(DeviceExecutionView execution, const char* op) {
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument(std::string(op) +
@@ -157,7 +169,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
     }
-    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
+    require_norm_input(x, 48, 5120, tokens, op);
     require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
     require_sequence_tensor(h,
                             h.dtype == DType::FP16 &&
@@ -187,7 +199,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
     }
     const GdnControlParentGeometry geometry = require_bf16_parent(ab_weight);
-    require_sequence_tensor(x, DType::BF16, geometry.input_rows, tokens, op, "x");
+    require_norm_input(x, geometry.heads, geometry.input_rows, tokens, op);
     require_vector_tensor(norm_weight, DType::BF16, geometry.input_rows, op, "norm_weight");
     require_sequence_tensor(h,
                             h.dtype == DType::FP16 &&

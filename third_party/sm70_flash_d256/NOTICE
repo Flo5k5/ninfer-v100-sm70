@@ -1,0 +1,53 @@
+SM70 D256 Split-D flash attention (vendored in NInfer, third_party/sm70_flash_d256)
+
+This directory combines code from three origins under three licenses:
+
+  LICENSE.Apache-2.0    Apache License 2.0
+  LICENSE.MIT           MIT License
+  LICENSE.BSD-3-Clause  BSD 3-Clause License; AUTHORS is the authors file it refers to
+
+Every source file here was taken from sm70-attn (origin 2), which carries the other two.
+
+1. 1Cat-vLLM
+   Project:    https://github.com/1CatAI/1Cat-vLLM
+   Commit:     6ada86ed64af6d1a7b3cb0f34df237fd86f06d48 (tag v1.3.0)
+   Files:      cmake/patches/sm70_flash_attn_d256_pipeline.patch and
+               cmake/patches/sm70_flash_attn_d256_splitkv3.patch, which create
+               csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
+   License:    Apache-2.0 (LICENSE.Apache-2.0)
+   Copyright:  Copyright (c) 2026, 1CatAI.
+   Used in:    fattn-sm70-d256-kernel.cuh (the Split-D D256 forward kernel, its
+               three-way KV split and the split merge kernel)
+
+2. sm70-attn
+   Project:    https://github.com/fishlikeX/sm70-attn
+   Commit:     707cf247c1beb5e7c701f47fe6f828c5b84b729d
+   Files:      ggml/src/ggml-cuda/fattn-sm70-d256-kernel.cuh
+               ggml/src/ggml-cuda/sm70-vendor/flash/{kernel_traits.h,mask.h,
+               namespace_config.h,philox.cuh,softmax.h,utils.h}
+   License:    MIT (LICENSE.MIT)
+   Copyright:  Copyright (c) 2023-2026 The ggml authors
+   Used in:    fattn-sm70-d256-kernel.cuh (device code extracted from origin 1,
+               kv_offset argument, FP32 output staging, three-way KV split port
+               with an empty-segment guard and a finite row-maximum
+               initialization, opt-in q4_0 direct loads), flash/mask.h
+               (std::min/std::max replaced by conditional expressions),
+               flash/utils.h (paged-KV helper removed)
+
+3. FlashAttention, Volta fork
+   Project:    https://github.com/zhinianqin/flash-attention-v100, a fork of
+               https://github.com/vllm-project/flash-attention, itself a fork of
+               FlashAttention (https://github.com/Dao-AILab/flash-attention)
+   Commit:     c2eda5e6115b98c3ba4bfd181570668742eece22
+   Files:      csrc/flash_attn/src/{kernel_traits.h,mask.h,namespace_config.h,
+               philox.cuh,softmax.h,utils.h}
+   License:    BSD-3-Clause (LICENSE.BSD-3-Clause, with AUTHORS)
+   Copyright:  Copyright (c) 2022, the respective contributors, as shown by the
+               AUTHORS file; the files carry Copyright (c) 2023 and 2024, Tri Dao.
+   Used in:    flash/*
+
+Modifications made in NInfer (provided under the license of the file they modify):
+  - fattn-sm70-d256-kernel.cuh: new file header; CuTe/CUTLASS headers included
+    from the build's CUTLASS include directory and FlashAttention headers as
+    "flash/..." instead of the sm70-attn "sm70-vendor/" prefix.
+  - flash/utils.h: the Chinese comments are translated to English.

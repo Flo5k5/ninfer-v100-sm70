@@ -11,6 +11,7 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -79,6 +80,42 @@ __launch_bounds__(256) __global__
     if (tid == 0 && (n & 1) != 0) {
         const std::int64_t i = n - 1;
         x[i]                 = __float2bfloat16_rn(__bfloat162float(x[i]) + __bfloat162float(y[i]));
+    }
+}
+
+// FP32 residual stream: x is FP32 and y is the BF16 or FP32 sublayer output. The sum is rounded
+// once, to FP32.
+template <class Y>
+__launch_bounds__(256) __global__
+    void residual_add_f32_kernel(const Y* __restrict__ y, float* __restrict__ x, std::int64_t n) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        float value;
+        if constexpr (std::is_same_v<Y, float>) {
+            value = y[i];
+        } else {
+            value = __bfloat162float(y[i]);
+        }
+        x[i] += value;
+    }
+}
+
+__launch_bounds__(256) __global__
+    void residual_add_f32_bf16x4_kernel(const uint2* __restrict__ y, float4* __restrict__ x,
+                                        std::int64_t packs) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < packs; i += stride) {
+        const uint2 yv   = y[i];
+        const float2 y01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&yv.x));
+        const float2 y23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&yv.y));
+        float4 xv        = x[i];
+        xv.x += y01.x;
+        xv.y += y01.y;
+        xv.z += y23.x;
+        xv.w += y23.y;
+        x[i] = xv;
     }
 }
 

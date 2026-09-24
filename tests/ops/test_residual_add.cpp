@@ -87,6 +87,51 @@ int run_cancellation_case() {
     return failures;
 }
 
+// FP32 residual stream: x is FP32 and y is the BF16 or FP32 sublayer output; the sum is rounded
+// once, to FP32.
+constexpr PointwiseCriterion residual_add_fp32_criterion() {
+    return {/*absolute*/ 0.0, /*relative*/ 1.2e-7};
+}
+
+int run_fp32_case(const char* label, std::int32_t rows, std::int32_t columns, bool fp32_y,
+                  std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> y(count), x(count);
+    fill_uniform(y, seed, -8.0f, 8.0f);
+    fill_uniform(x, seed + 1, -64.0f, 64.0f);
+    if (!fp32_y) { round_to_bf16(y); }
+
+    const auto expected = residual_add_oracle(y, x);
+    const auto y_bits   = encode_bf16(y);
+    GuardedDeviceBuffer device_y(count * (fp32_y ? sizeof(float) : sizeof(std::uint16_t)));
+    GuardedDeviceBuffer device_x(count * sizeof(float));
+    if (fp32_y) {
+        device_y.copy_from_host(y.data(), device_y.bytes());
+    } else {
+        device_y.copy_from_host(y_bits.data(), device_y.bytes());
+    }
+    device_x.copy_from_host(x.data(), device_x.bytes());
+
+    Tensor y_tensor(device_y.data(), fp32_y ? DType::FP32 : DType::BF16, {rows, columns});
+    Tensor x_tensor(device_x.data(), DType::FP32, {rows, columns});
+    ops::residual_add(y_tensor, x_tensor, nullptr);
+    cuda_synchronize();
+
+    const std::vector<float> updated = from_device<float>(device_x.data(), count);
+    int failures = verify_pointwise(label, std::vector<double>(updated.begin(), updated.end()),
+                                    expected, residual_add_fp32_criterion());
+    if (fp32_y) {
+        failures += verify_exact("residual_add fp32 y unchanged",
+                                 from_device<float>(device_y.data(), count), y);
+    } else {
+        failures += verify_exact("residual_add bf16 y unchanged",
+                                 from_device<std::uint16_t>(device_y.data(), count), y_bits);
+    }
+    failures += device_y.verify_guards("residual_add fp32 y");
+    failures += device_x.verify_guards("residual_add fp32 x");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -102,6 +147,9 @@ int main() {
     failures += run_case("residual_add [2048,48]", 2048, 48, 202u);
     failures += run_case("residual_add [1152,128]", 1152, 128, 301u);
     failures += run_cancellation_case();
+    failures += run_fp32_case("residual_add fp32 x, bf16 y [5120,33]", 5120, 33, false, 401u);
+    failures += run_fp32_case("residual_add fp32 x, fp32 y [5120,4]", 5120, 4, true, 402u);
+    failures += run_fp32_case("residual_add fp32 x, bf16 y odd [127,3]", 127, 3, false, 403u);
     std::cout << (failures ? "FAIL" : "OK") << " residual_add\n";
     return failures ? 1 : 0;
 }

@@ -4,23 +4,22 @@
 #include "core/layout.h"
 #include "ops/linear/fp8/fp8_gemv.cuh"
 #include "ops/linear/fp8/fp8_prepack_sm70.cuh"
+#include "ops/linear/fp8/fp8_row_scale_gemm_sm70.cuh"
 
 #include "cutlass/bfloat16.h"
-#include "cutlass/cutlass.h"
-#include "cutlass/epilogue/thread/linear_combination.h"
-#include "cutlass/gemm/device/gemm.h"
 #include "cutlass/half.h"
 
 #include <cuda_bf16.h>
 
-#include <stdexcept>
+#include <algorithm>
 
 namespace ninfer::ops::detail {
 namespace {
 
+// Stages the E4M3 codes unscaled: FP16 represents every E4M3 value exactly, and the row scale is
+// applied to the FP32 accumulator in the GEMM epilogue (fp8_row_scale_gemm_sm70.cuh).
 __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, int n, int k,
-                                        bool prepacked,
-                                        cutlass::half_t* __restrict__ out) {
+                                        bool prepacked, cutlass::half_t* __restrict__ out) {
     const int row      = static_cast<int>(blockIdx.y);
     const int pair_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= n || pair_idx >= k / 2) { return; }
@@ -32,10 +31,10 @@ __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, 
         source = codes + static_cast<std::int64_t>(row) * k + k0;
     }
     const std::uint16_t packed = *reinterpret_cast<const std::uint16_t*>(source);
-    const float2 weight = decode_fp8_e4m3x2(packed);
-    cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
-    out_row[pair_idx * 2]     = cutlass::half_t(weight.x);
-    out_row[pair_idx * 2 + 1] = cutlass::half_t(weight.y);
+    const float2 weight        = decode_fp8_e4m3x2(packed);
+    cutlass::half_t* out_row   = out + static_cast<std::int64_t>(row) * k;
+    out_row[pair_idx * 2]      = cutlass::half_t(weight.x);
+    out_row[pair_idx * 2 + 1]  = cutlass::half_t(weight.y);
 }
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
@@ -43,28 +42,6 @@ __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
 }
-
-__global__ void scale_rows_kernel(__nv_bfloat16* __restrict__ data,
-                                  const __nv_bfloat16* __restrict__ scales, std::int64_t count,
-                                  int n) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= count) { return; }
-    data[i] = __float2bfloat16(__bfloat162float(data[i]) * __bfloat162float(scales[i % n]));
-}
-
-using ElementAccumulator     = float;
-using ElementComputeEpilogue = float;
-using ElementInput           = cutlass::half_t;
-using ElementOutput          = cutlass::bfloat16_t;
-using Gemm = cutlass::gemm::device::Gemm<
-    ElementInput, cutlass::layout::RowMajor, ElementInput, cutlass::layout::ColumnMajor,
-    ElementOutput, cutlass::layout::RowMajor, ElementAccumulator, cutlass::arch::OpClassTensorOp,
-    cutlass::arch::Sm70, cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<64, 64, 32>, cutlass::gemm::GemmShape<8, 8, 4>,
-    cutlass::epilogue::thread::LinearCombination<
-        ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value, ElementAccumulator,
-        ElementComputeEpilogue>,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2>;
 
 template <class Allocator>
 struct Scratch {
@@ -84,22 +61,14 @@ Scratch<Allocator> allocate_scratch(Allocator& allocator, int n, int k, int cols
 }
 
 std::size_t gemm_workspace_bytes(int n, int k, int cols) {
-    const cutlass::gemm::GemmCoord shape(cols, n, k);
-    typename Gemm::Arguments args{shape, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
-                                  {1.0F, 0.0F}, 1};
-    return Gemm::get_workspace_size(args);
+    return std::max(fp8_row_scale_gemm_workspace_bytes<cutlass::bfloat16_t>(n, k, cols),
+                    fp8_row_scale_gemm_workspace_bytes<float>(n, k, cols));
 }
 
-} // namespace
-
-std::size_t fp8_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k, std::int32_t cols) {
-    WorkspaceLayoutBuilder layout;
-    (void)allocate_scratch(layout, n, k, cols, gemm_workspace_bytes(n, k, cols));
-    return layout.peak_bytes(1);
-}
-
-void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                             cudaStream_t stream) {
+// Stages the FP16 codes and activations, then runs D = (acc * scale) + beta * D.
+template <class ElementOut>
+void run(const Tensor& x, const Weight& w, ElementOut* out, float beta, WorkspaceArena& ws,
+         cudaStream_t stream) {
     const int n = w.n;
     const int k = w.k;
     const int t = x.ne[1];
@@ -120,30 +89,27 @@ void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Work
         static_cast<const __nv_bfloat16*>(x.data), input, input_count);
     CUDA_CHECK(cudaGetLastError());
 
-    const cutlass::gemm::GemmCoord shape(t, n, k);
-    typename Gemm::Arguments args{shape, {input, k}, {weight, k},
-                                  {static_cast<ElementOutput*>(out.data), n},
-                                  {static_cast<ElementOutput*>(out.data), n}, {1.0F, 0.0F}, 1};
-    Gemm op;
-    cutlass::Status status = op.can_implement(args);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error("fp8_cutlass_sm70: CUTLASS can_implement failed");
-    }
-    status = op.initialize(args, scratch.gemm.data, stream);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error("fp8_cutlass_sm70: CUTLASS initialize failed");
-    }
-    status = op(stream);
-    if (status != cutlass::Status::kSuccess) {
-        throw std::runtime_error("fp8_cutlass_sm70: CUTLASS gemm failed");
-    }
-    CUDA_CHECK(cudaGetLastError());
+    run_fp8_row_scale_gemm<ElementOut>(input, weight, static_cast<const __nv_bfloat16*>(w.scales),
+                                       out, beta, n, k, t, scratch.gemm.data, stream,
+                                       "fp8_cutlass_sm70");
+}
 
-    const std::int64_t output_count = static_cast<std::int64_t>(t) * n;
-    scale_rows_kernel<<<static_cast<int>((output_count + 255) / 256), 256, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(out.data), static_cast<const __nv_bfloat16*>(w.scales),
-        output_count, n);
-    CUDA_CHECK(cudaGetLastError());
+} // namespace
+
+std::size_t fp8_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k, std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_scratch(layout, n, k, cols, gemm_workspace_bytes(n, k, cols));
+    return layout.peak_bytes(1);
+}
+
+void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                             cudaStream_t stream) {
+    run<cutlass::bfloat16_t>(x, w, static_cast<cutlass::bfloat16_t*>(out.data), 0.0F, ws, stream);
+}
+
+void fp8_cutlass_sm70_residual_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                      WorkspaceArena& ws, cudaStream_t stream) {
+    run<float>(x, w, static_cast<float*>(residual.data), 1.0F, ws, stream);
 }
 
 } // namespace ninfer::ops::detail

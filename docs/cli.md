@@ -204,6 +204,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
+| `--text-residual bf16\|fp32` | text residual stream storage; `fp32` on Volta for Qwen3.8-27B NVFP4 without DFlash | `bf16` |
+| `--prefill-attention auto\|splitd\|flash\|reference` | Volta wide prefill attention kernel | `auto` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..7`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -244,6 +246,14 @@ Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions
 generated token IDs in diagnostics.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
+
+`--text-residual` and `--prefill-attention` are numerics controls of the Volta build, validated at
+Engine startup; [V100 long-context numerics](v100.md#long-context-numerics) describes them and
+their measured effect. `--text-residual fp32` keeps the text residual stream in FP32 and is
+available for the Qwen3.8-27B NVFP4 artifact without DFlash; other artifacts, DFlash and non-Volta
+builds reject it. `--prefill-attention` selects the kernel of wide BF16/INT8 prompts: `auto` is
+split-D on the 27B models and the llama.cpp flash kernel on 35B-A3B, `reference` the direct FP32
+kernel for numerical comparison. Non-Volta builds accept only `auto`.
 
 ## Context and memory
 

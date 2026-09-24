@@ -35,6 +35,25 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8KeyNvfp4Value,
 };
 
+// Storage of the text residual stream that every decoder layer updates twice. Float32 keeps the
+// stream out of BF16 between updates; it is available on Volta builds for qwen3.8-27b/nvfp4 without
+// DFlash, and the Engine rejects it anywhere else at construction.
+enum class TextResidualStorage : std::uint8_t {
+    BFloat16,
+    Float32,
+};
+
+// Kernel of the wide causal prefill attention route of Volta builds (BF16 and INT8 KV, one
+// sequence, prompt widths of at least 64 tokens). Automatic selects SplitD for the 27B attention
+// geometry (24 query heads) and Flash for the 35B-A3B one; Reference is the direct FP32 kernel, for
+// numerical comparison. Other builds accept only Automatic.
+enum class PrefillAttentionKernel : std::uint8_t {
+    Automatic,
+    SplitD,
+    Flash,
+    Reference,
+};
+
 enum class EnginePurpose : std::uint8_t {
     Generation,
     CausalScoring,
@@ -190,6 +209,8 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    TextResidualStorage text_residual  = TextResidualStorage::BFloat16;
+    PrefillAttentionKernel prefill_attention = PrefillAttentionKernel::Automatic;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -628,6 +649,18 @@ public:
     virtual void progress(PromptProgress progress)          = 0;
     virtual void timing(GenerationTimingObservation timing) = 0;
     virtual void publish(OutputDelta delta)                 = 0;
+};
+
+// Execution shape of Engine::score_tokens. Every scored target sees the same history under any
+// shape; only the width of the forward calls that evaluate the scored region changes, and with it
+// the kernels that run.
+struct CausalScoreOptions {
+    // Largest forward width over the scored targets, at most the prefill chunk. Zero evaluates
+    // them in prefill chunks. A small width (1 for decoding, the draft window plus one for MTP
+    // verification) evaluates them one column block at a time through the narrow-width attention
+    // and projection kernels that generation selects at that width; the pass keeps the prefill
+    // phase, so the GDN input projection and convolution keep their prefill forms.
+    std::uint32_t scored_chunk = 0;
 };
 
 // Receives the main-head logits of the scored positions of Engine::score_tokens, in target order,

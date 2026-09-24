@@ -639,10 +639,45 @@ int test_w8() {
     return failures;
 }
 
+// FP32 output (an FP32 residual stream): every element is the exact code * scale product.
+int run_fp8_fp32_case(Fp8Table& table, std::size_t tokens) {
+    const std::vector<std::int32_t> ids = dflash2_ids(tokens);
+    const std::string label = "embedding FP8 FP32 out T=" + std::to_string(tokens);
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), device_ids.bytes());
+    const std::size_t count = static_cast<std::size_t>(kFp8D) * ids.size();
+    GuardedDeviceBuffer output(count * sizeof(float));
+    output.fill(0x7d);
+    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.data(), DType::FP32, {kFp8D, static_cast<std::int32_t>(ids.size())});
+    Weight weight = table.weight();
+    ops::embedding(input, weight, result, nullptr);
+    cuda_synchronize();
+    std::vector<float> actual(count);
+    output.copy_to_host(actual.data(), output.bytes());
+    const std::vector<double> expected = table.oracle(ids);
+    int failures = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (static_cast<double>(actual[i]) != expected[i]) {
+            std::cerr << label << ": element " << i << " is " << actual[i] << ", exact "
+                      << expected[i] << '\n';
+            ++failures;
+            break;
+        }
+    }
+    failures += output.verify_guards(label.c_str()) +
+                verify_input(label.c_str(), device_ids, ids);
+    failures += table.verify_unchanged(label.c_str());
+    return failures;
+}
+
 int test_fp8() {
     Fp8Table table;
     int failures = 0;
     failures += qualify_dflash2("FP8 [248320,5120]", table, 4);
+    for (std::size_t tokens : {1u, 5u, 177u, 1024u}) {
+        failures += run_fp8_fp32_case(table, tokens);
+    }
     const std::vector<std::int32_t> ids = {0};
     GuardedDeviceBuffer device_ids(sizeof(std::int32_t));
     device_ids.copy_from_host(ids.data(), sizeof(std::int32_t));

@@ -83,6 +83,27 @@ int main() {
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos,
                       "serve help omits a production KV storage mode");
+    failures += check(defaults.text_residual == ninfer::TextResidualStorage::BFloat16 &&
+                          defaults.prefill_attention == ninfer::PrefillAttentionKernel::Automatic,
+                      "serve numerics defaults are not bf16/auto");
+    const ServeOptions numerics = parse({"ninfer-serve", "model.ninfer", "--text-residual", "fp32",
+                                         "--prefill-attention", "flash"});
+    failures += check(numerics.text_residual == ninfer::TextResidualStorage::Float32 &&
+                          numerics.prefill_attention == ninfer::PrefillAttentionKernel::Flash,
+                      "--text-residual/--prefill-attention were not parsed");
+    const auto rejects_numerics = [](const char* flag, const char* value) {
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", flag, value});
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    failures += check(rejects_numerics("--text-residual", "fp16") &&
+                          rejects_numerics("--prefill-attention", "fastest"),
+                      "serve accepted an unknown numerics value");
+    failures += check(kv_help.find("--text-residual bf16|fp32") != std::string::npos &&
+                          kv_help.find("--prefill-attention auto|splitd|flash|reference") !=
+                              std::string::npos,
+                      "serve help omits the numerics controls");
 
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});

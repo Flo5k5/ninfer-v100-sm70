@@ -168,6 +168,48 @@ int run_fp16_case(const std::string& label, const Shape& shape, bool unit_offset
     return verify_output_storage(label + " fp16 output", fp16_output, false);
 }
 
+// FP32 input (an FP32 residual stream) on the 5120-wide hidden row: the oracle reads the
+// represented FP32 values; BF16 output keeps the BF16 criterion, and FP16 output is the BF16
+// result staged to fp16 exactly as for a BF16 input.
+int run_fp32_input_case(const std::string& label, std::int32_t tokens, bool unit_offset,
+                        bool fp16_out, std::uint32_t seed, float input_scale = 4.0F) {
+    const Shape shape{5120, 1, tokens};
+    const std::size_t count = shape.elements();
+    std::vector<float> input(count), weight(shape.d);
+    fill_uniform(input, seed, -input_scale, input_scale);
+    fill_uniform(weight, seed + 1U, -1.5F, 1.5F);
+    round_to_bf16(weight);
+    DeviceBuffer device_input = to_device(input);
+    DeviceInput device_weight = make_input(weight, false);
+    GuardedDeviceBuffer output(count * sizeof(std::uint16_t));
+    output.fill(0xff);
+    Tensor input_tensor(device_input.p, DType::FP32, {shape.d, tokens});
+    Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
+    Tensor output_tensor(output.data(), fp16_out ? DType::FP16 : DType::BF16, {shape.d, tokens});
+    ops::rmsnorm(input_tensor, weight_tensor, kEps, unit_offset, output_tensor, nullptr);
+    cuda_synchronize();
+
+    const auto reference = rmsnorm_oracle(input, weight, shape, unit_offset);
+    std::vector<double> actual(count);
+    std::vector<std::uint16_t> bits(count);
+    CUDA_CHECK(cudaMemcpy(bits.data(), output.data(), count * 2, cudaMemcpyDeviceToHost));
+    for (std::size_t i = 0; i < count; ++i) {
+        if (fp16_out) {
+            __half value;
+            std::memcpy(&value, &bits[i], sizeof(value));
+            actual[i] = static_cast<double>(__half2float(value));
+        } else {
+            actual[i] = static_cast<double>(bf16_to_f32(bits[i]));
+        }
+    }
+    int failures = verify_reduction(label.c_str(), actual, reference, rmsnorm_bf16_criterion());
+    failures += verify_output_storage(label + " output", output, false);
+    failures += verify_exact((label + " preserves input").c_str(),
+                             from_device<float>(device_input, count), input);
+    failures += verify_preserved(label + " preserves weight", device_weight);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -237,6 +279,16 @@ int main() {
                                           (offset ? " offset" : " plain"),
                                       {5120, 1, t}, offset, 2100U + t);
     failures += run_fp16_case("rmsnorm hidden5120 FP16 large", {5120, 1, 5}, true, 2200U, 4096.F);
+    for (int t : {1, 5, 33, 1024})
+        for (bool offset : {false, true})
+            for (bool fp16_out : {false, true})
+                failures += run_fp32_input_case("rmsnorm hidden5120 FP32 input T=" +
+                                                    std::to_string(t) +
+                                                    (offset ? " offset" : " plain") +
+                                                    (fp16_out ? " FP16 out" : " BF16 out"),
+                                                t, offset, fp16_out, 2300U + t);
+    failures += run_fp32_input_case("rmsnorm hidden5120 FP32 input large", 17, true, false, 2400U,
+                                    40000.F);
     std::cout << (failures ? "FAIL" : "OK") << " rmsnorm\n";
     return failures ? 1 : 0;
 }

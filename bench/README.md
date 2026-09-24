@@ -49,6 +49,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>]
+          [--text-residual <bf16|fp32>] [--prefill-attention <auto|splitd|flash|reference>]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -66,7 +67,9 @@ Example:
 
 Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..7, DFlash/DFlash2
 K=1..15); `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
-enabled by default.
+enabled by default. `--text-residual` and `--prefill-attention` select the Volta numerics controls
+of [V100 long-context numerics](../docs/v100.md#long-context-numerics); the report `config` and the
+CSV record both.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with

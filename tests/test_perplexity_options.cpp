@@ -37,6 +37,20 @@ int main() {
     const auto sliding = parse({"model.ninfer", "--text", "t.txt"});
     failures += check(sliding.context == 4096 && sliding.stride == 2048 && !sliding.logits_out,
                       "sliding windows default to context 4096, stride 2048");
+    failures += check(sliding.prefill_chunk == 1024 && sliding.scored_chunk == 0,
+                      "scoring defaults to 1024-token prefill chunks for every target");
+    const auto narrow = parse({"model.ninfer", "--text", "t.txt", "--prefill-chunk", "2048",
+                               "--scored-chunk", "5"});
+    failures += check(narrow.prefill_chunk == 2048 && narrow.scored_chunk == 5,
+                      "--prefill-chunk and --scored-chunk are parsed");
+    failures += check(rejects([] {
+                          (void)parse({"model.ninfer", "--text", "t.txt", "--prefill-chunk", "1000"});
+                      }),
+                      "--prefill-chunk must be a multiple of 128");
+    failures += check(rejects([] {
+                          (void)parse({"model.ninfer", "--text", "t.txt", "--scored-chunk", "2048"});
+                      }),
+                      "--scored-chunk must not exceed the prefill chunk");
     failures +=
         check(rejects([] { (void)parse({"model.ninfer", "--text", "t.txt", "--context", "512"}); }),
               "a sliding plan still rejects the default stride above a small context");
@@ -89,6 +103,28 @@ int main() {
     failures += check(
         rejects([] { (void)parse({"model.ninfer", "--text", "t.txt", "--kv-dtype", "fp4"}); }),
         "an unknown KV dtype is rejected");
+    failures += check(sliding.text_residual == ninfer::TextResidualStorage::BFloat16 &&
+                          sliding.prefill_attention == ninfer::PrefillAttentionKernel::Automatic,
+                      "numerics default to a BF16 residual and the automatic prefill kernel");
+    const auto numerics = parse({"model.ninfer", "--text", "t.txt", "--text-residual", "fp32",
+                                 "--prefill-attention", "splitd"});
+    failures += check(numerics.text_residual == ninfer::TextResidualStorage::Float32 &&
+                          numerics.prefill_attention == ninfer::PrefillAttentionKernel::SplitD,
+                      "--text-residual and --prefill-attention are parsed");
+    failures += check(rejects([] {
+                          (void)parse(
+                              {"model.ninfer", "--text", "t.txt", "--text-residual", "bf32"});
+                      }) && rejects([] {
+                          (void)parse({"model.ninfer", "--text", "t.txt", "--prefill-attention",
+                                       "llama"});
+                      }),
+                      "unknown numerics values are rejected");
+    failures += check(ninfer::perplexity::usage_text().find("--text-residual bf16|fp32") !=
+                              std::string::npos &&
+                          ninfer::perplexity::usage_text().find(
+                              "--prefill-attention auto|splitd|flash|reference") !=
+                              std::string::npos,
+                      "usage lists the numerics controls");
     failures += check(rejects([] { (void)parse({"model.ninfer"}); }),
                       "exactly one of --corpus and --text is required");
     failures += check(parse({"--help"}).help_requested, "--help alone requests help");

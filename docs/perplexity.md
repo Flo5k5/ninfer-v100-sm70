@@ -42,6 +42,26 @@ report is `report.json` under `profiles/perplexity/` unless `--output` supplies 
 For KV-format comparisons, the recommended long-context profile is the full corpus with
 `--context 65536 --stride 32768` and without `--quick`.
 
+### Execution shape
+
+Scoring evaluates each window through the prefill route in chunks of `--prefill-chunk` tokens
+(default 1,024, a multiple of 128; the Qwen3.8-27B serving configuration uses 2,048). Generation
+does not: after the prompt, every token goes through forward calls a few columns wide, which select
+narrow-width attention and projection kernels. `--scored-chunk N` (at most the prefill chunk) keeps
+prefill chunks for the unscored history of each window and evaluates the scored targets N columns at
+a time, so they run through those narrow-width kernels while every target still sees exactly the
+same history. Use `--scored-chunk 1` for plain decoding and the draft window plus one (for example 5
+with `--draft-tokens 4`) for MTP verification. The pass keeps the prefill phase, so the Gated
+DeltaNet input projection and convolution keep their prefill forms. The scored region runs one
+forward call per N tokens, so it is slower than the prefill route. Both values are recorded under
+`execution` in `report.json`.
+
+`--text-residual bf16|fp32` and `--prefill-attention auto|splitd|flash|reference` select the
+scoring engine's text residual storage and Volta wide prefill attention kernel, with the same
+meaning and startup validation as in `ninfer` and `ninfer-serve` (see
+[V100 long-context numerics](v100.md#long-context-numerics)); `execution` in `report.json` records
+both.
+
 ## Metric
 
 For a stream `x[0..N)`, every token after `x[0]` is scored exactly once. A window `[b,e)` with target

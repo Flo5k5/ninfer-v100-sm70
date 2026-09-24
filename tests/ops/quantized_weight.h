@@ -296,6 +296,136 @@ struct PackedWeight {
     }
 };
 
+namespace detail {
+
+// FP8 row-scaled payload: an [n,k] code plane, then n BF16 scales at the next 256-byte boundary.
+inline PackedWeight allocate_fp8_row_scaled(std::int32_t n, std::int32_t k) {
+    PackedWeight packed;
+    packed.code_plane_bytes   = static_cast<std::uint64_t>(n) * k;
+    packed.scale_plane_offset =
+        align_up_size(static_cast<std::size_t>(packed.code_plane_bytes), 256);
+    packed.scale_plane_bytes  = static_cast<std::uint64_t>(n) * 2;
+    packed.payload.assign(
+        static_cast<std::size_t>(packed.scale_plane_offset + packed.scale_plane_bytes), 0);
+    return packed;
+}
+
+inline void describe_fp8_row_scaled(PackedWeight& packed, std::int32_t n, std::int32_t k) {
+    packed.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16S;
+    packed.weight.layout           = QuantLayout::RowScale;
+    packed.weight.scale_dtype      = DType::BF16;
+    packed.weight.payload          = packed.payload.data();
+    packed.weight.payload_bytes    = packed.payload.size();
+    packed.weight.high_plane_bytes = 0;
+    packed.weight.qdata            = packed.payload.data();
+    packed.weight.qhigh            = nullptr;
+    packed.weight.scales           = packed.payload.data() + packed.scale_plane_offset;
+    packed.weight.group_size       = static_cast<std::uint32_t>(k);
+    packed.weight.group            = k;
+    packed.weight.ndim             = 2;
+    packed.weight.shape[0]         = n;
+    packed.weight.shape[1]         = k;
+    packed.weight.shape[2]         = 1;
+    packed.weight.shape[3]         = 1;
+    packed.weight.padded_shape[0]  = n;
+    packed.weight.padded_shape[1]  = k;
+    packed.weight.padded_shape[2]  = 1;
+    packed.weight.padded_shape[3]  = 1;
+    packed.weight.scale_ne[0]      = n;
+    packed.weight.scale_ne[1]      = 1;
+    packed.weight.scale_ne[2]      = 1;
+    packed.weight.scale_ne[3]      = 1;
+    packed.weight.scale_nb[0]      = 2;
+    packed.weight.scale_nb[1]      = static_cast<std::int64_t>(n) * 2;
+    packed.weight.scale_nb[2]      = packed.weight.scale_nb[1];
+    packed.weight.scale_nb[3]      = packed.weight.scale_nb[1];
+    packed.weight.n                = n;
+    packed.weight.k                = k;
+}
+
+inline std::uint16_t f32_to_bf16_rne(float value) {
+    const std::uint32_t bits = float_bits(value);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) { return static_cast<std::uint16_t>(0x7fc0u); }
+    const std::uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
+    return static_cast<std::uint16_t>((bits + rounding) >> 16);
+}
+
+// Round-to-nearest-even E4M3FN encoding, saturating at the largest finite value (448).
+inline std::uint8_t encode_e4m3fn(double value) {
+    const std::uint8_t sign = std::signbit(value) ? 0x80U : 0x00U;
+    const double magnitude  = std::fabs(value);
+    if (!(magnitude < 448.0)) { return static_cast<std::uint8_t>(sign | 0x7eU); }
+    if (magnitude < std::ldexp(1.0, -6)) {
+        // Subnormals are multiples of 2^-9; a quotient of 8 rounds up to the smallest normal.
+        const int steps = static_cast<int>(std::nearbyint(magnitude * 512.0));
+        return static_cast<std::uint8_t>(sign | steps);
+    }
+    int exponent = std::ilogb(magnitude);
+    int mantissa = static_cast<int>(std::nearbyint(std::ldexp(magnitude, 3 - exponent))) - 8;
+    if (mantissa == 8) {
+        mantissa = 0;
+        ++exponent;
+    }
+    if (exponent + 7 > 15 || (exponent + 7 == 15 && mantissa == 7)) {
+        return static_cast<std::uint8_t>(sign | 0x7eU);
+    }
+    return static_cast<std::uint8_t>(sign | ((exponent + 7) << 3) | mantissa);
+}
+
+inline double uniform_unit(std::uint64_t& state) {
+    state = mix64(state);
+    return (static_cast<double>(state >> 11) + 0.5) * std::ldexp(1.0, -53);
+}
+
+inline double standard_normal(std::uint64_t& state) {
+    const double radius = std::sqrt(-2.0 * std::log(uniform_unit(state)));
+    return radius * std::cos(6.283185307179586 * uniform_unit(state));
+}
+
+} // namespace detail
+
+// Row-scaled FP8 weights distributed like a trained checkpoint. Row r is Gaussian with its own
+// standard deviation and is quantized as a checkpoint converter does it: scale = BF16(amax/448),
+// codes = E4M3(w/scale) with round-to-nearest-even. Standard deviations are log-uniform in
+// [2e-3, 5e-2]; every `tiny_row_period`-th row (row % tiny_row_period == 0) draws from
+// [5e-6, 5e-5] instead, so that code * scale lies below the smallest normal FP16 value (6.1e-5)
+// for most of its elements. Row-scaled checkpoints contain such rows; the patterned fixture's
+// scales keep every code * scale exact in FP16 and cannot show what a route loses on them.
+inline PackedWeight make_checkpoint_like_fp8_weight(std::int32_t n, std::int32_t k,
+                                                    std::uint32_t seed,
+                                                    std::int32_t tiny_row_period = 16) {
+    if (n <= 0 || k <= 0 || tiny_row_period <= 0) {
+        throw std::invalid_argument("quantized-weight fixture: invalid checkpoint-like FP8 shape");
+    }
+    PackedWeight packed = detail::allocate_fp8_row_scaled(n, k);
+    std::vector<double> row(static_cast<std::size_t>(k));
+    for (std::int32_t r = 0; r < n; ++r) {
+        std::uint64_t state =
+            (static_cast<std::uint64_t>(seed) << 32) ^ static_cast<std::uint64_t>(r) * 0x9e37U;
+        const bool tiny           = r % tiny_row_period == 0;
+        const double lower        = tiny ? 5.0e-6 : 2.0e-3;
+        const double upper        = tiny ? 5.0e-5 : 5.0e-2;
+        const double deviation    = lower * std::pow(upper / lower, detail::uniform_unit(state));
+        double amax               = 0.0;
+        for (double& value : row) {
+            value = deviation * detail::standard_normal(state);
+            amax  = std::max(amax, std::fabs(value));
+        }
+        const std::uint16_t scale_bits =
+            detail::f32_to_bf16_rne(static_cast<float>(amax / 448.0));
+        const double scale = static_cast<double>(detail::bf16_to_f32(scale_bits));
+        detail::store_u16_le(packed.payload,
+                             packed.scale_plane_offset + static_cast<std::size_t>(r) * 2,
+                             scale_bits);
+        std::uint8_t* codes = packed.payload.data() + static_cast<std::size_t>(r) * k;
+        for (std::int32_t c = 0; c < k; ++c) {
+            codes[c] = detail::encode_e4m3fn(row[static_cast<std::size_t>(c)] / scale);
+        }
+    }
+    detail::describe_fp8_row_scaled(packed, n, k);
+    return packed;
+}
+
 enum class RowSplitScalePattern : std::uint8_t {
     Unit,
     Small,
@@ -327,13 +457,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 "quantized-weight fixture: divisors do not belong to FP8 weights");
         }
 
-        PackedWeight packed;
-        packed.code_plane_bytes = static_cast<std::uint64_t>(n) * k;
-        packed.scale_plane_offset =
-            detail::align_up_size(static_cast<std::size_t>(packed.code_plane_bytes), 256);
-        packed.scale_plane_bytes = static_cast<std::uint64_t>(n) * 2;
-        packed.payload.assign(
-            static_cast<std::size_t>(packed.scale_plane_offset + packed.scale_plane_bytes), 0);
+        PackedWeight packed = detail::allocate_fp8_row_scaled(n, k);
 
         constexpr std::uint8_t kCodes[]{
             0x00U, 0x80U, 0x01U, 0x81U, 0x07U, 0x87U, 0x08U, 0x88U,
@@ -355,36 +479,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                                  kScales[(static_cast<std::uint32_t>(row) + seed) & 3U]);
         }
 
-        packed.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16S;
-        packed.weight.layout           = QuantLayout::RowScale;
-        packed.weight.scale_dtype      = DType::BF16;
-        packed.weight.payload          = packed.payload.data();
-        packed.weight.payload_bytes    = packed.payload.size();
-        packed.weight.high_plane_bytes = 0;
-        packed.weight.qdata            = packed.payload.data();
-        packed.weight.qhigh            = nullptr;
-        packed.weight.scales           = packed.payload.data() + packed.scale_plane_offset;
-        packed.weight.group_size       = static_cast<std::uint32_t>(k);
-        packed.weight.group            = k;
-        packed.weight.ndim             = 2;
-        packed.weight.shape[0]         = n;
-        packed.weight.shape[1]         = k;
-        packed.weight.shape[2]         = 1;
-        packed.weight.shape[3]         = 1;
-        packed.weight.padded_shape[0]  = n;
-        packed.weight.padded_shape[1]  = k;
-        packed.weight.padded_shape[2]  = 1;
-        packed.weight.padded_shape[3]  = 1;
-        packed.weight.scale_ne[0]      = n;
-        packed.weight.scale_ne[1]      = 1;
-        packed.weight.scale_ne[2]      = 1;
-        packed.weight.scale_ne[3]      = 1;
-        packed.weight.scale_nb[0]      = 2;
-        packed.weight.scale_nb[1]      = static_cast<std::int64_t>(n) * 2;
-        packed.weight.scale_nb[2]      = packed.weight.scale_nb[1];
-        packed.weight.scale_nb[3]      = packed.weight.scale_nb[1];
-        packed.weight.n                = n;
-        packed.weight.k                = k;
+        detail::describe_fp8_row_scaled(packed, n, k);
         return packed;
     }
     if (qtype == QType::NVFP4) {

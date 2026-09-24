@@ -81,6 +81,9 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
  * boundary. A contiguous [hidden,W,B] block is presented as the matrix with T=W*B; each
  * column has its own norm and controls. DFlash2 target verification uses W=2..16, B=1..8
  * (T<=128), without restricting the positive-T matrix contract.
+ *
+ * On the [48,5120] geometry `x` may instead be a 16-byte aligned FP32 tensor (an FP32 residual
+ * stream); the oracle then reads the represented FP32 values and every output keeps its contract.
  */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,

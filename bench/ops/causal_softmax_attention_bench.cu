@@ -378,8 +378,8 @@ std::size_t workspace_capacity(const Geometry& geometry, KvCacheStorage storage,
     const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(visible),
                                                          static_cast<std::uint32_t>(visible)};
     return ops::causal_softmax_attention_workspace_capacity_bytes(
-        {kHeadDim, geometry.query_heads, geometry.kv_heads}, storage, envelope, batch, tokens,
-        tokens);
+        {kHeadDim, geometry.query_heads, geometry.kv_heads}, storage, envelope,
+        PrefillAttentionKernel::Automatic, batch, tokens, tokens);
 }
 
 std::int32_t profile_visible(std::span<const std::int32_t> contexts,
@@ -524,7 +524,7 @@ public:
             ops::causal_softmax_attention(
                 q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, table_rows_tensor_,
                 {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale, batch_cache_view_, envelope_,
-                workspace_, output_tensor_, stream);
+                PrefillAttentionKernel::Automatic, workspace_, output_tensor_, stream);
         } else {
             ops::causal_softmax_attention_cached(
                 q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},

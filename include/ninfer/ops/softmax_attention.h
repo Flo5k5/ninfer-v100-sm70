@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/attention_geometry.h"
+#include "ninfer/types.h"
 
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
@@ -124,7 +125,11 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
  * The registered prompt route consumes the paged cache directly and requires zero transient
- * workspace. Small-T routes may use the split state returned by the capacity query below.
+ * workspace. Small-T routes may use the split state returned by the capacity query below. On
+ * Volta builds, `prompt_kernel` selects the kernel of the wide prompt route (B=1, W >= 64, BF16
+ * or INT8 cache; see PrefillAttentionKernel), which stages the visible keys in workspace; the
+ * split-D kernel needs an exact envelope (min == max visible keys) and any other envelope runs the
+ * direct kernel. Other builds accept only PrefillAttentionKernel::Automatic.
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
@@ -137,7 +142,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
-                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                              CausalAttentionExecutionEnvelope envelope,
+                              PrefillAttentionKernel prompt_kernel, WorkspaceArena& workspace,
                               Tensor& out, cudaStream_t stream);
 
 /**
@@ -156,13 +162,14 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
- * head geometry, cache dtype, and execution envelope are fixed implementation-profile inputs.
- * Invalid profiles or intervals throw; an interval containing only prompt routes returns zero.
+ * head geometry, cache dtype, execution envelope, and prompt kernel are fixed
+ * implementation-profile inputs. Invalid profiles or intervals throw; an interval containing only
+ * workspace-free prompt routes returns zero.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
-    CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
-    std::int32_t max_tokens);
+    CausalAttentionExecutionEnvelope envelope, PrefillAttentionKernel prompt_kernel,
+    std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
  * Non-causal grouped-query attention over persistent context plus one live query block.

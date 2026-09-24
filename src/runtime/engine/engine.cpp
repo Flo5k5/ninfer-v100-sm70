@@ -27,7 +27,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::CausalScoring:
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
-        options.prefill_chunk        = 1024;
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
@@ -337,7 +336,8 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
 }
 
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
-                                        ScoreLogitsSink* logits_sink) {
+                                        ScoreLogitsSink* logits_sink,
+                                        CausalScoreOptions options) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                   static_cast<std::uint64_t>(tokens.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -350,6 +350,9 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     if (first_target == 0 || first_target >= tokens.size()) {
         throw std::invalid_argument("score_tokens first_target must be in [1,token_count-1]");
     }
+    if (options.scored_chunk > impl_->options.prefill_chunk) {
+        throw std::invalid_argument("score_tokens scored_chunk must not exceed the prefill chunk");
+    }
     PreparedPrompt prompt      = prepare_tokens(std::move(tokens), false);
     const std::size_t expected = prompt.summary().prompt_tokens - first_target;
     std::vector<float> result  = std::visit(
@@ -357,7 +360,8 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore27>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::ScoreCore35>>) {
-                return core->score(std::move(prompt.impl_->value), first_target, logits_sink);
+                return core->score(std::move(prompt.impl_->value), first_target, logits_sink,
+                                   options);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
             }

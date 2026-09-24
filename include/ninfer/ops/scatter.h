@@ -13,10 +13,11 @@ namespace ninfer::ops {
  *   destination[:, indices[i]] = source[:, i] for 0 <= i < V.
  *
  * Logical shapes:
- *   BF16 source [D,V], I32 indices [V], BF16 destination [D,T], all contiguous.
+ *   BF16 source [D,V], I32 indices [V], BF16 or FP32 destination [D,T], all contiguous.
  *
  * Numeric:
- *   Exact BF16 element copies. Callers provide indices in [0,T) with no duplicates when
+ *   Exact element copies (an FP32 destination, such as an FP32 residual stream, receives the
+ *   exactly widened BF16 values). Callers provide indices in [0,T) with no duplicates when
  *   deterministic overwrite order is required.
  *
  * Effects:
@@ -28,7 +29,8 @@ namespace ninfer::ops {
  *
  * Supported routes:
  *   D divisible by eight with 16-byte-aligned source/destination uses BF16x8 copies; other aligned
- *   even D uses BF16x2; remaining contiguous dimensions use scalar copies.
+ *   even D uses BF16x2; remaining contiguous dimensions use scalar copies. An FP32 destination
+ *   uses BF16x2-to-float2 widening for even D with aligned storage, scalar widening otherwise.
  */
 void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream);
 

@@ -44,6 +44,31 @@ __global__ void scatter_scalar_kernel(const __nv_bfloat16* src, const std::int32
     }
 }
 
+// BF16 source columns widened exactly into an FP32 destination (an FP32 residual stream).
+__global__ void scatter_bf16_to_f32x2_kernel(const __nv_bfloat162* src, const std::int32_t* indices,
+                                             float2* dst, std::int32_t pairs) {
+    const std::int32_t src_col  = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t dst_col  = indices[src_col];
+    const std::int64_t src_base = static_cast<std::int64_t>(src_col) * pairs;
+    const std::int64_t dst_base = static_cast<std::int64_t>(dst_col) * pairs;
+    for (std::int32_t pair = static_cast<std::int32_t>(threadIdx.x); pair < pairs;
+         pair += static_cast<std::int32_t>(blockDim.x)) {
+        dst[dst_base + pair] = __bfloat1622float2(src[src_base + pair]);
+    }
+}
+
+__global__ void scatter_bf16_to_f32_kernel(const __nv_bfloat16* src, const std::int32_t* indices,
+                                           float* dst, std::int32_t d) {
+    const std::int32_t src_col  = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t dst_col  = indices[src_col];
+    const std::int64_t src_base = static_cast<std::int64_t>(src_col) * d;
+    const std::int64_t dst_base = static_cast<std::int64_t>(dst_col) * d;
+    for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < d;
+         row += static_cast<std::int32_t>(blockDim.x)) {
+        dst[dst_base + row] = __bfloat162float(src[src_base + row]);
+    }
+}
+
 inline constexpr int kScatterBatchThreads = 128;
 
 // A 2 KiB feature tile exposes parallelism even when the block has few columns.
