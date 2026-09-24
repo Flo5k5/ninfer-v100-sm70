@@ -317,6 +317,28 @@ int run_fp8() {
 
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, true);
     failures += run_fp8_case(parent, 2, ops::LinearPolicy::A16Only);
+#ifdef NINFER_VOLTA_BUILD
+    // Volta A16 runs QPN passes of up to 32 columns through one activation staging buffer up to
+    // 160 columns, and stages the whole weight for its CUTLASS route from 161.
+    const auto a16_capacity = [&](std::int32_t min_tokens, std::int32_t max_tokens) {
+        return ops::gdn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S, kRows,
+                                                            kHidden, ops::LinearPolicy::A16Only,
+                                                            min_tokens, max_tokens);
+    };
+    const std::size_t staging = static_cast<std::size_t>(kHidden) * 32 * sizeof(std::uint16_t);
+    if (a16_capacity(1, 32) != staging || a16_capacity(33, 160) != staging ||
+        a16_capacity(1, 160) != staging || a16_capacity(161, 161) <= staging ||
+        a16_capacity(1, 2048) != a16_capacity(2048, 2048)) {
+        std::cerr << "FP8 gdn input Volta A16 workspace frontier mismatch\n";
+        ++failures;
+    }
+    // 57 and 150 end on a partial four-tile pass (25 and 22 columns), 150 in a fifth pass.
+    for (const std::int32_t tokens : {32, 33, 48, 57, 128, 150, 160, 161}) {
+        failures += run_fp8_case(parent, tokens, ops::LinearPolicy::A16Only);
+    }
+    // Without caller workspace the passes read the BF16 activations directly.
+    failures += run_fp8_case(parent, 48, ops::LinearPolicy::A16Only, true);
+#endif
 #ifndef NINFER_VOLTA_BUILD
     for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024}) {
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8);
