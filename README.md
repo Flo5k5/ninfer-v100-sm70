@@ -83,7 +83,10 @@ exactly matches an earlier 16-token span and the learned proposal agrees with th
 continuation. On a 172-token verbatim-copy prompt, Qwen3.8-27B NVFP4 produced the exact
 continuation at **201.0 tok/s**, averaging 12.91 output tokens per round. This is a
 context-reproduction fast path; ordinary generation continues to use the normal MTP window and
-the general decode results above.
+the general decode results above. `--lookup-policy`, `--lookup-min-suffix` and
+`--lookup-max-proposal` select when and how far a round widens, including an adaptive policy that
+probes short copies (edit targets in tool calls) with a narrower verification; see
+[context-lookup MTP](docs/v100.md#context-lookup-mtp).
 
 Context-lookup MTP was inspired by
 [syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090).
