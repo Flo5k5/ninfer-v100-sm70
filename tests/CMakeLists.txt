@@ -355,6 +355,10 @@ endif()
 ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
 if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
 ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
+else()
+ninfer_add_op_test(ninfer_linear_fp8_row_scale_sm70_test
+  SOURCES ops/linear/test_fp8_row_scale_sm70.cpp
+  LIBRARIES ninfer_ops)
 endif()
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
