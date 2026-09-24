@@ -233,8 +233,18 @@ constexpr ReductionCriterion kFp32ResidualTolerance{1.0e-4, 1.0 / 16384.0, 1.0 /
 // FP32 residual stream: the same weight and activation update an FP32 residual. The fused QPN
 // epilogue (T <= 32) and the wide GEMM route (T > 32, accumulating onto the residual from its FP32
 // accumulators) both round the sum once, to FP32.
-int run_fp32_residual_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    constexpr std::array<std::int32_t, 4> kTokens{1, 5, 33, 64};
+int run_fp32_residual_shape(std::int32_t n, std::int32_t k, std::int32_t first_w4a4,
+                            std::uint32_t seed) {
+    struct Call {
+        std::int32_t tokens;
+        ops::LinearPolicy policy;
+    };
+    // The permissive policy stays on the FP32-accumulating route below the W4A4 width.
+    const std::array<Call, 5> calls{{{1, ops::LinearPolicy::A16Only},
+                                     {5, ops::LinearPolicy::A16Only},
+                                     {first_w4a4 - 1, ops::LinearPolicy::AllowA4},
+                                     {33, ops::LinearPolicy::A16Only},
+                                     {64, ops::LinearPolicy::A16Only}}};
     constexpr std::int32_t kMaximumTokens = 64;
     quantized_weight::PackedWeight host_weight = [&] {
         quantized_weight::PatternedWeightOptions options;
@@ -265,21 +275,51 @@ int run_fp32_residual_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) 
     ops::detail::nvfp4_prepack_qpn_sm70(weight);
 
     int failures = 0;
-    for (const std::int32_t tokens : kTokens) {
+    {
+        // From the W4A4 width the permissive policy takes the W4A4 route, which writes BF16:
+        // an FP32 residual is rejected before any launch and keeps its values.
+        const std::int32_t tokens = first_w4a4;
+        const std::size_t words   = static_cast<std::size_t>(n) * tokens;
+        GuardedDeviceBuffer output(words * sizeof(float));
+        output.copy_from_host(initial_residual.data(), output.bytes());
+        Tensor x(device_activation.data(), DType::BF16, {k, tokens});
+        Tensor residual(output.data(), DType::FP32, {n, tokens});
+        const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
+            QType::NVFP4, n, k, ops::LinearPolicy::AllowA4, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        const std::string label = std::string("NVFP4 linear_add FP32 residual W4A4 route [") +
+                                  std::to_string(n) + "," + std::to_string(k) + "]";
+        try {
+            ops::linear_add(x, weight, residual, ops::LinearPolicy::AllowA4, workspace, nullptr);
+            std::cerr << label << ": an FP32 residual was accepted\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {
+        }
+        cuda_check(cudaDeviceSynchronize(), "synchronize rejected FP32-residual linear_add");
+        std::vector<float> after(words);
+        output.copy_to_host(after.data(), output.bytes());
+        failures += verify_exact((label + " residual unchanged").c_str(), after,
+                                 std::vector<float>(initial_residual.begin(),
+                                                    initial_residual.begin() +
+                                                        static_cast<std::ptrdiff_t>(words)));
+    }
+    for (const Call& call : calls) {
+        const std::int32_t tokens       = call.tokens;
         const std::size_t output_words = static_cast<std::size_t>(n) * tokens;
         GuardedDeviceBuffer output(output_words * sizeof(float));
         output.copy_from_host(initial_residual.data(), output.bytes());
         Tensor x(device_activation.data(), DType::BF16, {k, tokens});
         Tensor residual(output.data(), DType::FP32, {n, tokens});
         const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
-            QType::NVFP4, n, k, ops::LinearPolicy::A16Only, tokens, tokens);
+            QType::NVFP4, n, k, call.policy, tokens, tokens);
         WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-        ops::linear_add(x, weight, residual, ops::LinearPolicy::A16Only, workspace, nullptr);
+        ops::linear_add(x, weight, residual, call.policy, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "synchronize FP32-residual linear_add");
 
-        const std::string label = std::string("NVFP4") + " linear_add FP32 residual [" +
-                                  std::to_string(n) + "," + std::to_string(k) +
-                                  "] T=" + std::to_string(tokens);
+        const std::string label =
+            std::string("NVFP4") + " linear_add FP32 residual [" + std::to_string(n) + "," +
+            std::to_string(k) + "] T=" + std::to_string(tokens) +
+            (call.policy == ops::LinearPolicy::A16Only ? "" : " AllowA4");
         if (workspace.peak_used() > std::max<std::size_t>(capacity, 256)) {
             std::cerr << label << ": workspace overrun\n";
             ++failures;
@@ -334,8 +374,8 @@ int main() {
 #ifdef NINFER_VOLTA_BUILD
     failures += run_shape(5120, 6144, 812U, true);
     failures += run_shape(5120, 17408, 822U, true);
-    failures += run_fp32_residual_shape(5120, 6144, 815U);
-    failures += run_fp32_residual_shape(5120, 17408, 825U);
+    failures += run_fp32_residual_shape(5120, 6144, 7, 815U);
+    failures += run_fp32_residual_shape(5120, 17408, 8, 825U);
 #endif
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;

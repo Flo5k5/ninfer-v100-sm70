@@ -173,6 +173,11 @@ bool fp8_linear_add_fp16_activation_supported(const Weight& weight, LinearPolicy
     return resolve_route(weight.n, weight.k, policy, tokens) == Fp8LinearAddRoute::QpnResidual &&
            tokens <= kFp8VoltaQpnMaxTokens;
 }
+
+bool fp8_linear_add_fp32_residual_supported(const Weight& weight, LinearPolicy policy,
+                                            std::int32_t tokens) {
+    return resolve_route(weight.n, weight.k, policy, tokens) == Fp8LinearAddRoute::QpnResidual;
+}
 #endif
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,

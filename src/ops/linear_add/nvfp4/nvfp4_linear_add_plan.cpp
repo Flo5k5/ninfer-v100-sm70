@@ -177,6 +177,11 @@ bool nvfp4_linear_add_fp16_activation_supported(const Weight& weight, LinearPoli
                Nvfp4LinearAddRoute::LinearThenAdd &&
            qpn_residual(weight, tokens);
 }
+
+bool nvfp4_linear_add_fp32_residual_supported(const Weight& weight, LinearPolicy policy,
+                                              std::int32_t tokens) {
+    return resolve_route(weight.n, weight.k, policy, tokens) == Nvfp4LinearAddRoute::LinearThenAdd;
+}
 #endif
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
