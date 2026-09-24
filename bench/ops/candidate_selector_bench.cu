@@ -3,7 +3,6 @@
 #include "ninfer/ops/candidate_selector.h"
 
 #include "ninfer_bench_common.h"
-#include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -170,7 +169,6 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
                     draft, q);
     const auto* configs = static_cast<const ops::SamplingConfig*>(fixture.configs.p);
 
-    const auto route    = ops::detail::candidate_selector_path_route(fixture.kSteps, batch_size);
     const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
         fixture.kSteps, fixture.kSteps, batch_size, batch_size);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 1));
@@ -180,9 +178,9 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
                                      configs, draft, q, workspace, s);
     });
     const auto timing = measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
-    std::printf("%d,%d,%s,%s,%.3f,%.3f,%.3f,%zu,%zu\n", fixture.kSteps, batch_size, mode_name(mode),
-                ops::detail::selector_route_name(route), timing.median_us, timing.min_us,
-                timing.p95_us, graph.nodes(), workspace.peak_used());
+    std::printf("%d,%d,%s,%.3f,%.3f,%.3f,%zu,%zu\n", fixture.kSteps, batch_size, mode_name(mode),
+                timing.median_us, timing.min_us, timing.p95_us, graph.nodes(),
+                workspace.peak_used());
 }
 
 } // namespace
@@ -205,7 +203,7 @@ int main(int argc, char** argv) {
         std::printf("# gpu=%s public=candidate_selector_path geometry=C16_K1..15_R256 "
                     "cache=cold flush_mib=%zu execution=graph\n",
                     properties.name, options.flush_bytes >> 20);
-        std::printf("K,B,mode,route,median_us,min_us,p95_us,graph_nodes,workspace_bytes\n");
+        std::printf("K,B,mode,median_us,min_us,p95_us,graph_nodes,workspace_bytes\n");
         for (int steps = 1; steps <= 15; ++steps) {
             if (options.steps && options.steps != steps) continue;
             Fixture fixture(steps);
