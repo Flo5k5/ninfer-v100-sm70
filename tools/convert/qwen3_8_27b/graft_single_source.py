@@ -23,8 +23,12 @@ Example (a single-source NVFP4 checkpoint of the same architecture)::
 
     python3 -m tools.convert.qwen3_8_27b.graft_single_source \\
       --template <published>/qwen3_8_27b_nvfp4.ninfer \\
-      --source <checkpoint>/Qwen3.8-27B-NVFP4 \\
+      --source <checkpoint>/Qwen3.8-27B-NVFP4 --source-label <org>/Qwen3.8-27B-NVFP4 \\
       --out <output>/qwen3_8_27b_nvfp4.ninfer
+
+The artifact's provenance names the source by its required label (a repository id, for example)
+and the template by file name and artifact id, never by path; the template's own provenance is
+kept without its path members, which are listed under ``graft.removed_template_paths``.
 
 ``--verify-against-template`` regenerates the selected objects and compares
 them with the template payloads instead of writing an artifact. Run it with the
@@ -56,6 +60,7 @@ from tools.artifact.formats import QUANT_FORMATS
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
 from tools.artifact.writer import ArtifactWriter
+from tools.convert.common.provenance import input_label, strip_local_paths
 from tools.convert.common.quantize import quantize_and_encode
 from tools.convert.qwen3_8_27b.fp8_embedding import (
     ENCODER_PROFILE,
@@ -490,7 +495,7 @@ def verify(builder: ObjectBuilder, patterns: Sequence[str]) -> int:
     return 1 if mismatches else 0
 
 
-def convert(builder: ObjectBuilder, out_path: Path, provenance_extra: dict) -> None:
+def convert(builder: ObjectBuilder, out_path: Path, provenance: dict) -> None:
     template = builder.template
     directory = template.directory
     specs = []
@@ -499,8 +504,6 @@ def convert(builder: ObjectBuilder, out_path: Path, provenance_extra: dict) -> N
             specs.append(TensorSpec(obj.id, tuple(obj.shape), obj.format, obj.layout))
         else:
             specs.append(ResourceSpec(obj.id, obj.bytes, obj.encoding))
-    provenance = dict(directory.provenance)
-    provenance.update(provenance_extra)
     started = time.perf_counter()
     writer = ArtifactWriter(
         out_path,
@@ -552,7 +555,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--source-label", default=None)
+    parser.add_argument(
+        "--source-label",
+        type=input_label,
+        help="repository id or name of --source recorded in the artifact (required with --out)",
+    )
     parser.add_argument("--verify-against-template", action="store_true")
     parser.add_argument(
         "--only",
@@ -569,24 +576,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             return verify(builder, arguments.only)
         if arguments.out is None:
             parser.error("--out is required unless --verify-against-template is set")
-        # The template source paths no longer describe the language-model
-        # weights: keep them under the graft record and name the new source.
-        extra = {
-            "sources": {
-                "single": {
-                    "label": arguments.source_label or str(arguments.source),
-                    "path": str(arguments.source.resolve()),
-                }
-            },
-            "graft": {
-                "tool": "tools.convert.qwen3_8_27b.graft_single_source",
-                "template": str(arguments.template.resolve()),
-                "template_artifact_id": template.artifact_id.hex(),
-                "template_sources": template.directory.provenance.get("sources"),
-                "copied": list(COPY_PREFIXES),
-            },
+        if arguments.source_label is None:
+            parser.error("--source-label is required with --out")
+        # The template's sources no longer describe the language-model weights: keep them
+        # under the graft record and name the new source. No record carries a local path.
+        provenance, removed = strip_local_paths(template.directory.provenance)
+        graft = {
+            "tool": "tools.convert.qwen3_8_27b.graft_single_source",
+            "template": arguments.template.name,
+            "template_artifact_id": template.artifact_id.hex(),
+            "copied": list(COPY_PREFIXES),
         }
-        convert(builder, arguments.out, extra)
+        if "sources" in provenance:
+            graft["template_sources"] = provenance["sources"]
+        if removed:
+            graft["removed_template_paths"] = removed
+        provenance["sources"] = {"single": {"label": arguments.source_label}}
+        provenance["graft"] = graft
+        convert(builder, arguments.out, provenance)
     return 0
 
 
