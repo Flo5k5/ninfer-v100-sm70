@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import struct
 
+import pytest
 from safetensors.torch import save_file
 import torch
 
@@ -37,6 +38,16 @@ def test_fp8_quantization_zero_rows_ties_and_signed_zero() -> None:
     codes, scales = decode_fp8_row_scaled_words(payload, source.shape)
     assert torch.equal(codes, quantized.codes)
     assert torch.equal(scales.view(torch.int16), quantized.scales.view(torch.int16))
+
+
+def test_fp8_quantization_rejects_wrong_signature_and_nonfinite_source() -> None:
+    with pytest.raises(TypeError, match="rank-two BF16"):
+        fp8_row.quantize_bf16_rows(torch.ones(2, 3))
+    with pytest.raises(TypeError, match="rank-two BF16"):
+        fp8_row.quantize_bf16_rows(torch.ones(3, dtype=torch.bfloat16))
+    source = torch.tensor([[1.0, float("inf")]], dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        fp8_row.quantize_bf16_rows(source)
 
 
 def test_streamed_fp8_conversion_matches_known_words(tmp_path) -> None:

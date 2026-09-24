@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from tools.artifact.codecs.row_split import (
@@ -79,3 +80,13 @@ def test_nonzero_scale_underflow_uses_smallest_fp16_subnormal() -> None:
     weight[0, 0] = torch.finfo(torch.float32).tiny
     quantized = quantize_matrix(weight, "q4_g64_fp16", device="cpu")
     assert int(quantized.scales.view(torch.int16)[0, 0]) == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    (float("nan"), float("inf"), -float("inf"), torch.finfo(torch.float32).max),
+)
+def test_quantization_rejects_nonfinite_source_or_fp16_scale(value: float) -> None:
+    weight = torch.full((1, 64), value, dtype=torch.float32)
+    with pytest.raises(ValueError):
+        quantize_matrix(weight, "q4_g64_fp16", device="cpu")
