@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import re
 import struct
-import tempfile
 
 import pytest
 from safetensors.torch import save_file
@@ -17,6 +15,8 @@ from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorSpec
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.qwen3_8_27b import graft_single_source
+
+from ..path_fragments import assert_no_path_fragments
 
 
 HIDDEN = 64
@@ -95,16 +95,6 @@ def _arguments(template_path, source_dir, out_path, *extra: str) -> list[str]:
             *extra]
 
 
-def _assert_no_path_fragments(text: str, tmp_path: Path) -> None:
-    """No JSON string (member name or value) is, or starts like, a local filesystem path."""
-
-    for fragment in (str(tmp_path), str(Path.home()), tempfile.gettempdir(), "/home/", "/tmp/",
-                     "/private/", "/Users/", "/data/", "/var/"):
-        assert fragment not in text, fragment
-    # A JSON string (member name or value) that starts like an absolute or home path.
-    assert not re.findall(r'"(?:/|~|\\\\|[A-Za-z]:)', text)
-
-
 def test_graft_names_the_source_by_label_and_drops_local_paths(tmp_path) -> None:
     template_path, source_dir, words = _build(tmp_path)
     out_path = tmp_path / "out.ninfer"
@@ -135,7 +125,7 @@ def test_graft_names_the_source_by_label_and_drops_local_paths(tmp_path) -> None
     with out_path.open("rb") as handle:
         _, json_bytes, _ = HEADER.unpack(handle.read(HEADER.size))
         text = handle.read(json_bytes).decode("utf-8")
-    _assert_no_path_fragments(text, tmp_path)
+    assert_no_path_fragments(text, tmp_path)
 
 
 def test_graft_report_names_files_by_name_only(tmp_path) -> None:
@@ -152,7 +142,7 @@ def test_graft_report_names_files_by_name_only(tmp_path) -> None:
     assert report["source"] == source_dir.name
     for value in (report["artifact"], report["template"], report["source"]):
         assert "/" not in value and "\\" not in value
-    _assert_no_path_fragments(json.dumps(report), tmp_path)
+    assert_no_path_fragments(json.dumps(report), tmp_path)
 
 
 @pytest.mark.parametrize("extra", [(), ("--source-label", "/data/models/fine-tune"),
