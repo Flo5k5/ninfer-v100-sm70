@@ -102,6 +102,16 @@ void run(const char* artifact, ninfer::SpeculativeBackend backend, const char* l
     ninfer::Engine engine(engine_options(artifact, backend));
     const std::string prefix = std::string(label) + " ";
 
+    // Prime the lookup state with one unconstrained pass over the reused question: without it,
+    // the first retained-frontier pass can match a partial suffix instead of the full prompt
+    // (observed 20 of 27 tokens) and the strict frontier assertions below flake on engine state
+    // rather than on grammar behaviour.
+    {
+        const std::string priming_question =
+            "Which city is the capital of Spain? Answer with its country and population.";
+        (void)engine.generate(engine.prepare(question(priming_question, false, {})), greedy(8));
+    }
+
     const ninfer::GenerationResult direct = engine.generate(
         engine.prepare(question("Which city is the capital of France? Answer with its country and "
                                 "population.",
