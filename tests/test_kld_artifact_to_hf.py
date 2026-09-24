@@ -11,7 +11,7 @@ from safetensors.torch import load_file, save_file
 from tools.artifact.codecs.direct import encode_direct
 from tools.artifact.codecs.fp8_row import dequantize_fp8_row_scaled, encode_fp8_row_scaled
 from tools.artifact.schema import TensorObject
-from tools.convert.qwen3_8_27b.fp8_embedding import quantize_bf16_rows
+from tools.convert.quantization.fp8_row import quantize_bf16_rows
 
 from tools.kld import artifact_to_hf
 

@@ -56,19 +56,21 @@ from safetensors import safe_open
 from tools.artifact.codecs.direct import decode_direct, encode_direct
 from tools.artifact.codecs.fp8_row import encode_fp8_row_scaled
 from tools.artifact.codecs.nvfp4 import encode_nvfp4
+from tools.artifact.codecs.row_split import encode_row_split
 from tools.artifact.formats import QUANT_FORMATS
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
 from tools.artifact.writer import ArtifactWriter
-from tools.convert.common.provenance import input_label, local_name, strip_local_paths
-from tools.convert.common.quantize import quantize_and_encode
-from tools.convert.qwen3_8_27b.fp8_embedding import (
-    ENCODER_PROFILE,
-    quantize_bf16_rows,
-)
+from tools.convert.provenance import input_label, local_name, strip_local_paths
+from tools.convert.quantization.fp8_row import quantize_bf16_rows
+from tools.convert.quantization.groupwise import quantize_matrix
 
 
 COPY_PREFIXES = ("resource/", "vision/", "dflash2/", "proposal/token_ids")
+# The BF16-to-FP8 row encoder, quantize_bf16_rows: its profile name in the Qwen3.8-27B artifact
+# reference and model card, and the conversion method that owns it.
+FP8_BF16_ENCODER = "MAXABS_BF16S_RECIP_E4M3FN_RNE_V1"
+FP8_BF16_METHOD = "fp8_row_maxabs"
 ATTENTION_HEADS = 24
 ATTENTION_HEAD_ROWS = 512
 ATTENTION_QUERY_ROWS = 256
@@ -436,7 +438,8 @@ class ObjectBuilder:
             return self._encode_nvfp4(obj, parts)
         if obj.format in QUANT_FORMATS:
             values = self._values(obj, parts)
-            return quantize_and_encode(values, obj.format, device=self.device)
+            quantized = quantize_matrix(values, obj.format, device=self.device)
+            return encode_row_split(quantized.codes, quantized.scales, obj.format, values.shape)
         if obj.format in ("bf16", "fp32", "int32"):
             values = self._values(obj, parts)
             target = {"bf16": torch.bfloat16, "fp32": torch.float32, "int32": torch.int32}
@@ -540,7 +543,8 @@ def convert(builder: ObjectBuilder, out_path: Path, provenance: dict) -> None:
         "source": local_name(builder.source.model_dir),
         "objects": counts,
         "copy_prefixes": list(COPY_PREFIXES),
-        "fp8_bf16_encoder": ENCODER_PROFILE,
+        "fp8_bf16_encoder": FP8_BF16_ENCODER,
+        "fp8_bf16_method": FP8_BF16_METHOD,
         "provenance": provenance,
         "elapsed_seconds": round(elapsed, 1),
     }

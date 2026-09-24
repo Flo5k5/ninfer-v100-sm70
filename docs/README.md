@@ -11,6 +11,7 @@ run the CLI or HTTP server.
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, tool calls, and zero data retention |
 | [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
 | [V100 port](v100.md) | sm_70 build, supported surface, qualification, and preferred-SXM2 launch policy |
+| [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components, artifact output, and what this port runs |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 

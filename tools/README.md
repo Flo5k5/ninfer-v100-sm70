@@ -2,18 +2,19 @@
 
 `tools/` contains the project-owner workflows for artifact conversion and inspection, benchmark
 orchestration, and serving smoke checks. These tools are not part of the public download-and-run
-path; normal users should start with the [project README](../README.md).
+path; normal users should start with the [project README](../README.md). To build your own weights,
+use the [weight conversion guide](../docs/weight-conversion.md).
 
-Run commands from the repository root with a Python 3.11 environment containing the dependencies
-for the selected tool.
+Run commands from the repository root with Python 3.10 or later and the dependencies of the
+selected tool.
 
 ## Task index
 
 | Task | Location |
 |---|---|
-| Build the 27B artifact | [`convert/qwen3_6_27b/`](convert/qwen3_6_27b/) |
-| Build the Qwen3.8-27B artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/) |
-| Build the 35B-A3B artifact | [`convert/qwen3_6_35b_a3b/`](convert/qwen3_6_35b_a3b/) |
+| Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
+| Rebuild the Qwen3.8-27B NVFP4 artifact from one single-source checkpoint | [`convert/qwen3_8_27b/graft_single_source.py`](convert/qwen3_8_27b/graft_single_source.py) |
+| Re-encode its NVFP4 MLP objects from a calibrated checkpoint | [`convert/qwen3_8_27b/reencode_nvfp4.py`](convert/qwen3_8_27b/reencode_nvfp4.py) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
@@ -23,34 +24,35 @@ for the selected tool.
 
 ## Artifact workflow
 
-The converters consume their fixed local source checkpoints and write one complete `.ninfer`
-artifact. The paths below are placeholders for the maintainer's local checkpoint checkouts:
+The common converter reads selected local sources and writes a `.ninfer` artifact plus its
+`.conversion.json` report. This example includes the optional weights of the official Qwen3.8-27B
+NVFP4 artifact; the input paths are placeholders for local checkpoint checkouts:
 
 ```bash
-python3 -m tools.convert.qwen3_6_27b.convert \
-  --model /path/to/Qwen3.6-27B \
-  --out out/qwen3_6_27b.ninfer
-
-python3 -m tools.convert.qwen3_8_27b.convert \
+python3 -m tools.convert \
   --model /path/to/Qwen3.8-27B \
-  --dflash2-model /path/to/Qwen3.8-27B-DFlash2 \
-  --out out/qwen3_8_27b.ninfer
-
-python3 -m tools.convert.qwen3_6_35b_a3b.convert \
-  --model /path/to/Qwen3.6-35B-A3B-base \
-  --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \
-  --out out/qwen3_6_35b_a3b.ninfer
+  --recipe qwen3_8_27b_nvfp4 --components text,vision,mtp,dflash2 --proposal \
+  --source quantized=/path/to/Qwen3.8-27B-NVFP4 \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --name qwen3.8-27b \
+  --out out/qwen3_8_27b_nvfp4.ninfer
 ```
 
-Inspect either result:
+Inspect a result:
 
 ```bash
-python3 -m tools.artifact.inspect out/qwen3_6_27b.ninfer --objects
+python3 -m tools.artifact.inspect out/qwen3_8_27b_nvfp4.ninfer --objects
 ```
 
-The exact source revisions, inventories, formats, and conversion recipes are recorded in
-[`docs/maintainer/`](../docs/maintainer/). Published users download the completed artifacts from
-Hugging Face instead of running these workflows.
+The five official recipes, mixed sources, custom methods, resources and sharding are described in
+the [conversion guide](../docs/weight-conversion.md), with the artifacts the Volta Engine runs.
+Published users download the completed artifacts from Hugging Face instead of running these
+workflows.
+
+Two tools start from a published Qwen3.8-27B NVFP4 v3 artifact instead of a whole checkpoint set,
+and keep its directory: `graft_single_source` replaces its payloads with those of one
+compressed-tensors checkpoint of the same architecture, and `reencode_nvfp4` rewrites its NVFP4 MLP
+objects from a calibrated checkpoint. Their module docstrings give the commands.
 
 ## Benchmark orchestration
 
