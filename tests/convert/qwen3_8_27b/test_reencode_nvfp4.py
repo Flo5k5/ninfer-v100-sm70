@@ -13,7 +13,6 @@ from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorSpec
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.qwen3_8_27b import reencode_nvfp4
-from tools.convert.qwen3_8_27b.graft_single_source import SourceCheckpoint
 
 
 # Miniature geometry: the tool reads shapes from the base artifact, not from constants.
@@ -24,10 +23,12 @@ VOCAB = 256
 LAYERS = (0, 1)
 NVFP4_LAYOUT = "block_scale_k16_m128x4_v1"
 MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-# weight_scale_2 values: the first has an exact FP32 reciprocal, the second (0x397dbe11) has none.
+# ModelOpt weight_scale_2 values: the first has an exact FP32 reciprocal, 0x397dbe11 has none.
 EXACT_SCALE_2 = 2.0 ** -12
 INEXACT_SCALE_2 = struct.unpack("<f", struct.pack("<I", 0x397DBE11))[0]
-PROJECTIONS_INDEX = {"gate": 0, "up": 1, "down": 2}
+# compressed-tensors global scales (divisors), not powers of two.
+GLOBAL_SCALES = {"gate_proj": 4133.75, "up_proj": 4133.75, "down_proj": 3999.125}
+LEAF_INDEX = {"gate": 0, "up": 1, "down": 2}
 
 
 def _nearest_codes(values: torch.Tensor, steps: torch.Tensor) -> torch.Tensor:
@@ -53,30 +54,34 @@ def _unpack(packed: torch.Tensor) -> torch.Tensor:
     return torch.stack((packed & 0x0F, packed >> 4), dim=2).reshape(packed.shape[0], -1)
 
 
-def _e4m3_words(values: torch.Tensor) -> torch.Tensor:
-    return values.to(torch.float8_e4m3fn).view(torch.uint8)
-
-
 def _block_words(values: torch.Tensor, divisor: float, shift: torch.Tensor | None = None):
     """E4M3 block scale words for max scaling under ``divisor``, optionally moved by some codes."""
 
     rows, columns = values.shape
     amax = values.abs().reshape(rows, columns // 16, 16).amax(dim=2)
-    words = _e4m3_words(amax / 6.0 * divisor).to(torch.int16)
+    words = (amax / 6.0 * divisor).to(torch.float8_e4m3fn).view(torch.uint8).to(torch.int16)
     if shift is not None:
         words = words + shift
     return words.clamp(1, 0x7E).to(torch.uint8)
 
 
-def _dequantize(codes: torch.Tensor, words: torch.Tensor, multiplier: float) -> torch.Tensor:
+def _steps(words: torch.Tensor, *, multiplier: float | None = None,
+           divisor: float | None = None) -> torch.Tensor:
+    scale = words.view(torch.float8_e4m3fn).float()
+    if multiplier is not None:
+        return scale * torch.tensor(multiplier, dtype=torch.float32)
+    return scale / torch.tensor(divisor, dtype=torch.float32)
+
+
+def _values(codes: torch.Tensor, steps: torch.Tensor) -> torch.Tensor:
     rows, columns = codes.shape
     magnitude = torch.tensor(MAGNITUDES, dtype=torch.float32)[(codes & 0x7).long()]
-    values = torch.where((codes & 0x8) != 0, -magnitude, magnitude)
-    step = words.view(torch.float8_e4m3fn).float() * torch.tensor(multiplier, dtype=torch.float32)
-    return (values.reshape(rows, -1, 16) * step.unsqueeze(2)).reshape(rows, columns)
+    signed = torch.where((codes & 0x8) != 0, -magnitude, magnitude)
+    return (signed.reshape(rows, -1, 16) * steps.unsqueeze(2)).reshape(rows, columns)
 
 
-def _build(tmp_path, *, up_scale_2: float | None = None, layer1_down_format: str = "nvfp4"):
+def _build(tmp_path, *, layout: str = "modelopt", up_scale_2: float | None = None,
+           layer1_down_format: str = "nvfp4", mismatched_gate: bool = False):
     generator = torch.Generator().manual_seed(7)
     donor: dict[str, torch.Tensor] = {}
     weights: dict[str, torch.Tensor] = {}
@@ -85,65 +90,66 @@ def _build(tmp_path, *, up_scale_2: float | None = None, layer1_down_format: str
     for index, layer in enumerate(LAYERS):
         source = f"model.language_model.layers.{layer}.mlp."
         prefix = f"text/layers/{layer}/mlp/"
-        gate = torch.randn(INTERMEDIATE, HIDDEN, generator=generator).to(torch.bfloat16) * 0.02
-        up = torch.randn(INTERMEDIATE, HIDDEN, generator=generator).to(torch.bfloat16) * 0.02
-        down = torch.randn(DOWN_ROWS, INTERMEDIATE, generator=generator).to(torch.bfloat16) * 0.02
-        # The model edits down after quantization of its original: donor and local weights differ.
+        gate = (torch.randn(INTERMEDIATE, HIDDEN, generator=generator) * 0.02).to(torch.bfloat16)
+        up = (torch.randn(INTERMEDIATE, HIDDEN, generator=generator) * 0.02).to(torch.bfloat16)
+        down = (torch.randn(DOWN_ROWS, INTERMEDIATE, generator=generator) * 0.02).to(torch.bfloat16)
+        # The model edited down after the donor quantized the original: they differ slightly.
         edited_down = (down.float() + 0.001 * torch.randn(down.shape, generator=generator)).to(
             torch.bfloat16)
-        weights[source + "gate_proj.weight"] = gate
+        weights[source + "gate_proj.weight"] = gate.flip(0) if mismatched_gate else gate
         weights[source + "up_proj.weight"] = up
         weights[source + "down_proj.weight"] = edited_down
 
-        # Donor: ModelOpt words with block scales moved away from max scaling (a calibrated choice).
+        # Donor: words with block scales moved away from max scaling (a calibrated choice).
         scale_2 = {"gate_proj": EXACT_SCALE_2, "up_proj": up_scale_2 or EXACT_SCALE_2,
                    "down_proj": INEXACT_SCALE_2 if layer == 1 else EXACT_SCALE_2}
         for name, values in (("gate_proj", gate), ("up_proj", up), ("down_proj", down)):
             shift = torch.randint(-1, 5, (values.shape[0], values.shape[1] // 16),
                                   generator=generator, dtype=torch.int16)
-            words = _block_words(values.float(), 1.0 / scale_2[name], shift)
-            step = words.view(torch.float8_e4m3fn).float() * torch.tensor(scale_2[name])
-            codes = _nearest_codes(values.float(), step)
-            donor[source + name + ".weight"] = _pack(codes)
+            if layout == "modelopt":
+                words = _block_words(values.float(), 1.0 / scale_2[name], shift)
+                steps = _steps(words, multiplier=scale_2[name])
+                donor[source + name + ".weight_scale_2"] = torch.tensor(scale_2[name])
+            else:
+                words = _block_words(values.float(), GLOBAL_SCALES[name], shift)
+                steps = _steps(words, divisor=GLOBAL_SCALES[name])
+                donor[source + name + ".weight_global_scale"] = torch.tensor([GLOBAL_SCALES[name]])
+            codes = _nearest_codes(values.float(), steps)
+            key = ".weight" if layout == "modelopt" else ".weight_packed"
+            donor[source + name + key] = _pack(codes)
             donor[source + name + ".weight_scale"] = words.view(torch.float8_e4m3fn)
-            donor[source + name + ".weight_scale_2"] = torch.tensor(scale_2[name])
-            expected[source + name] = (codes, words, scale_2[name])
+            expected[source + name] = (codes, words, steps)
 
         # Base: round-to-nearest words with max block scales, one divisor for gate and up.
         gate_up_id, down_id = f"weight/{2 * index:06d}", f"weight/{2 * index + 1:06d}"
         gate_up_shape, down_shape = (2 * INTERMEDIATE, HIDDEN), tuple(down.shape)
-        fused = torch.cat([gate.float(), up.float()])
-        divisor = 2688.0 / float(fused.abs().max())
-        words = _block_words(fused, divisor)
-        codes = _nearest_codes(fused, words.view(torch.float8_e4m3fn).float() / divisor)
-        payloads[gate_up_id] = encode_nvfp4(_pack(codes), words, torch.tensor(divisor), gate_up_shape)
-        down_divisor = 2688.0 / float(edited_down.float().abs().max())
-        down_words = _block_words(edited_down.float(), down_divisor)
-        down_codes = _nearest_codes(edited_down.float(),
-                                    down_words.view(torch.float8_e4m3fn).float() / down_divisor)
-        payloads[down_id] = encode_nvfp4(_pack(down_codes), down_words, torch.tensor(down_divisor),
-                                         down_shape)
-        down_format = layer1_down_format if layer == 1 else "nvfp4"
+        for object_id, values, shape in ((gate_up_id, torch.cat([gate.float(), up.float()]),
+                                          gate_up_shape),
+                                         (down_id, edited_down.float(), down_shape)):
+            divisor = 2688.0 / float(values.abs().max())
+            words = _block_words(values, divisor)
+            codes = _nearest_codes(values, _steps(words, divisor=divisor))
+            payloads[object_id] = encode_nvfp4(_pack(codes), words, torch.tensor(divisor), shape)
         specs.append(TensorSpec(gate_up_id, gate_up_shape, "nvfp4", NVFP4_LAYOUT))
-        if down_format == "nvfp4":
-            specs.append(TensorSpec(down_id, down_shape, "nvfp4", NVFP4_LAYOUT))
-        else:
+        if layer == 1 and layer1_down_format != "nvfp4":
             codes8 = edited_down.float().to(torch.float8_e4m3fn).view(torch.uint8)
             payloads[down_id] = encode_fp8_row_scaled(
                 codes8, torch.ones(DOWN_ROWS, dtype=torch.bfloat16), down_shape)
             specs.append(TensorSpec(down_id, down_shape, "fp8_e4m3fn_row_bf16", "row_scale_v1"))
+        else:
+            specs.append(TensorSpec(down_id, down_shape, "nvfp4", NVFP4_LAYOUT))
         half = INTERMEDIATE * HIDDEN
         bindings[prefix + "gate"] = {"parts": [{"object": gate_up_id, "range": [0, half]}]}
         bindings[prefix + "up"] = {"parts": [{"object": gate_up_id, "range": [half, 2 * half]}]}
         bindings[prefix + "down"] = {"object": down_id}
         for leaf, source_input in (("gate", "ffn_input"), ("up", "ffn_input"),
                                    ("down", "mlp/product")):
-            aux_id = f"auxiliary/{3 * index + PROJECTIONS_INDEX[leaf]:06d}"
+            aux_id = f"auxiliary/{3 * index + LEAF_INDEX[leaf]:06d}"
             uses.append({"parameter": prefix + leaf, "input": f"text/layers/{layer}/{source_input}",
                          "activation_policy": "AllowA4",
                          "auxiliaries": {"activation_input_divisor": {"object": aux_id}}})
             specs.append(TensorSpec(aux_id, (), "fp32", "contiguous_le_v1"))
-            payloads[aux_id] = struct.pack("<f", 40.0 + 3 * index + PROJECTIONS_INDEX[leaf])
+            payloads[aux_id] = struct.pack("<f", 40.0 + 3 * index + LEAF_INDEX[leaf])
     head = torch.randn(VOCAB, HIDDEN, generator=generator)
     specs.append(TensorSpec("weight/head", (VOCAB, HIDDEN), "fp8_e4m3fn_row_bf16", "row_scale_v1"))
     payloads["weight/head"] = encode_fp8_row_scaled(
@@ -170,63 +176,99 @@ def _build(tmp_path, *, up_scale_2: float | None = None, layer1_down_format: str
     return base_path, donor_dir, weights_dir, weights, expected
 
 
-
-def _run(base_path, donor_dir, weights_dir, out_path, *extra: str) -> int:
-    return reencode_nvfp4.main([
-        "--base", str(base_path), "--donor", str(donor_dir), "--weights", str(weights_dir),
-        "--round", "down", "--out", str(out_path), *extra])
+def _arguments(base_path, donor_dir, out_path, *extra) -> list[str]:
+    return ["--base", str(base_path), "--donor", str(donor_dir), "--out", str(out_path), *extra]
 
 
-def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path) -> None:
-    base_path, donor_dir, weights_dir, weights, expected = _build(tmp_path)
-    out_path = tmp_path / "out.ninfer"
-    assert _run(base_path, donor_dir, weights_dir, out_path, "--verify") == 0
-
+def _check_copies(base_path, out_path) -> None:
     with Artifact(base_path) as base, Artifact(out_path) as out:
         for field in ("components", "bindings", "uses", "metadata"):
             assert getattr(out.directory, field) == getattr(base.directory, field)
         assert out.directory.provenance["recipe"] == "qwen3_8_27b_nvfp4"
-        assert out.directory.provenance["reencode"]["layers"] == list(LAYERS)
         assert [obj.to_json() for obj in out.objects] == [obj.to_json() for obj in base.objects]
         reencoded = {f"weight/{i:06d}" for i in range(2 * len(LAYERS))}
         for obj in base.objects:
             if obj.id not in reencoded:
                 assert out.read_object(obj.id) == base.read_object(obj.id), obj.id
 
-        for index, layer in enumerate(LAYERS):
-            source = f"model.language_model.layers.{layer}.mlp."
-            # Gate/up: the donor's words as they are, decoding to the donor's values.
-            gate_up = f"weight/{2 * index:06d}"
-            shape = (2 * INTERMEDIATE, HIDDEN)
-            codes, scales, divisor = decode_nvfp4_words(out.read_object(gate_up), shape)
-            donor_codes = torch.cat([expected[source + name][0] for name in ("gate_proj", "up_proj")])
-            donor_words = torch.cat([expected[source + name][1] for name in ("gate_proj", "up_proj")])
-            assert torch.equal(_unpack(codes), donor_codes)
-            assert torch.equal(scales, donor_words)
-            assert float(torch.tensor(1.0) / divisor) == EXACT_SCALE_2
-            donor_values = torch.cat([_dequantize(*expected[source + name])
-                                      for name in ("gate_proj", "up_proj")])
-            torch.testing.assert_close(dequantize_nvfp4(out.read_object(gate_up), shape),
-                                       donor_values, rtol=2.0 ** -21, atol=0.0)
 
-            # Down: the donor's scales, codes rounded from the edited local weights.
-            down_id = f"weight/{2 * index + 1:06d}"
-            shape = (DOWN_ROWS, INTERMEDIATE)
-            codes, scales, divisor = decode_nvfp4_words(out.read_object(down_id), shape)
-            _, donor_down_words, scale_2 = expected[source + "down_proj"]
-            assert torch.equal(scales, donor_down_words)
-            steps = scales.view(torch.float8_e4m3fn).float() * (torch.tensor(1.0) / divisor)
-            local = weights[source + "down_proj.weight"].float()
-            assert torch.equal(_unpack(codes), _nearest_codes(local, steps))
-            if scale_2 == EXACT_SCALE_2:
-                assert float(torch.tensor(1.0) / divisor) == scale_2
+def _words(out_path, object_id: str, shape: tuple[int, int]):
+    with Artifact(out_path) as out:
+        payload = out.read_object(object_id)
+    codes, scales, divisor = decode_nvfp4_words(payload, shape)
+    return _unpack(codes), scales, divisor, payload
+
+
+@pytest.mark.parametrize("layout", ["modelopt", "compressed-tensors"])
+def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path, monkeypatch, layout) -> None:
+    # Row chunks that divide neither part: offsets across chunk and gate/up boundaries are exercised.
+    monkeypatch.setattr(reencode_nvfp4, "ROW_CHUNK", 48)
+    base_path, donor_dir, weights_dir, weights, expected = _build(tmp_path, layout=layout)
+    out_path = tmp_path / "out.ninfer"
+    arguments = _arguments(base_path, donor_dir, out_path, "--weights", str(weights_dir),
+                           "--round", "down", "--verify")
+    assert reencode_nvfp4.main(arguments) == 0
+    _check_copies(base_path, out_path)
+    with Artifact(out_path) as out:
+        assert out.directory.provenance["reencode"]["layers"] == list(LAYERS)
+
+    for index, layer in enumerate(LAYERS):
+        source = f"model.language_model.layers.{layer}.mlp."
+        # Gate/up: the donor's words as they are, decoding to the donor's values.
+        shape = (2 * INTERMEDIATE, HIDDEN)
+        codes, scales, divisor, payload = _words(out_path, f"weight/{2 * index:06d}", shape)
+        parts = [expected[source + name] for name in ("gate_proj", "up_proj")]
+        assert torch.equal(codes, torch.cat([part[0] for part in parts]))
+        assert torch.equal(scales, torch.cat([part[1] for part in parts]))
+        donor_values = torch.cat([_values(part[0], part[2]) for part in parts])
+        if layout == "modelopt":
+            assert float(torch.tensor(1.0) / divisor) == EXACT_SCALE_2
+            torch.testing.assert_close(dequantize_nvfp4(payload, shape), donor_values,
+                                       rtol=2.0 ** -21, atol=0.0)
+        else:
+            assert float(divisor) == GLOBAL_SCALES["gate_proj"]
+            assert torch.equal(dequantize_nvfp4(payload, shape), donor_values)
+
+        # Down: the donor's scales, codes rounded from the edited local weights.
+        shape = (DOWN_ROWS, INTERMEDIATE)
+        codes, scales, divisor, _ = _words(out_path, f"weight/{2 * index + 1:06d}", shape)
+        assert torch.equal(scales, expected[source + "down_proj"][1])
+        steps = scales.view(torch.float8_e4m3fn).float() * (torch.tensor(1.0) / divisor)
+        local = weights[source + "down_proj.weight"].float()
+        assert torch.equal(codes, _nearest_codes(local, steps))
 
     report = json.loads((tmp_path / "out.ninfer.reencode.json").read_text())
-    assert report["inexact_reciprocals"] == 1
+    assert report["verified"] is True
+    assert report["inexact_divisors"] == (1 if layout == "modelopt" else 0)
     assert report["recipe"] == "qwen3_8_27b_nvfp4"
-    gate_up_report = report["objects"][0]
-    assert gate_up_report["codes_equal_to_rounded_weights"] == 1.0
+    assert report["objects"][0]["codes_equal_to_rounded_weights"] == 1.0
     assert all(item["relative_rms_error"] < 0.2 for item in report["objects"])
+
+
+def test_donor_words_everywhere_without_weights(tmp_path) -> None:
+    base_path, donor_dir, _, _, expected = _build(tmp_path)
+    out_path = tmp_path / "out.ninfer"
+    assert reencode_nvfp4.main(_arguments(base_path, donor_dir, out_path, "--verify")) == 0
+    _check_copies(base_path, out_path)
+    codes, scales, _, _ = _words(out_path, "weight/000001", (DOWN_ROWS, INTERMEDIATE))
+    down = expected["model.language_model.layers.0.mlp.down_proj"]
+    assert torch.equal(codes, down[0]) and torch.equal(scales, down[1])
+
+
+def test_rounds_gate_and_up_together(tmp_path) -> None:
+    base_path, donor_dir, weights_dir, weights, expected = _build(tmp_path)
+    out_path = tmp_path / "out.ninfer"
+    arguments = _arguments(base_path, donor_dir, out_path, "--weights", str(weights_dir),
+                           "--round", "gate", "up")
+    assert reencode_nvfp4.main(arguments) == 0
+    codes, scales, divisor, _ = _words(out_path, "weight/000000", (2 * INTERMEDIATE, HIDDEN))
+    source = "model.language_model.layers.0.mlp."
+    local = torch.cat([weights[source + name + ".weight"].float() for name in ("gate_proj", "up_proj")])
+    steps = scales.view(torch.float8_e4m3fn).float() * (torch.tensor(1.0) / divisor)
+    assert torch.equal(codes, _nearest_codes(local, steps))
+    down = expected[source + "down_proj"]
+    down_codes, _, _, _ = _words(out_path, "weight/000001", (DOWN_ROWS, INTERMEDIATE))
+    assert torch.equal(down_codes, down[0])
 
 
 def test_inexact_reciprocal_is_the_nearest_fp32_word() -> None:
@@ -247,11 +289,12 @@ def test_inexact_reciprocal_is_the_nearest_fp32_word() -> None:
 def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None:
     base_path, donor_dir, weights_dir, _, _ = _build(tmp_path)
     out_path = tmp_path / "out.ninfer"
-    assert _run(base_path, donor_dir, weights_dir, out_path) == 0
-    with Artifact(base_path) as base:
-        targets = reencode_nvfp4.plan_targets(base, LAYERS, {"down"})
-    encoder = reencode_nvfp4.Encoder(SourceCheckpoint(donor_dir), SourceCheckpoint(weights_dir))
-    assert reencode_nvfp4.verify_output(base_path, out_path, targets, encoder) == 0
+    arguments = _arguments(base_path, donor_dir, out_path, "--weights", str(weights_dir),
+                           "--round", "down")
+    assert reencode_nvfp4.main(arguments) == 0
+    report = json.loads((tmp_path / "out.ninfer.reencode.json").read_text())
+    expected = {item["object"]: item["payload_sha256"] for item in report["objects"]}
+    assert reencode_nvfp4.verify_output(base_path, out_path, expected) == 0
     for object_id in ("weight/head", "weight/000001"):
         with Artifact(out_path) as out:
             offset = out.payload_offset + out.object(object_id).offset + 5
@@ -260,23 +303,55 @@ def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None
             byte = handle.read(1)[0]
             handle.seek(offset)
             handle.write(bytes([byte ^ 0x10]))
-        assert reencode_nvfp4.verify_output(base_path, out_path, targets, encoder) == 1
+        assert reencode_nvfp4.verify_output(base_path, out_path, expected) == 1
         with out_path.open("r+b") as handle:
             handle.seek(offset)
             handle.write(bytes([byte]))
 
 
-def test_refuses_fused_parts_with_different_tensor_scales(tmp_path) -> None:
-    base_path, donor_dir, weights_dir, _, _ = _build(tmp_path, up_scale_2=2.0 ** -11)
+def test_failed_verification_removes_the_output(tmp_path, monkeypatch) -> None:
+    base_path, donor_dir, weights_dir, _, _ = _build(tmp_path)
     out_path = tmp_path / "out.ninfer"
-    with pytest.raises(reencode_nvfp4.ReencodeError, match="different tensor scales"):
-        _run(base_path, donor_dir, weights_dir, out_path)
+    monkeypatch.setattr(reencode_nvfp4, "verify_output", lambda *arguments: 1)
+    arguments = _arguments(base_path, donor_dir, out_path, "--weights", str(weights_dir),
+                           "--round", "down", "--verify")
+    assert reencode_nvfp4.main(arguments) == 1
+    assert not out_path.exists()
+    report = json.loads((tmp_path / "out.ninfer.reencode.json").read_text())
+    assert report["verified"] is False and report["removed"] is True
+
+
+@pytest.mark.parametrize(
+    "build, extra, match",
+    [
+        ({"up_scale_2": 2.0 ** -11}, ("--round", "down"), "different tensor scales"),
+        ({"mismatched_gate": True}, ("--round", "down"), "does the donor quantize"),
+        ({}, ("--round", "gate"), "round both or neither"),
+        ({"layer1_down_format": "fp8"}, ("--round", "down", "--layers", "0-1"),
+         "not an NVFP4 matrix"),
+    ],
+)
+def test_refusals_leave_no_output(tmp_path, build, extra, match) -> None:
+    base_path, donor_dir, weights_dir, _, _ = _build(tmp_path, **build)
+    out_path = tmp_path / "out.ninfer"
+    with pytest.raises(reencode_nvfp4.ReencodeError, match=match):
+        reencode_nvfp4.main(_arguments(base_path, donor_dir, out_path, "--weights",
+                                       str(weights_dir), *extra))
     assert not out_path.exists()
 
 
-def test_refuses_a_layer_whose_mlp_is_not_nvfp4(tmp_path) -> None:
+def test_argument_and_base_checks(tmp_path) -> None:
     base_path, donor_dir, weights_dir, _, _ = _build(tmp_path, layer1_down_format="fp8")
+    out_path = tmp_path / "out.ninfer"
+    for extra in (("--round", "down"), ("--layers", "1-0")):
+        with pytest.raises(SystemExit):
+            reencode_nvfp4.main(_arguments(base_path, donor_dir, out_path, *extra))
+    with pytest.raises(SystemExit):
+        reencode_nvfp4.main(_arguments(base_path, donor_dir, base_path))
     with Artifact(base_path) as base:
         assert reencode_nvfp4.nvfp4_layers(base) == [0]
-        with pytest.raises(reencode_nvfp4.ReencodeError, match="not an NVFP4 matrix"):
-            reencode_nvfp4.plan_targets(base, LAYERS, {"down"})
+    # An earlier re-encode is not a valid base.
+    first = tmp_path / "first.ninfer"
+    assert reencode_nvfp4.main(_arguments(base_path, donor_dir, first)) == 0
+    with pytest.raises(reencode_nvfp4.ReencodeError, match="already re-encoded"):
+        reencode_nvfp4.main(_arguments(first, donor_dir, tmp_path / "second.ninfer"))
