@@ -49,6 +49,9 @@ struct ServeOptions {
     // in memory; they have their own switches (see the zero data retention section of
     // docs/serving.md).
     bool enable_response_store             = true;
+    // --no-structured-output: build no grammar compiler and reject constrained requests
+    // (response_format json_object/json_schema and their Responses and Anthropic forms).
+    bool enable_structured_output            = true;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;

@@ -129,6 +129,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
+        // Every captured round carries the mask kernel; unconstrained rows count zero columns.
+        if (state.execution.token_masks.bitmask != nullptr) {
+            card.set_token_masks(state.execution.token_masks.bitmask, &frame.token_mask_columns);
+        }
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
                                            static_cast<std::uint64_t>(width) * batch_size);

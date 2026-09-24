@@ -972,6 +972,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     token_counts    = plan.persistent.token_counts.bind(backing);
     sampling_config = plan.persistent.sampling_config.bind(backing);
+    if (plan.persistent.token_masks.has_value() !=
+        plan.persistent.token_mask_single_column.has_value()) {
+        throw std::logic_error("token mask layout is incomplete");
+    }
+    if (plan.persistent.token_masks) {
+        token_masks              = plan.persistent.token_masks->bind(backing);
+        token_mask_single_column = plan.persistent.token_mask_single_column->bind(backing);
+        token_mask_host.emplace(token_masks->bytes());
+    }
     active_continuations.fill(continuation_capacity);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
@@ -989,6 +998,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
+    if (token_mask_single_column) { set_device_i32(*token_mask_single_column, 1); }
 
     host_tokens = static_cast<TokenId*>(round_host.data());
     if (ordinary_host) {
@@ -7398,6 +7408,7 @@ ProgramImplCore::shared_prefix_summary(const SharedPrefixState& shared) const {
 }
 
 PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence,
+                                                 runtime::TokenConstraint* constraint,
                                                  runtime::ExecutionTiming* failed_timing) {
     if (pending_transaction_ || !valid_sequence(sequence)) {
         throw std::logic_error("prefill sequence capability is invalid");
@@ -7407,7 +7418,7 @@ PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence,
         throw std::logic_error("prefill advance requires a prefilling sequence");
     }
     try {
-        runtime::PrefillStepResult step = advance_prefill_raw(lane, failed_timing);
+        runtime::PrefillStepResult step = advance_prefill_raw(lane, constraint, failed_timing);
         if (failed_timing != nullptr) { *failed_timing += step.timing; }
         return wrap_prefill(lane, std::move(step));
     } catch (...) {
@@ -8813,9 +8824,11 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
 
 PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
                                      std::span<const runtime::RoundBudget> budgets,
+                                     std::span<runtime::TokenConstraint* const> constraints,
                                      runtime::ExecutionTiming* failed_timing) {
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
-        budgets.size() != members.size()) {
+        budgets.size() != members.size() ||
+        (!constraints.empty() && constraints.size() != members.size())) {
         throw std::invalid_argument("decode membership is invalid");
     }
     std::array<std::uint32_t, kMaximumConcurrency> lanes{};
@@ -8833,7 +8846,8 @@ PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
     }
     const auto lane_span = std::span<const std::uint32_t>(lanes.data(), members.size());
     try {
-        runtime::BatchedGeneratedRound round = decode_raw(lane_span, budgets, failed_timing);
+        runtime::BatchedGeneratedRound round =
+            decode_raw(lane_span, budgets, constraints, failed_timing);
         if (failed_timing != nullptr) { *failed_timing += round.timing; }
         return wrap_pending(lane_span, std::move(round));
     } catch (...) {
@@ -10054,9 +10068,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
 }
 
 runtime::PrefillStepResult
-ProgramImplCore::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
+ProgramImplCore::advance_prefill_raw(std::uint32_t lane, runtime::TokenConstraint* constraint,
+                                     runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    return advance_prefill(active_sequence(lane), requests[lane], constraint, failed_timing);
 }
 
 runtime::ExecutionTiming
@@ -11209,7 +11224,8 @@ void ProgramImplCore::prepare_graphs() {
                                        prefill_hidden,
                                        prefill_chunk,
                                        proposal_head,
-                                       text_numerics};
+                                       text_numerics,
+                                       token_mask_buffers()};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -11551,6 +11567,39 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
                                     {minimum_count, maximum_count});
 }
 
+schedule::TokenMaskBuffers ProgramImplCore::token_mask_buffers() const noexcept {
+    if (!token_masks) { return {}; }
+    return schedule::TokenMaskBuffers{.bitmask       = &*token_masks,
+                                      .single_column = &*token_mask_single_column};
+}
+
+std::uint32_t ProgramImplCore::stage_token_masks(std::uint32_t row,
+                                                 runtime::TokenConstraint& constraint,
+                                                 std::span<const TokenId> drafts) {
+    if (!token_masks || !token_mask_host) {
+        throw std::logic_error("constrained rows require planned token masks");
+    }
+    const Tensor& masks        = *token_masks;
+    const auto words           = static_cast<std::size_t>(masks.ne[0]);
+    const auto columns         = static_cast<std::size_t>(masks.ne[1]);
+    const std::size_t row_base = static_cast<std::size_t>(row) * columns * words;
+    if (constraint.mask_words() != masks.ne[0] || drafts.size() >= columns ||
+        row >= static_cast<std::uint32_t>(masks.ne[2])) {
+        throw std::logic_error("constrained row does not fit the planned token masks");
+    }
+    // The previous round has completed, so its uploads no longer read the staging rows.
+    auto* host                 = static_cast<std::int32_t*>(token_mask_host->data()) + row_base;
+    const std::uint32_t walked = constraint.fill_masks(drafts, host, words);
+    if (walked > drafts.size()) {
+        throw std::logic_error("output constraint walked more drafts than it was given");
+    }
+    CUDA_CHECK(
+        cudaMemcpyAsync(static_cast<std::int32_t*>(masks.data) + row_base, host,
+                        (static_cast<std::size_t>(walked) + 1U) * words * sizeof(std::int32_t),
+                        cudaMemcpyHostToDevice, device.stream));
+    return walked;
+}
+
 void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) const {
     for (const TokenId token : tokens) {
         if (token < 0 || token >= TextConfig::token_domain) {
@@ -11561,10 +11610,14 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
 
 runtime::PrefillStepResult
 ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& request,
+                                 runtime::TokenConstraint* constraint,
                                  runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
+    }
+    if (constraint != nullptr && is_masked_draft_backend(speculative_backend)) {
+        throw std::logic_error("DFlash prefill cannot constrain its first token");
     }
 
     RequestControl::Prefill& staged = *request.prefill;
@@ -11602,7 +11655,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         schedule::PrefillContext schedule_state{
             {device, model, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, text_numerics},
+             proposal_head, text_numerics, token_mask_buffers()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -11616,6 +11669,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             selectors.destination,
             staged.initial_mtp_extent,
             dflash_host_ingress};
+        // The first generated token is sampled by the step that reaches the end of the prompt.
+        if (constraint != nullptr && staged.prompt_tokens - staged.cursor <= prefill_chunk) {
+            (void)stage_token_masks(0, *constraint, {});
+            schedule_state.constrained_sample = true;
+        }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -11857,6 +11915,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets,
+                                       std::span<runtime::TokenConstraint* const> constraints,
                                        runtime::ExecutionTiming* failed_timing) {
     nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                   static_cast<std::uint64_t>(lanes.size()));
@@ -11921,18 +11980,24 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
+            ordinary_host_ingress->token_mask_columns[row]      = 0;
+            if (runtime::TokenConstraint* constraint =
+                    constraints.empty() ? nullptr : constraints[row]) {
+                (void)stage_token_masks(static_cast<std::uint32_t>(row), *constraint, {});
+                ordinary_host_ingress->token_mask_columns[row] = 1;
+            }
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
 
-        schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
-                                                       replay_records ? &*replay_records : nullptr,
-                                                       io, prefill_hidden, prefill_chunk,
-                                                       proposal_head, text_numerics},
-                                                      decoder->text_kv,
-                                                      *io.ordinary,
-                                                      *ordinary_host_ingress,
-                                                      *ordinary_host_egress,
-                                                      state_images->continuation_hidden_store()};
+        schedule::OrdinaryBatchContext schedule_state{
+            {device, model, work, state_images->linear(),
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             proposal_head, text_numerics, token_mask_buffers()},
+            decoder->text_kv,
+            *io.ordinary,
+            *ordinary_host_ingress,
+            *ordinary_host_egress,
+            state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -11990,6 +12055,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets,
+                                  std::span<runtime::TokenConstraint* const> constraints,
                                   runtime::ExecutionTiming* failed_timing) {
     nvtx::ScopedRange round_range(nvtx::Name::DecodeMtpRound, nvtx::Category::Mtp,
                                   static_cast<std::uint64_t>(lanes.size()));
@@ -12039,6 +12105,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                               : 0U;
         ContextLookupRow& lookup_row    = lookup_rows[row];
         lookup_row.room = std::min(budget_room, capacity - sequence.execution_frontier - 1);
+        // A constrained row verifies no draft: only its target position is masked, so it takes
+        // one token per round and keeps the batch off lookup verification.
+        if (!constraints.empty() && constraints[row] != nullptr) { lookup_row.room = 0; }
         if (!lookup_plan.lookup_planned()) { continue; }
         request.lookup.observe(sequence.ledger);
         if (!lookup_candidate || lookup_row.room <= draft_window) {
@@ -12130,19 +12199,27 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
+            if (runtime::TokenConstraint* constraint =
+                    constraints.empty() ? nullptr : constraints[row]) {
+                if (extent != 0) {
+                    throw std::logic_error("a constrained MTP row cannot verify drafts");
+                }
+                (void)stage_token_masks(static_cast<std::uint32_t>(row), *constraint, {});
+                mtp_host_ingress->token_mask_columns[row] = 1;
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
         }
 
-        schedule::MtpBatchContext schedule_state{{device, model, work, state_images->linear(),
-                                                  replay_source, io, prefill_hidden, prefill_chunk,
-                                                  proposal_head, text_numerics},
-                                                 decoder->text_kv,
-                                                 *decoder->mtp_cache(),
-                                                 frame,
-                                                 *mtp_host_ingress,
-                                                 *mtp_host_egress,
-                                                 state_images->continuation_hidden_store()};
+        schedule::MtpBatchContext schedule_state{
+            {device, model, work, state_images->linear(), replay_source, io, prefill_hidden,
+             prefill_chunk, proposal_head, text_numerics, token_mask_buffers()},
+            decoder->text_kv,
+            *decoder->mtp_cache(),
+            frame,
+            *mtp_host_ingress,
+            *mtp_host_egress,
+            state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -12238,7 +12315,15 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets,
+                                     std::span<runtime::TokenConstraint* const> constraints,
                                      runtime::ExecutionTiming* failed_timing) {
+    // DFlash drafts and verifies inside one graph, where no grammar mask can reach the drafted
+    // positions; the frontend rejects constrained requests on such Engines.
+    if (std::any_of(
+            constraints.begin(), constraints.end(),
+            [](const runtime::TokenConstraint* constraint) { return constraint != nullptr; })) {
+        throw std::logic_error("DFlash rounds cannot constrain their rows");
+    }
     nvtx::ScopedRange round_range(nvtx::Name::DecodeDFlashRound, nvtx::Category::DFlash,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -12433,14 +12518,15 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
                             std::span<const runtime::RoundBudget> budgets,
+                            std::span<runtime::TokenConstraint* const> constraints,
                             runtime::ExecutionTiming* failed_timing) {
     if (speculative_backend == SpeculativeBackend::None) {
-        return decode_ordinary_batch(lanes, budgets, failed_timing);
+        return decode_ordinary_batch(lanes, budgets, constraints, failed_timing);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        return decode_mtp_batch(lanes, budgets, failed_timing);
+        return decode_mtp_batch(lanes, budgets, constraints, failed_timing);
     }
-    return decode_dflash_batch(lanes, budgets, failed_timing);
+    return decode_dflash_batch(lanes, budgets, constraints, failed_timing);
 }
 
 runtime::ExecutionTiming ProgramImplCore::resolve_non_speculative_pending(

@@ -4,6 +4,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/token_bitmask.h"
 
 #include <cuda_runtime.h>
 
@@ -28,6 +29,22 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
             (void)rewrite_checkpoint;
         });
+}
+
+// The grammar mask of the prompt's last position, bound when the request is constrained.
+const TokenMaskBuffers* prompt_token_masks(const PrefillContext& state) {
+    if (!state.constrained_sample) { return nullptr; }
+    const TokenMaskBuffers& masks = state.execution.token_masks;
+    if (masks.bitmask == nullptr || masks.single_column == nullptr) {
+        throw std::logic_error("a constrained prompt sample has no grammar mask buffers");
+    }
+    return &masks;
+}
+
+void bind_prompt_token_mask(TextContext& card, const PrefillContext& state) {
+    if (const TokenMaskBuffers* masks = prompt_token_masks(state)) {
+        card.set_token_masks(masks->bitmask, masks->single_column);
+    }
 }
 
 } // namespace
@@ -60,6 +77,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    bind_prompt_token_mask(card, state);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -84,6 +102,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
+    bind_prompt_token_mask(card, state);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -141,6 +160,11 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
     ops::linear(hidden, state.execution.model.output_head, logits, state.execution.device.stream);
+    if (const TokenMaskBuffers* masks = prompt_token_masks(state)) {
+        Tensor column_logits = logits.view({TextConfig::output_rows, 1, 1});
+        ops::apply_token_bitmask(column_logits, *masks->bitmask, *masks->single_column,
+                                 TextConfig::token_domain, state.execution.device.stream);
+    }
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));

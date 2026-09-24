@@ -180,6 +180,10 @@ ninfer_add_test(ninfer_qwen3_6_27b_context_lookup_real_test
   SOURCES targets/qwen3_6_27b/test_engine_context_lookup_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_context_lookup_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_structured_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_structured_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_structured_real_test PROPERTIES SKIP_RETURN_CODE 77)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   # The FP32 text residual stream (Volta, qwen3.8-27b/nvfp4): scoring in both shapes against a
   # BF16-residual engine, the production MTP + CUDA Graph decode, and its startup planning.

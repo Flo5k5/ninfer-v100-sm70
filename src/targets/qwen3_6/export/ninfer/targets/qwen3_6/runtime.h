@@ -875,8 +875,11 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    // A constrained sequence passes its output constraint: the first generated token, sampled
+    // when prefill reaches the end of the prompt, is masked by it.
     [[nodiscard]] PrefillProgress<Variant>
     advance_prefill(SequenceHandle<Variant> sequence,
+                    runtime::TokenConstraint* constraint    = nullptr,
                     runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer<Variant>& offer,
@@ -909,9 +912,14 @@ public:
         const SharedPrefixHandle<Variant>* replacement,
         std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
         CapturePressurePlan<Variant>&& pressure, runtime::CancellationFlagView cancellation);
-    [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
-                                               std::span<const runtime::RoundBudget> budgets,
-                                               runtime::ExecutionTiming* failed_timing = nullptr);
+    // `constraints` is empty or holds one entry per sequence, null for an unconstrained row: the
+    // positions each constrained row samples are masked by its constraint. An Engine started
+    // with a DFlash backend cannot mask its drafted positions and rejects constrained rows.
+    [[nodiscard]] PendingBatch<Variant>
+    decode(std::span<const SequenceHandle<Variant>> sequences,
+           std::span<const runtime::RoundBudget> budgets,
+           std::span<runtime::TokenConstraint* const> constraints = {},
+           runtime::ExecutionTiming* failed_timing                = nullptr);
     // Advance each live sequence with its exact target-owned token row. This does not sample or
     // advance sampler RNG/occurrence state; callers own output publication and budget accounting.
     // Each optional execution split is relative to its row's forced-token span.

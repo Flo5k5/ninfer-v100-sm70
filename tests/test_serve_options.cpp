@@ -321,6 +321,10 @@ int main() {
     failures +=
         check(!parse({"ninfer-serve", "model.ninfer", "--no-response-store"}).enable_response_store,
               "--no-response-store did not disable Responses storage");
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).enable_structured_output &&
+                          !parse({"ninfer-serve", "model.ninfer", "--no-structured-output"})
+                               .enable_structured_output,
+                      "--no-structured-output did not disable structured output");
     for (const std::vector<std::string>& limit :
          {std::vector<std::string>{"--response-store-max-records", "42"},
           std::vector<std::string>{"--response-store-max-mib", "8"}}) {

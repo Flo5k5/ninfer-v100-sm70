@@ -180,6 +180,8 @@ struct RequestRecord {
     bool capture_pending                  = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;
+    // The output constraint refused a generated token: the request fails when it is settled.
+    bool constraint_violation = false;
 
     std::optional<BasePlan> base_plan;
     std::uint64_t remaining_service_work = 0;

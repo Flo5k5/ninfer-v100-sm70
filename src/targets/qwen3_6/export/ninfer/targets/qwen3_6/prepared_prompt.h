@@ -1,5 +1,6 @@
 #pragma once
 
+#include "grammar/grammar_service.h"
 #include <ninfer/targets/qwen3_6/frontend.h>
 
 #include <array>
@@ -148,6 +149,9 @@ struct PreparedPromptData {
     PromptIdentity identity;
     PreparedContextCache context_cache;
     std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
+    // Grammar over the complete output of a constrained request, reasoning part included; empty
+    // when the output is unconstrained.
+    grammar::CompiledGrammar output_grammar;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
 

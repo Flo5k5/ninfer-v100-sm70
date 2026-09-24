@@ -960,7 +960,16 @@ private:
             request->terminal_reason.reset();
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            complete_success(request, reason);
+            if (request->constraint_violation) {
+                // Fails without naming the refused token.
+                complete_error(request, std::make_exception_ptr(RequestError(
+                                            RequestErrorKind::OutputConstraintViolated,
+                                            "the output grammar refused a generated token; the "
+                                            "request stopped instead of continuing "
+                                            "unconstrained")));
+            } else {
+                complete_success(request, reason);
+            }
             remove_completed_slot(lane);
             boundary = begin_host_phase();
             changed  = true;
@@ -1111,6 +1120,23 @@ private:
                 }
                 const OutputDecision decision = request->output.preview_model(
                     row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                if (decision.constraint_violation) {
+                    if (decision.accepted_tokens != 0 ||
+                        decision.finish_reason != FinishReason::Cancelled) {
+                        throw std::logic_error("output policy returned an invalid violation");
+                    }
+                    // A cancelled row cannot be released while another row holds the context
+                    // transaction. The row ends as a terminal one with its first token, which the
+                    // output session does not publish, and its request fails when it is settled.
+                    decisions[row] = CommitDecision{
+                        .accepted_tokens = 1,
+                        .terminal        = true,
+                        .cancelled       = false,
+                    };
+                    finish_reasons[row]           = FinishReason::Cancelled;
+                    request->constraint_violation = true;
+                    continue;
+                }
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                     (!decision.finished() && decision.accepted_tokens != count) ||
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
@@ -1392,8 +1418,8 @@ private:
         }
         setup.finish();
         ProgramCallScope program_call(*this);
-        auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+        auto progress = instance_.program->advance_prefill(
+            *request->sequence, request->output.token_constraint(), &program_call.failed_timing());
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
@@ -1794,9 +1820,16 @@ private:
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
+        std::array<TokenConstraint*, kMaximumConcurrency> constraints{};
+        for (std::size_t row = 0; row < membership.size; ++row) {
+            const auto& request = slots_[membership.lanes[row]];
+            constraints[row]    = request != nullptr ? request->output.token_constraint() : nullptr;
+        }
         ProgramCallScope program_call(*this);
         auto pending = instance_.program->decode(
-            membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
+            membership.sequence_span(), membership.budget_span(),
+            std::span<TokenConstraint* const>(constraints.data(), membership.size),
+            &program_call.failed_timing());
         program_call.finish(pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();

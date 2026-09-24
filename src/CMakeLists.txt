@@ -468,6 +468,7 @@ target_link_libraries(ninfer_engine
   PRIVATE
     ninfer_artifact
     ninfer_core
+    ninfer_grammar
     ninfer_ops
     ninfer_text
     ninfer_media_decode)

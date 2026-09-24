@@ -3,6 +3,9 @@
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include "grammar/grammar_error.h"
+#include "grammar/grammar_service.h"
+#include "grammar/schema_admission.h"
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
@@ -898,6 +901,100 @@ PreparedContextCache prepare_context_cache(
     return out;
 }
 
+// The reasoning part of a thinking answer, which the generation prompt leaves open after
+// "<think>\n": any text without a think tag, closed by </think> and the blank line of the
+// canonical close serialization.
+constexpr std::string_view kReasoningPrefixFormat =
+    R"({"type":"sequence","elements":[{"type":"tag","begin":"","content":{"type":"any_text",)"
+    R"("excludes":["<think>","</think>"]},"end":"</think>"},{"type":"const_string",)"
+    R"("value":"\n\n"}]})";
+static_assert(fi::kCanonicalReasoningCloseSerialization == "\n</think>\n\n");
+constexpr std::string_view kAnyJsonObjectSchema = R"({"type":"object"})";
+
+// The grammar sees the text an output publishes. Special tokens publish nothing, so the grammar
+// gives them no text: among them, only the stop tokens can be generated, where the grammar ends.
+std::shared_ptr<const grammar::GrammarService>
+make_grammar_service(const fi::Tokenizer& tokenizer, const std::vector<TokenId>& stop_tokens,
+                     const StructuredOutputOptions& options) {
+    std::vector<std::string> token_bytes(kTokenDomain);
+    for (std::size_t id = 0; id < kTokenDomain; ++id) {
+        const int token = static_cast<int>(id);
+        if (!tokenizer.is_valid_token(token)) { continue; }
+        const fi::DecodedTokenView decoded = tokenizer.decoded_token(token);
+        if (!decoded.special) { token_bytes[id].assign(decoded.bytes); }
+    }
+    return std::make_shared<const grammar::GrammarService>(
+        std::move(token_bytes), stop_tokens,
+        grammar::GrammarServiceOptions{.workers         = options.compile_workers,
+                                       .compile_threads = options.compile_threads,
+                                       .cache_bytes     = options.cache_bytes});
+}
+
+// A grammar to compile for an output, with the request field it enforces: errors found while
+// compiling name that field.
+struct OutputRecipe {
+    grammar::GrammarRecipe recipe;
+    std::string field;
+};
+
+// The grammar of a constrained answer, or nothing for free text. Throws
+// RequestError(InvalidOutputConstraint) when the format cannot be enforced as requested.
+std::optional<OutputRecipe> response_format_recipe(const PromptOptions& options) {
+    const ResponseFormat& format = options.response_format;
+    switch (format.kind) {
+    case ResponseFormatKind::Text:
+        return std::nullopt;
+    case ResponseFormatKind::JsonObject:
+    case ResponseFormatKind::JsonSchema:
+        break;
+    default:
+        throw std::invalid_argument("PromptOptions contains an invalid response format kind");
+    }
+    if (options.continuation != PromptContinuationMode::NewAssistantTurn) {
+        throw RequestError(RequestErrorKind::InvalidOutputConstraint,
+                           "a response format applies to a new assistant turn and cannot "
+                           "continue a final assistant message");
+    }
+    if (!options.tool_jsons.empty()) {
+        throw RequestError(RequestErrorKind::InvalidOutputConstraint,
+                           "a response format cannot yet be combined with callable tools");
+    }
+    grammar::GrammarRecipe answer =
+        grammar::GrammarRecipe::json_schema(std::string(kAnyJsonObjectSchema));
+    std::string field = "response_format";
+    if (format.kind == ResponseFormatKind::JsonSchema) {
+        field = format.schema_location.empty() ? std::string("schema") : format.schema_location;
+        try {
+            grammar::SchemaAdmission admission{grammar::GrammarLimits{}};
+            answer =
+                grammar::GrammarRecipe::json_schema(admission.admit(format.schema_json, field));
+        } catch (const grammar::GrammarError& error) {
+            throw RequestError(RequestErrorKind::InvalidOutputConstraint, error.what());
+        }
+    }
+    if (!options.enable_thinking) { return OutputRecipe{std::move(answer), std::move(field)}; }
+    return OutputRecipe{grammar::GrammarRecipe::sequence({grammar::GrammarRecipe::structural_tag(
+                                                              std::string(kReasoningPrefixFormat)),
+                                                          std::move(answer)}),
+                        std::move(field)};
+}
+
+// The grammar state of one constrained output, advanced by its committed model and control
+// tokens.
+class GrammarConstraint final : public runtime::TokenConstraint {
+public:
+    explicit GrammarConstraint(const grammar::CompiledGrammar& grammar) : matcher(grammar) {}
+
+    [[nodiscard]] std::int32_t mask_words() const noexcept override { return matcher.mask_words(); }
+
+    [[nodiscard]] std::uint32_t fill_masks(std::span<const TokenId> drafts, std::int32_t* rows,
+                                           std::size_t row_stride_words) override {
+        return matcher.fill_draft_masks(drafts, rows, row_stride_words);
+    }
+
+    grammar::TokenMatcher matcher;
+};
+
 } // namespace
 
 class Frontend::Impl {
@@ -960,6 +1057,37 @@ public:
             }
         }
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+        if (!options.structured_output.enabled) {
+            grammar_unavailable = "structured output is disabled for this Engine";
+        } else if (!options.structured_output_supported) {
+            grammar_unavailable =
+                "this Engine cannot constrain output: its DFlash speculative backend drafts "
+                "positions that grammar masks cannot reach; start it with MTP or without "
+                "speculative decoding";
+        } else {
+            grammar_service =
+                make_grammar_service(*tokenizer, defaults.token_ids, options.structured_output);
+        }
+    }
+
+    void require_structured_output() const {
+        if (grammar_service == nullptr) {
+            throw RequestError(RequestErrorKind::OutputConstraintUnavailable, grammar_unavailable);
+        }
+    }
+
+    // Compiles the output grammar of a prompt, waiting for it under the preparation control.
+    [[nodiscard]] grammar::CompiledGrammar
+    compile_output_grammar(const OutputRecipe& output, const PreparationControl& control) const {
+        require_structured_output();
+        try {
+            return grammar_service->compile(output.recipe, [&control] {
+                fi::check_preparation_control(control, "grammar compilation");
+            });
+        } catch (const grammar::GrammarError& error) {
+            throw RequestError(RequestErrorKind::InvalidOutputConstraint,
+                               output.field + ": " + error.what());
+        }
     }
 
     fi::CompiledChatTemplate chat_template;
@@ -968,8 +1096,10 @@ public:
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
-    bool vision_enabled       = true;
-    std::uint32_t max_context = 0;
+    std::shared_ptr<const grammar::GrammarService> grammar_service;
+    const char* grammar_unavailable = nullptr;
+    bool vision_enabled             = true;
+    std::uint32_t max_context       = 0;
 };
 
 class OutputSession::Impl {
@@ -977,7 +1107,8 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
-         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
+         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
+         const grammar::CompiledGrammar& output_grammar)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
@@ -987,6 +1118,7 @@ public:
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
+        if (output_grammar) { constraint = std::make_unique<GrammarConstraint>(output_grammar); }
         state.in_reasoning        = split_reasoning;
         prefix_execution.tracking = starts_in_reasoning;
         semantic.budget           = thinking.budget;
@@ -1012,7 +1144,23 @@ public:
     fi::ToolCallOutputDecoder tool_call_output;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
+    // Grammar of a constrained output. A preview advances it by the tokens it accepts; the Engine
+    // commits every preview it takes, so the grammar never needs to return to the pre-preview
+    // state except when it refuses a token.
+    std::unique_ptr<GrammarConstraint> constraint;
     bool preview_ready = false;
+
+    // Stages a preview that accepts nothing and ends the output as committed so far.
+    void stage_terminal_preview() {
+        preview_state            = state;
+        preview_semantic         = semantic;
+        preview_prefix_execution = prefix_execution;
+        preview_execution_split_after.reset();
+        preview_semantic.control_pending = false;
+        preview_output.clear();
+        terminalize(preview_state, policy, preview_output, 0);
+        preview_ready = true;
+    }
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -1138,6 +1286,17 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         const TokenId token                = tokens[index];
         const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
 
+        // The masks of the round allowed only tokens the grammar accepts, so a refusal means the
+        // round was not generated under this grammar. Nothing of it is accepted, and the request
+        // fails rather than continue unconstrained.
+        if (impl_->constraint && !impl_->constraint->matcher.accept(token)) {
+            impl_->constraint->matcher.rollback(static_cast<std::uint32_t>(index));
+            impl_->stage_terminal_preview();
+            return runtime::OutputDecision{.accepted_tokens      = 0,
+                                           .finish_reason        = FinishReason::Cancelled,
+                                           .constraint_violation = true};
+        }
+
         if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes);
             boundary && *boundary == decoded.bytes.size()) {
             impl_->preview_execution_split_after = count;
@@ -1233,6 +1392,16 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     if (tokens.size() > total_budget_remaining) {
         throw std::invalid_argument("thinking control span exceeds the remaining output budget");
     }
+    // Control is injected only while the reasoning part is open, where the grammar accepts any
+    // text without a think tag; the suffix then closes it exactly as the grammar requires.
+    if (impl_->constraint) {
+        for (std::size_t index = 0; index < tokens.size(); ++index) {
+            if (!impl_->constraint->matcher.accept(tokens[index])) {
+                impl_->constraint->matcher.rollback(static_cast<std::uint32_t>(index));
+                throw std::logic_error("the output grammar refused the thinking control suffix");
+            }
+        }
+    }
 
     impl_->preview_state            = impl_->state;
     impl_->preview_semantic         = impl_->semantic;
@@ -1294,15 +1463,12 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
         reason == FinishReason::StopToken) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
-    impl_->preview_state            = impl_->state;
-    impl_->preview_semantic         = impl_->semantic;
-    impl_->preview_prefix_execution = impl_->prefix_execution;
-    impl_->preview_execution_split_after.reset();
-    impl_->preview_semantic.control_pending = false;
-    impl_->preview_output.clear();
-    terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
-    impl_->preview_ready = true;
+    impl_->stage_terminal_preview();
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
+}
+
+runtime::TokenConstraint* OutputSession::token_constraint() noexcept {
+    return impl_ != nullptr ? impl_->constraint.get() : nullptr;
 }
 
 PublishedOutput OutputSession::commit_preview() {
@@ -1413,8 +1579,15 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
-    const auto start              = Clock::now();
-    const PromptOptions options   = input.options;
+    const auto start            = Clock::now();
+    const PromptOptions options = input.options;
+    // A constrained answer is admitted before the prompt is rendered and compiled once the prompt
+    // fits, so that a request the Engine cannot serve fails before any compilation.
+    std::optional<OutputRecipe> output_recipe;
+    if (options.response_format.kind != ResponseFormatKind::Text) {
+        impl_->require_structured_output();
+        output_recipe = response_format_recipe(options);
+    }
     ContextCacheHints cache_hints = std::move(input.context_cache);
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
@@ -1517,6 +1690,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         checked_token_count(result.token_ids.size()));
     result.starts_in_reasoning =
         options.continuation == PromptContinuationMode::NewAssistantTurn && options.enable_thinking;
+    if (output_recipe) {
+        result.output_grammar = impl_->compile_output_grammar(*output_recipe, control);
+    }
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1607,11 +1783,16 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const OutputOptions& output,
                                             const ThinkingControlOptions& thinking) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    if (prompt.data_->output_grammar && !caller_stop.include_model_defaults) {
+        throw std::invalid_argument("a constrained output ends at the model's stop tokens, which "
+                                    "its stop policy must keep");
+    }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
-        impl_->thinking_control_tokens, prompt.data_->tool_call_output));
+        impl_->thinking_control_tokens, prompt.data_->tool_call_output,
+        prompt.data_->output_grammar));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

@@ -564,6 +564,7 @@ public:
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
+                                                  runtime::TokenConstraint* constraint,
                                                   runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
@@ -592,6 +593,7 @@ public:
         CapturePressureCandidate&& pressure, runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
+                                      std::span<runtime::TokenConstraint* const> constraints,
                                       runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,
@@ -674,6 +676,11 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    // Grammar masks of constrained rows and their host staging; planned for the ordinary and
+    // MTP backends when structured output is enabled.
+    std::optional<Tensor> token_masks;
+    std::optional<Tensor> token_mask_single_column;
+    std::optional<PinnedHostBuffer> token_mask_host;
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;
@@ -1009,9 +1016,11 @@ private:
                         MaterializationTransaction& transaction);
     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
     [[nodiscard]] runtime::PrefillStepResult
-    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing);
+    advance_prefill_raw(std::uint32_t lane, runtime::TokenConstraint* constraint,
+                        runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
+               std::span<runtime::TokenConstraint* const> constraints,
                runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::ExecutionTiming
     resolve_prefill_raw(std::uint32_t lane, bool terminal, runtime::ExecutionTiming* failed_timing);
@@ -1224,7 +1233,7 @@ private:
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
-                    runtime::ExecutionTiming* failed_timing);
+                    runtime::TokenConstraint* constraint, runtime::ExecutionTiming* failed_timing);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
@@ -1233,15 +1242,25 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets,
+                          std::span<runtime::TokenConstraint* const> constraints,
                           runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_mtp_batch(std::span<const std::uint32_t> lanes,
                      std::span<const runtime::RoundBudget> budgets,
+                     std::span<runtime::TokenConstraint* const> constraints,
                      runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
+                        std::span<runtime::TokenConstraint* const> constraints,
                         runtime::ExecutionTiming* failed_timing);
+    // Grammar masks of the rows a round samples (null buffers when none are planned).
+    [[nodiscard]] schedule::TokenMaskBuffers token_mask_buffers() const noexcept;
+    // Fills the masks of compact row `row` from its constraint, the committed state followed by
+    // the drafts it walks, and uploads them to the device before the round is launched. Returns
+    // the number of drafts walked.
+    std::uint32_t stage_token_masks(std::uint32_t row, runtime::TokenConstraint& constraint,
+                                    std::span<const TokenId> drafts);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);

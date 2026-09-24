@@ -29,6 +29,7 @@
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
+#include "ninfer/ops/token_bitmask.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 
@@ -579,6 +580,15 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     }
 }
 
+void TextContext::apply_token_masks(Tensor& logits, cudaStream_t stream) const {
+    if (token_mask_bitmask_ == nullptr) { return; }
+    if (token_mask_columns_ == nullptr) {
+        throw std::logic_error("grammar masks are bound without their column counts");
+    }
+    ops::apply_token_bitmask(logits, *token_mask_bitmask_, *token_mask_columns_, kCfg.token_domain,
+                             stream);
+}
+
 void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& positions,
                                     ops::CausalAttentionExecutionEnvelope envelope,
@@ -689,6 +699,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
         ops::linear(hidden, *lm_head_, logits, stream);
+        Tensor column_logits = logits.view({kCfg.vocab, 1, batch});
+        apply_token_masks(column_logits, stream);
     }
     work_.reset();
 }
@@ -750,6 +762,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+        apply_token_masks(logits, stream);
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
     work_.reset();
@@ -1233,6 +1246,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 ops::linear(last_xf, *lm_head_, logits, s);
+                Tensor column_logits = logits.view({kCfg.vocab, 1, 1});
+                apply_token_masks(column_logits, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).

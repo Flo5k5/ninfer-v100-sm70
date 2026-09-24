@@ -26,6 +26,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.prefill_hidden, state.execution.prefill_chunk,
                          state.execution.numerics, 0, {},
                          &state.text_cache);
+        // Every captured round carries the mask kernel; unconstrained rows count zero columns.
+        if (state.execution.token_masks.bitmask != nullptr) {
+            card.set_token_masks(state.execution.token_masks.bitmask, &ordinary.token_mask_columns);
+        }
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);

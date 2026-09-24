@@ -477,6 +477,17 @@ Cancellation 不修改 in-flight mapping，也不从未完成的 active state �
 Cleanup 顺序必须先终止 Program 中未决的 resource/model transaction，再释放 active state，最后清空
 ResourceManager 与完成所有 request response。内部不变量错误不能降级成 cache miss、等待或重试。
 
+### 7.5 Output constraint violation
+
+A constrained output feeds every committed token through its grammar. A token the grammar refuses,
+which its mask should have excluded (a masking fault or non-finite logits), fails that request only:
+
+- the output session publishes nothing for the round;
+- the row ends as a terminal row with one accepted token, never as a cancelled row, because a
+  cancelled row cannot be released while another row holds the context transaction;
+- the Engine settles it like any terminal request once no transaction is open, and completes it
+  with `RequestErrorKind::OutputConstraintViolated` instead of a result.
+
 ---
 
 ## 8. 物理执行的顶层约束

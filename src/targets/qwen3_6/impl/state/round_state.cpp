@@ -111,6 +111,8 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_source_slots), DType::I32);
     state_destination_slots =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_destination_slots), DType::I32);
+    token_mask_columns =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, token_mask_columns), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
@@ -288,7 +290,9 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     state_destination_slots =
         ingress_tensor(offsetof(MtpDecodeIngress, state_destination_slots), DType::I32, {batch});
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
-    sampling    = reinterpret_cast<const ops::SamplingConfig*>(
+    token_mask_columns =
+        ingress_tensor(offsetof(MtpDecodeIngress, token_mask_columns), DType::I32, {batch});
+    sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
 
     licensed_tokens =
