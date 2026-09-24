@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
+import hashlib
 import json
+from pathlib import Path
+import re
 import struct
+import tempfile
 
 import pytest
 from safetensors.torch import save_file
@@ -9,6 +14,7 @@ import torch
 
 from tools.artifact.codecs.fp8_row import encode_fp8_row_scaled
 from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, dequantize_nvfp4, encode_nvfp4
+from tools.artifact.framing import HEADER
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorSpec
 from tools.artifact.writer import ArtifactWriter
@@ -23,12 +29,68 @@ VOCAB = 256
 LAYERS = (0, 1)
 NVFP4_LAYOUT = "block_scale_k16_m128x4_v1"
 MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-# ModelOpt weight_scale_2 values: the first has an exact FP32 reciprocal, 0x397dbe11 has none.
-EXACT_SCALE_2 = 2.0 ** -12
-INEXACT_SCALE_2 = struct.unpack("<f", struct.pack("<I", 0x397DBE11))[0]
-# compressed-tensors global scales (divisors), not powers of two.
+# ModelOpt weight_scale_2 words and the divisor word the artifact must store for each: the first
+# two have exact FP32 reciprocals that BF16 cannot represent; 0x397DBE11 has none, so the nearest
+# reciprocal is stored and reported inexact.
+GATE_UP_SCALE_2 = 0x39A2877F
+DOWN_SCALE_2 = {0: 0x3A03126F, 1: 0x397DBE11}
+DIVISOR_WORDS = {0x39A2877F: 0x45499CE7, 0x3A03126F: 0x44F9FFFF, 0x397DBE11: 0x4581238A}
+INEXACT_SCALES_2 = {0x397DBE11}
+# compressed-tensors global scales are the divisors themselves, not powers of two.
 GLOBAL_SCALES = {"gate_proj": 4133.75, "up_proj": 4133.75, "down_proj": 3999.125}
+DONOR_SUFFIXES = {"modelopt": (".weight", ".weight_scale", ".weight_scale_2"),
+                  "compressed-tensors": (".weight_packed", ".weight_scale", ".weight_global_scale")}
 LEAF_INDEX = {"gate": 0, "up": 1, "down": 2}
+DONOR_LABEL = "org/calibrated-NVFP4"
+WEIGHTS_LABEL = "org/fine-tune"
+# The base's provenance as a graft leaves it, with local paths, and what the output keeps of it.
+INHERITED_PROVENANCE = {
+    "converter": "ninfer-v3",
+    "recipe": "qwen3_8_27b_nvfp4",
+    "sources": {"single": {"label": "org/fine-tune-NVFP4"}},
+    "graft": {"tool": "tools.convert.qwen3_8_27b.graft_single_source",
+              "template_artifact_id": "00112233445566778899aabbccddeeff",
+              "copied": ["resource/", "vision/"]},
+}
+REMOVED_BASE_PATHS = ["sources.single.path", "ranking", "graft.template",
+                      "graft.template_sources.base.path"]
+
+
+@dataclass
+class Fixture:
+    base: Path
+    donor_dir: Path
+    weights_dir: Path
+    donor: dict[str, torch.Tensor]
+    weights: dict[str, torch.Tensor]
+    expected: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+
+
+def _f32(word: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", word))[0]
+
+
+def _word(value: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def _scale_2_word(layer: int, name: str) -> int:
+    return DOWN_SCALE_2[layer] if name == "down_proj" else GATE_UP_SCALE_2
+
+
+def _divisor_word(layout: str, layer: int, name: str) -> int:
+    """The divisor word the artifact must store, from the donor's tensor scale alone."""
+
+    if layout == "modelopt":
+        return DIVISOR_WORDS[_scale_2_word(layer, name)]
+    return _word(GLOBAL_SCALES[name])
+
+
+def _decode_steps(scales: torch.Tensor, divisor_word: int) -> torch.Tensor:
+    """One E2M1 unit per block as the FP32 decode routes form it: e4m3 * (1.0f / divisor)."""
+
+    reciprocal = torch.tensor(1.0) / torch.tensor(_f32(divisor_word), dtype=torch.float32)
+    return scales.view(torch.float8_e4m3fn).float() * reciprocal
 
 
 def _nearest_codes(values: torch.Tensor, steps: torch.Tensor) -> torch.Tensor:
@@ -80,8 +142,27 @@ def _values(codes: torch.Tensor, steps: torch.Tensor) -> torch.Tensor:
     return (signed.reshape(rows, -1, 16) * steps.unsqueeze(2)).reshape(rows, columns)
 
 
-def _build(tmp_path, *, layout: str = "modelopt", up_scale_2: float | None = None,
-           layer1_down_format: str = "nvfp4", mismatched_gate: bool = False):
+def _save(directory: Path, tensors: dict[str, torch.Tensor]) -> None:
+    save_file(tensors, str(directory / "model.safetensors"))
+
+
+def _base_provenance(tmp_path: Path) -> dict:
+    return {
+        "converter": "ninfer-v3",
+        "recipe": "qwen3_8_27b_nvfp4",
+        "sources": {"single": {"label": "org/fine-tune-NVFP4",
+                               "path": str(tmp_path / "fine-tune-NVFP4")}},
+        "ranking": str(tmp_path / "ranking.counts.i64"),
+        "graft": {"tool": "tools.convert.qwen3_8_27b.graft_single_source",
+                  "template": str(tmp_path / "template.ninfer"),
+                  "template_artifact_id": "00112233445566778899aabbccddeeff",
+                  "template_sources": {"base": {"path": "~/models/base-hf-bf16"}},
+                  "copied": ["resource/", "vision/"]},
+    }
+
+
+def _build(tmp_path, *, layout: str = "modelopt", up_scale_2: int | None = None,
+           layer1_down_format: str = "nvfp4", mismatched_gate: bool = False) -> Fixture:
     generator = torch.Generator().manual_seed(7)
     donor: dict[str, torch.Tensor] = {}
     weights: dict[str, torch.Tensor] = {}
@@ -101,22 +182,22 @@ def _build(tmp_path, *, layout: str = "modelopt", up_scale_2: float | None = Non
         weights[source + "down_proj.weight"] = edited_down
 
         # Donor: words with block scales moved away from max scaling (a calibrated choice).
-        scale_2 = {"gate_proj": EXACT_SCALE_2, "up_proj": up_scale_2 or EXACT_SCALE_2,
-                   "down_proj": INEXACT_SCALE_2 if layer == 1 else EXACT_SCALE_2}
+        scale_2 = {name: _scale_2_word(layer, name) for name in ("gate_proj", "down_proj")}
+        scale_2["up_proj"] = up_scale_2 or GATE_UP_SCALE_2
         for name, values in (("gate_proj", gate), ("up_proj", up), ("down_proj", down)):
             shift = torch.randint(-1, 5, (values.shape[0], values.shape[1] // 16),
                                   generator=generator, dtype=torch.int16)
             if layout == "modelopt":
-                words = _block_words(values.float(), 1.0 / scale_2[name], shift)
-                steps = _steps(words, multiplier=scale_2[name])
-                donor[source + name + ".weight_scale_2"] = torch.tensor(scale_2[name])
+                multiplier = _f32(scale_2[name])
+                words = _block_words(values.float(), 1.0 / multiplier, shift)
+                steps = _steps(words, multiplier=multiplier)
+                donor[source + name + ".weight_scale_2"] = torch.tensor(multiplier)
             else:
                 words = _block_words(values.float(), GLOBAL_SCALES[name], shift)
                 steps = _steps(words, divisor=GLOBAL_SCALES[name])
                 donor[source + name + ".weight_global_scale"] = torch.tensor([GLOBAL_SCALES[name]])
             codes = _nearest_codes(values.float(), steps)
-            key = ".weight" if layout == "modelopt" else ".weight_packed"
-            donor[source + name + key] = _pack(codes)
+            donor[source + name + DONOR_SUFFIXES[layout][0]] = _pack(codes)
             donor[source + name + ".weight_scale"] = words.view(torch.float8_e4m3fn)
             expected[source + name] = (codes, words, steps)
 
@@ -164,20 +245,24 @@ def _build(tmp_path, *, layout: str = "modelopt", up_scale_2: float | None = Non
     base_path = tmp_path / "base.ninfer"
     writer = ArtifactWriter(base_path, specs, components={"text": {"config": {}}},
                             bindings=bindings, uses=uses, metadata={"name": "qwen3.8-27b"},
-                            provenance={"recipe": "qwen3_8_27b_nvfp4"})
+                            provenance=_base_provenance(tmp_path))
     for object_id, payload in payloads.items():
         writer.write_object(object_id, payload)
     writer.finish()
     donor_dir, weights_dir = tmp_path / "donor", tmp_path / "weights"
     donor_dir.mkdir()
     weights_dir.mkdir()
-    save_file(donor, str(donor_dir / "model.safetensors"))
-    save_file(weights, str(weights_dir / "model.safetensors"))
-    return base_path, donor_dir, weights_dir, weights, expected
+    _save(donor_dir, donor)
+    _save(weights_dir, weights)
+    return Fixture(base_path, donor_dir, weights_dir, donor, weights, expected)
 
 
-def _arguments(base_path, donor_dir, out_path, *extra) -> list[str]:
-    return ["--base", str(base_path), "--donor", str(donor_dir), "--out", str(out_path), *extra]
+def _arguments(fixture: Fixture, out_path: Path, *extra: str, weights: bool = False) -> list[str]:
+    arguments = ["--base", str(fixture.base), "--donor", str(fixture.donor_dir),
+                 "--donor-label", DONOR_LABEL, "--out", str(out_path)]
+    if weights:
+        arguments += ["--weights", str(fixture.weights_dir), "--weights-label", WEIGHTS_LABEL]
+    return arguments + list(extra)
 
 
 def _check_copies(base_path, out_path) -> None:
@@ -199,102 +284,346 @@ def _words(out_path, object_id: str, shape: tuple[int, int]):
     return _unpack(codes), scales, divisor, payload
 
 
+def _stored_sha256(directory: Path) -> dict[str, str]:
+    """SHA-256 of every tensor's stored bytes, read from the safetensors file itself."""
+
+    data = (directory / "model.safetensors").read_bytes()
+    (length,) = struct.unpack("<Q", data[:8])
+    header = json.loads(data[8:8 + length])
+    start = 8 + length
+    return {name: hashlib.sha256(data[start + meta["data_offsets"][0]:
+                                      start + meta["data_offsets"][1]]).hexdigest()
+            for name, meta in header.items() if name != "__metadata__"}
+
+
+def _assert_no_local_paths(artifact: Path, tmp_path: Path) -> None:
+    """No directory JSON string is a filesystem path or names a home or temporary directory."""
+
+    with artifact.open("rb") as handle:
+        _, json_bytes, _ = HEADER.unpack(handle.read(HEADER.size))
+        text = handle.read(json_bytes).decode("utf-8")
+    for fragment in (str(tmp_path), str(Path.home()), tempfile.gettempdir(), "/home/", "/tmp/",
+                     "/private/", "/Users/", "/data/", "/var/"):
+        assert fragment not in text, fragment
+    # A JSON string (member name or value) that starts like an absolute or home path.
+    assert not re.findall(r'"(?:/|~|\\\\|[A-Za-z]:)', text)
+
+
+def _report(tmp_path) -> dict:
+    return json.loads((tmp_path / "out.ninfer.reencode.json").read_text())
+
+
+def _assert_nothing_written(tmp_path) -> None:
+    assert not (tmp_path / "out.ninfer").exists()
+    assert not list(tmp_path.glob(".out.ninfer.*"))
+
+
 @pytest.mark.parametrize("layout", ["modelopt", "compressed-tensors"])
 def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path, monkeypatch, layout) -> None:
     # Row chunks that divide neither part: offsets across chunk and gate/up boundaries are exercised.
     monkeypatch.setattr(reencode_nvfp4, "ROW_CHUNK", 48)
-    base_path, donor_dir, weights_dir, weights, expected = _build(tmp_path, layout=layout)
+    fixture = _build(tmp_path, layout=layout)
     out_path = tmp_path / "out.ninfer"
-    arguments = _arguments(base_path, donor_dir, out_path, "--weights", str(weights_dir),
-                           "--round", "down", "--verify")
+    arguments = _arguments(fixture, out_path, "--round", "down", "--verify", weights=True)
     assert reencode_nvfp4.main(arguments) == 0
-    _check_copies(base_path, out_path)
-    with Artifact(out_path) as out:
-        assert out.directory.provenance["reencode"]["layers"] == list(LAYERS)
+    _check_copies(fixture.base, out_path)
+    report = _report(tmp_path)
+    assert report["verified"] is True
+    assert report["recipe"] == "qwen3_8_27b_nvfp4"
+    assert report["reencode"]["layers"] == list(LAYERS)
+    assert report["inexact_divisors"] == (1 if layout == "modelopt" else 0)
+    entries = {item["object"]: item for item in report["objects"]}
+    donor_sha256, weights_sha256 = _stored_sha256(fixture.donor_dir), _stored_sha256(
+        fixture.weights_dir)
 
     for index, layer in enumerate(LAYERS):
         source = f"model.language_model.layers.{layer}.mlp."
-        # Gate/up: the donor's words as they are, decoding to the donor's values.
-        shape = (2 * INTERMEDIATE, HIDDEN)
-        codes, scales, divisor, payload = _words(out_path, f"weight/{2 * index:06d}", shape)
-        parts = [expected[source + name] for name in ("gate_proj", "up_proj")]
+        # Gate/up: the donor's words as they are, under the divisor of the donor's tensor scale.
+        gate_up_id, shape = f"weight/{2 * index:06d}", (2 * INTERMEDIATE, HIDDEN)
+        word = _divisor_word(layout, layer, "gate_proj")
+        codes, scales, divisor, payload = _words(out_path, gate_up_id, shape)
+        assert _word(float(divisor)) == word
+        parts = [fixture.expected[source + name] for name in ("gate_proj", "up_proj")]
         assert torch.equal(codes, torch.cat([part[0] for part in parts]))
         assert torch.equal(scales, torch.cat([part[1] for part in parts]))
         donor_values = torch.cat([_values(part[0], part[2]) for part in parts])
         if layout == "modelopt":
-            assert float(torch.tensor(1.0) / divisor) == EXACT_SCALE_2
+            # The FP32 decode route reproduces the donor's values bit for bit; division is close.
+            assert torch.equal(_values(codes, _decode_steps(scales, word)), donor_values)
             torch.testing.assert_close(dequantize_nvfp4(payload, shape), donor_values,
                                        rtol=2.0 ** -21, atol=0.0)
         else:
-            assert float(divisor) == GLOBAL_SCALES["gate_proj"]
             assert torch.equal(dequantize_nvfp4(payload, shape), donor_values)
 
-        # Down: the donor's scales, codes rounded from the edited local weights.
-        shape = (DOWN_ROWS, INTERMEDIATE)
-        codes, scales, divisor, _ = _words(out_path, f"weight/{2 * index + 1:06d}", shape)
-        assert torch.equal(scales, expected[source + "down_proj"][1])
-        steps = scales.view(torch.float8_e4m3fn).float() * (torch.tensor(1.0) / divisor)
-        local = weights[source + "down_proj.weight"].float()
-        assert torch.equal(codes, _nearest_codes(local, steps))
+        # Down: the donor's scales and divisor, codes rounded from the edited local weights.
+        down_id, shape = f"weight/{2 * index + 1:06d}", (DOWN_ROWS, INTERMEDIATE)
+        word = _divisor_word(layout, layer, "down_proj")
+        codes, scales, divisor, _ = _words(out_path, down_id, shape)
+        assert _word(float(divisor)) == word
+        assert torch.equal(scales, fixture.expected[source + "down_proj"][1])
+        steps = _decode_steps(scales, word)
+        local = fixture.weights[source + "down_proj.weight"].float()
+        oracle = _nearest_codes(local, steps)
+        assert torch.equal(codes, oracle)
+        clipped = local.double().abs().reshape(DOWN_ROWS, -1, 16) > 6.0 * steps.double().unsqueeze(2)
+        assert entries[down_id]["saturated"] == int(clipped.sum()) > 0
+        assert entries[down_id]["zeroed"] == int((((oracle & 0x7) == 0) & (local != 0)).sum()) > 0
 
-    report = json.loads((tmp_path / "out.ninfer.reencode.json").read_text())
-    assert report["verified"] is True
-    assert report["inexact_divisors"] == (1 if layout == "modelopt" else 0)
-    assert report["recipe"] == "qwen3_8_27b_nvfp4"
-    assert report["objects"][0]["codes_equal_to_rounded_weights"] == 1.0
-    assert all(item["relative_rms_error"] < 0.2 for item in report["objects"])
+        for object_id, names in ((gate_up_id, ("gate_proj", "up_proj")), (down_id, ("down_proj",))):
+            entry = entries[object_id]
+            word = _divisor_word(layout, layer, names[0])
+            assert entry["weight_divisor_word"] == f"0x{word:08x}"
+            assert entry["divisor_exact"] is (
+                layout != "modelopt" or _scale_2_word(layer, names[0]) not in INEXACT_SCALES_2)
+            assert entry["relative_rms_error_vs_base"] < 0.3
+            assert entry["relative_rms_error_vs_weights"] < 0.2
+            tensors = [source + name + suffix for name in names for suffix in DONOR_SUFFIXES[layout]]
+            assert entry["donor_sha256"] == {name: donor_sha256[name] for name in tensors}
+            matrices = [source + name + ".weight" for name in names]
+            assert entry["weights_sha256"] == {name: weights_sha256[name] for name in matrices}
+    assert entries["weight/000000"]["codes_equal_to_rounded_weights"] == 1.0
+
+
+def test_output_metadata_names_inputs_without_paths(tmp_path) -> None:
+    fixture = _build(tmp_path)
+    out_path = tmp_path / "out.ninfer"
+    assert reencode_nvfp4.main(_arguments(fixture, out_path, "--round", "down", weights=True)) == 0
+    with Artifact(out_path) as out:
+        provenance = dict(out.directory.provenance)
+    record = provenance.pop("reencode")
+    assert provenance == INHERITED_PROVENANCE
+    assert record["donor"] == {"label": DONOR_LABEL}
+    assert record["weights"] == {"label": WEIGHTS_LABEL}
+    assert record["base"] == "base.ninfer"
+    assert record["removed_base_paths"] == REMOVED_BASE_PATHS
+
+    _assert_no_local_paths(out_path, tmp_path)
 
 
 def test_donor_words_everywhere_without_weights(tmp_path) -> None:
-    base_path, donor_dir, _, _, expected = _build(tmp_path)
+    fixture = _build(tmp_path)
     out_path = tmp_path / "out.ninfer"
-    assert reencode_nvfp4.main(_arguments(base_path, donor_dir, out_path, "--verify")) == 0
-    _check_copies(base_path, out_path)
-    codes, scales, _, _ = _words(out_path, "weight/000001", (DOWN_ROWS, INTERMEDIATE))
-    down = expected["model.language_model.layers.0.mlp.down_proj"]
-    assert torch.equal(codes, down[0]) and torch.equal(scales, down[1])
+    assert reencode_nvfp4.main(_arguments(fixture, out_path, "--verify")) == 0
+    _check_copies(fixture.base, out_path)
+    for index, layer in enumerate(LAYERS):
+        down = fixture.expected[f"model.language_model.layers.{layer}.mlp.down_proj"]
+        codes, scales, divisor, _ = _words(out_path, f"weight/{2 * index + 1:06d}",
+                                           (DOWN_ROWS, INTERMEDIATE))
+        assert torch.equal(codes, down[0]) and torch.equal(scales, down[1])
+        assert _word(float(divisor)) == DIVISOR_WORDS[DOWN_SCALE_2[layer]]
+    report = _report(tmp_path)
+    assert "weights" not in report["reencode"]
+    for entry in report["objects"]:
+        assert entry["relative_rms_error_vs_base"] < 0.3
+        assert "relative_rms_error_vs_weights" not in entry and "weights_sha256" not in entry
+
+
+def test_donor_of_other_weights_is_refused_without_weights(tmp_path) -> None:
+    fixture = _build(tmp_path)
+    # Layers swapped: valid NVFP4 words of the right shapes, but of other weights.
+    swap = {"layers.0.": "layers.1.", "layers.1.": "layers.0."}
+    _save(fixture.donor_dir, {re.sub(r"layers\.[01]\.", lambda match: swap[match.group(0)], name):
+                              tensor for name, tensor in fixture.donor.items()})
+    with pytest.raises(reencode_nvfp4.ReencodeError,
+                       match=r"weight/000000: relative RMS error 1\.\d+ against the base"):
+        reencode_nvfp4.main(_arguments(fixture, tmp_path / "out.ninfer", "--verify"))
+    _assert_nothing_written(tmp_path)
 
 
 def test_rounds_gate_and_up_together(tmp_path) -> None:
-    base_path, donor_dir, weights_dir, weights, expected = _build(tmp_path)
+    fixture = _build(tmp_path)
     out_path = tmp_path / "out.ninfer"
-    arguments = _arguments(base_path, donor_dir, out_path, "--weights", str(weights_dir),
-                           "--round", "gate", "up")
-    assert reencode_nvfp4.main(arguments) == 0
+    assert reencode_nvfp4.main(_arguments(fixture, out_path, "--round", "gate", "up",
+                                          weights=True)) == 0
     codes, scales, divisor, _ = _words(out_path, "weight/000000", (2 * INTERMEDIATE, HIDDEN))
+    word = DIVISOR_WORDS[GATE_UP_SCALE_2]
+    assert _word(float(divisor)) == word
     source = "model.language_model.layers.0.mlp."
-    local = torch.cat([weights[source + name + ".weight"].float() for name in ("gate_proj", "up_proj")])
-    steps = scales.view(torch.float8_e4m3fn).float() * (torch.tensor(1.0) / divisor)
-    assert torch.equal(codes, _nearest_codes(local, steps))
-    down = expected[source + "down_proj"]
+    local = torch.cat([fixture.weights[source + name + ".weight"].float()
+                       for name in ("gate_proj", "up_proj")])
+    assert torch.equal(codes, _nearest_codes(local, _decode_steps(scales, word)))
     down_codes, _, _, _ = _words(out_path, "weight/000001", (DOWN_ROWS, INTERMEDIATE))
-    assert torch.equal(down_codes, down[0])
+    assert torch.equal(down_codes, fixture.expected[source + "down_proj"][0])
 
 
-def test_inexact_reciprocal_is_the_nearest_fp32_word() -> None:
-    divisor, exact = reencode_nvfp4.reciprocal_divisor(INEXACT_SCALE_2)
-    assert not exact
-    target = torch.tensor(INEXACT_SCALE_2)
-    one = torch.tensor(1.0)
-    chosen = abs(float(one / divisor) - float(target))
-    start = int((one / target).view(torch.int32))
-    for delta in range(-64, 65):
-        candidate = torch.tensor(start + delta, dtype=torch.int32).view(torch.float32)
-        assert float(one / candidate) != float(target)
-        assert abs(float(one / candidate) - float(target)) >= chosen
-    divisor, exact = reencode_nvfp4.reciprocal_divisor(EXACT_SCALE_2)
-    assert exact and float(one / divisor) == EXACT_SCALE_2
+def _set_weight(name: str, row: int, column: int, value: float):
+    def mutate(fixture: Fixture) -> None:
+        fixture.weights[name] = fixture.weights[name].clone()
+        fixture.weights[name][row, column] = value
+        _save(fixture.weights_dir, fixture.weights)
+    return mutate
+
+
+def _zero_weights(*names: str):
+    def mutate(fixture: Fixture) -> None:
+        for name in names:
+            fixture.weights[name] = torch.zeros_like(fixture.weights[name])
+        _save(fixture.weights_dir, fixture.weights)
+    return mutate
+
+
+def _zero_block_scale(name: str):
+    def mutate(fixture: Fixture) -> None:
+        words = fixture.donor[name].view(torch.uint8).clone()
+        words[0, 0] = 0
+        fixture.donor[name] = words.view(torch.float8_e4m3fn)
+        _save(fixture.donor_dir, fixture.donor)
+    return mutate
+
+
+LAYER0 = "model.language_model.layers.0.mlp."
+
+
+@pytest.mark.parametrize(
+    "build, mutate, extra, match",
+    [
+        ({"mismatched_gate": True}, None, ("--round", "down"),
+         "against --weights exceeds --max-error 0.3; does the donor quantize"),
+        ({}, _set_weight(LAYER0 + "down_proj.weight", 3, 5, float("nan")), ("--round", "down"),
+         r"down_proj.weight: rows \[0, 128\) of --weights hold non-finite values"),
+        ({}, _set_weight(LAYER0 + "gate_proj.weight", 7, 1, float("inf")), (),
+         "gate_proj.weight: rows .* hold non-finite values"),
+        ({}, _zero_weights(LAYER0 + "gate_proj.weight", LAYER0 + "up_proj.weight"), (),
+         "relative RMS error inf against --weights"),
+        ({}, _zero_block_scale(LAYER0 + "down_proj.weight_scale"), ("--round", "down"),
+         "weight/000001: 16 nonzero --weights values .* zero donor block scale"),
+    ],
+)
+def test_refusals_while_encoding_leave_no_output(tmp_path, build, mutate, extra, match) -> None:
+    fixture = _build(tmp_path, **build)
+    if mutate is not None:
+        mutate(fixture)
+    with pytest.raises(reencode_nvfp4.ReencodeError, match=match):
+        reencode_nvfp4.main(_arguments(fixture, tmp_path / "out.ninfer", *extra, weights=True))
+    _assert_nothing_written(tmp_path)
+
+
+def _edit_donor(name: str, value):
+    def mutate(fixture: Fixture) -> None:
+        if value is None:
+            del fixture.donor[name]
+        else:
+            fixture.donor[name] = value(fixture.donor[name])
+        _save(fixture.donor_dir, fixture.donor)
+    return mutate
+
+
+def _edit_weights(name: str, value):
+    def mutate(fixture: Fixture) -> None:
+        fixture.weights[name] = value(fixture.weights[name])
+        _save(fixture.weights_dir, fixture.weights)
+    return mutate
+
+
+def _both_rows(rows: int):
+    def mutate(fixture: Fixture) -> None:
+        for suffix in (".weight", ".weight_scale"):
+            name = LAYER0 + "down_proj" + suffix
+            fixture.donor[name] = fixture.donor[name][:rows].contiguous()
+        _save(fixture.donor_dir, fixture.donor)
+    return mutate
+
+
+LAYER1 = "model.language_model.layers.1.mlp."
+
+
+@pytest.mark.parametrize(
+    "build, mutate, extra, match",
+    [
+        ({}, _edit_donor(LAYER1 + "down_proj.weight_scale", None), (),
+         "donor checkpoint is missing .*layers.1.mlp.down_proj.weight_scale$"),
+        ({}, _edit_donor(LAYER1 + "up_proj.weight_scale_2", None), (),
+         "missing .*layers.1.mlp.up_proj.weight_scale_2"),
+        ({}, _edit_donor(LAYER1 + "down_proj.weight", None), (),
+         "layers.1.mlp.down_proj: no NVFP4 words in the donor checkpoint"),
+        ({}, _edit_donor(LAYER1 + "down_proj.weight", lambda t: t[:64].contiguous()), (),
+         r"codes \(64, 64\) and scales \(128, 8\) are not an NVFP4 matrix of 128 columns"),
+        ({}, _both_rows(64), (), "weight/000001: donor matrices have 64 rows, object has 128"),
+        ({}, _edit_donor(LAYER1 + "down_proj.weight_scale", lambda t: t.view(torch.uint8)), (),
+         "weight_scale must be F8_E4M3 block scales, not U8"),
+        ({"up_scale_2": 0x39800000}, None, (), "weight/000000: fused donor matrices have different"),
+        *[({}, _edit_donor(LAYER1 + "down_proj.weight_scale_2", lambda t, v=v: torch.tensor(v)),
+           (), "down_proj.weight_scale_2 = .* must be finite and positive")
+          for v in (float("nan"), float("inf"), 0.0, -2.0 ** -12)],
+        ({}, _edit_donor(LAYER1 + "down_proj.weight_scale_2", lambda t: t.half()), (),
+         "down_proj.weight_scale_2 must be one FP32 value"),
+        ({}, _edit_donor(LAYER1 + "down_proj.weight_scale_2", lambda t: t.repeat(2)), (),
+         "down_proj.weight_scale_2 must be one FP32 value"),
+        ({}, _edit_donor(LAYER1 + "down_proj.weight_scale_2", lambda t: torch.tensor(1e-45)), (),
+         "has no finite positive FP32 divisor"),
+        ({}, _edit_weights(LAYER1 + "down_proj.weight", lambda t: torch.cat([t, t])),
+         ("--weights",), r"--weights shape \(256, 128\) differs from the donor matrix \(128, 128\)"),
+        ({}, _edit_weights(LAYER1 + "up_proj.weight", lambda t: t.to(torch.float8_e4m3fn)),
+         ("--weights",), "up_proj.weight: expected unquantized weights in --weights, got F8_E4M3"),
+        ({"layer1_down_format": "fp8"}, None, ("--layers", "0-1"), "not an NVFP4 matrix"),
+        ({}, None, ("--weights", "--round", "gate"), "round both or neither"),
+    ],
+)
+def test_refusals_before_writing(tmp_path, monkeypatch, build, mutate, extra, match) -> None:
+    def no_writer(*arguments, **keywords):
+        raise AssertionError("the output was created before the inputs were checked")
+
+    monkeypatch.setattr(reencode_nvfp4, "ArtifactWriter", no_writer)
+    fixture = _build(tmp_path, **build)
+    if mutate is not None:
+        mutate(fixture)
+    weights = "--weights" in extra
+    options = [item for item in extra if item != "--weights"]
+    with pytest.raises(reencode_nvfp4.ReencodeError, match=match):
+        reencode_nvfp4.main(_arguments(fixture, tmp_path / "out.ninfer", *options,
+                                       weights=weights))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("--round", "down"),
+        ("--round",),
+        ("--layers", "1-0"),
+        *[("--max-error", value) for value in ("nan", "inf", "0", "-0.1")],
+        ("--weights-label", WEIGHTS_LABEL),
+        *[("--donor-label", label) for label in ("/data/models/donor", "~/models/donor",
+                                                 "C:\\models\\donor", "../donor", "", " org/x")],
+    ],
+)
+def test_argument_checks(tmp_path, extra) -> None:
+    fixture = _build(tmp_path)
+    with pytest.raises(SystemExit):
+        reencode_nvfp4.main(_arguments(fixture, tmp_path / "out.ninfer", *extra))
+    _assert_nothing_written(tmp_path)
+
+
+def test_labels_are_required(tmp_path) -> None:
+    fixture = _build(tmp_path)
+    out = str(tmp_path / "out.ninfer")
+    common = ["--base", str(fixture.base), "--donor", str(fixture.donor_dir), "--out", out]
+    for arguments in (common, [*common, "--donor-label", DONOR_LABEL, "--weights",
+                               str(fixture.weights_dir)]):
+        with pytest.raises(SystemExit):
+            reencode_nvfp4.main(arguments)
+    with pytest.raises(SystemExit):
+        reencode_nvfp4.main(_arguments(fixture, fixture.base))  # --out is the base
+    _assert_nothing_written(tmp_path)
+
+
+def test_base_checks(tmp_path) -> None:
+    fixture = _build(tmp_path, layer1_down_format="fp8")
+    with Artifact(fixture.base) as base:
+        assert reencode_nvfp4.nvfp4_layers(base) == [0]
+    # An earlier re-encode is not a valid base.
+    first = tmp_path / "first.ninfer"
+    assert reencode_nvfp4.main(_arguments(fixture, first)) == 0
+    with pytest.raises(reencode_nvfp4.ReencodeError, match="already re-encoded"):
+        reencode_nvfp4.main(_arguments(replace(fixture, base=first), tmp_path / "second.ninfer"))
 
 
 def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None:
-    base_path, donor_dir, weights_dir, _, _ = _build(tmp_path)
+    fixture = _build(tmp_path)
     out_path = tmp_path / "out.ninfer"
-    arguments = _arguments(base_path, donor_dir, out_path, "--weights", str(weights_dir),
-                           "--round", "down")
-    assert reencode_nvfp4.main(arguments) == 0
-    report = json.loads((tmp_path / "out.ninfer.reencode.json").read_text())
-    expected = {item["object"]: item["payload_sha256"] for item in report["objects"]}
-    assert reencode_nvfp4.verify_output(base_path, out_path, expected) == 0
+    assert reencode_nvfp4.main(_arguments(fixture, out_path, "--round", "down",
+                                          weights=True)) == 0
+    expected = {item["object"]: item["payload_sha256"] for item in _report(tmp_path)["objects"]}
+    assert reencode_nvfp4.verify_output(fixture.base, out_path, expected) == 0
     for object_id in ("weight/head", "weight/000001"):
         with Artifact(out_path) as out:
             offset = out.payload_offset + out.object(object_id).offset + 5
@@ -303,55 +632,18 @@ def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None
             byte = handle.read(1)[0]
             handle.seek(offset)
             handle.write(bytes([byte ^ 0x10]))
-        assert reencode_nvfp4.verify_output(base_path, out_path, expected) == 1
+        assert reencode_nvfp4.verify_output(fixture.base, out_path, expected) == 1
         with out_path.open("r+b") as handle:
             handle.seek(offset)
             handle.write(bytes([byte]))
 
 
 def test_failed_verification_removes_the_output(tmp_path, monkeypatch) -> None:
-    base_path, donor_dir, weights_dir, _, _ = _build(tmp_path)
+    fixture = _build(tmp_path)
     out_path = tmp_path / "out.ninfer"
     monkeypatch.setattr(reencode_nvfp4, "verify_output", lambda *arguments: 1)
-    arguments = _arguments(base_path, donor_dir, out_path, "--weights", str(weights_dir),
-                           "--round", "down", "--verify")
-    assert reencode_nvfp4.main(arguments) == 1
+    assert reencode_nvfp4.main(_arguments(fixture, out_path, "--round", "down", "--verify",
+                                          weights=True)) == 1
     assert not out_path.exists()
-    report = json.loads((tmp_path / "out.ninfer.reencode.json").read_text())
+    report = _report(tmp_path)
     assert report["verified"] is False and report["removed"] is True
-
-
-@pytest.mark.parametrize(
-    "build, extra, match",
-    [
-        ({"up_scale_2": 2.0 ** -11}, ("--round", "down"), "different tensor scales"),
-        ({"mismatched_gate": True}, ("--round", "down"), "does the donor quantize"),
-        ({}, ("--round", "gate"), "round both or neither"),
-        ({"layer1_down_format": "fp8"}, ("--round", "down", "--layers", "0-1"),
-         "not an NVFP4 matrix"),
-    ],
-)
-def test_refusals_leave_no_output(tmp_path, build, extra, match) -> None:
-    base_path, donor_dir, weights_dir, _, _ = _build(tmp_path, **build)
-    out_path = tmp_path / "out.ninfer"
-    with pytest.raises(reencode_nvfp4.ReencodeError, match=match):
-        reencode_nvfp4.main(_arguments(base_path, donor_dir, out_path, "--weights",
-                                       str(weights_dir), *extra))
-    assert not out_path.exists()
-
-
-def test_argument_and_base_checks(tmp_path) -> None:
-    base_path, donor_dir, weights_dir, _, _ = _build(tmp_path, layer1_down_format="fp8")
-    out_path = tmp_path / "out.ninfer"
-    for extra in (("--round", "down"), ("--layers", "1-0")):
-        with pytest.raises(SystemExit):
-            reencode_nvfp4.main(_arguments(base_path, donor_dir, out_path, *extra))
-    with pytest.raises(SystemExit):
-        reencode_nvfp4.main(_arguments(base_path, donor_dir, base_path))
-    with Artifact(base_path) as base:
-        assert reencode_nvfp4.nvfp4_layers(base) == [0]
-    # An earlier re-encode is not a valid base.
-    first = tmp_path / "first.ninfer"
-    assert reencode_nvfp4.main(_arguments(base_path, donor_dir, first)) == 0
-    with pytest.raises(reencode_nvfp4.ReencodeError, match="already re-encoded"):
-        reencode_nvfp4.main(_arguments(first, donor_dir, tmp_path / "second.ninfer"))
