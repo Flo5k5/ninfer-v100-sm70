@@ -242,8 +242,10 @@ int run(const Options& options) {
             "benchmark configuration requires " + std::to_string(required_bytes) +
             " bytes of device memory, but only " + std::to_string(free_bytes) + " bytes are free");
     }
+    // materialize() consumes its plan, and construct_loaded_model() still takes the load plan.
+    auto materialization = load_plan.materialization();
     auto materialized =
-        ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
+        ninfer::artifact::materialize(reader, std::move(materialization), device, nullptr);
     auto model =
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
     auto frontend = target::Package::make_frontend(*model, engine);
