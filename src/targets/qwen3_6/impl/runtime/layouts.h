@@ -7,6 +7,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "targets/qwen3_6/impl/runtime/context_lookup.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/state_image.h>
@@ -105,10 +106,8 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
     ContextLookupOptions context_lookup;
-    // Copied tokens verified by one MTP context-lookup round; zero when lookup is not planned.
-    std::uint32_t lookup_window = 0;
-    // Narrower tier that adaptive lookup uses to enter a copy; zero when not planned.
-    std::uint32_t lookup_entry_window = 0;
+    // MTP verification frames derived from the backend, draft window and lookup options.
+    ContextLookupPlan lookup;
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;

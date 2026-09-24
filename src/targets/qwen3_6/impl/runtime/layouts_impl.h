@@ -177,11 +177,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .value_dim       = TextConfig::gdn_value_head_dim,
                          });
         };
-        if (plan.lookup_window != 0) {
-            out.mtp_lookup_replay_records = lookup_records(plan.lookup_window);
+        if (plan.lookup.lookup_window != 0) {
+            out.mtp_lookup_replay_records = lookup_records(plan.lookup.lookup_window);
         }
-        if (plan.lookup_entry_window != 0) {
-            out.mtp_lookup_entry_replay_records = lookup_records(plan.lookup_entry_window);
+        if (plan.lookup.entry_window != 0) {
+            out.mtp_lookup_entry_replay_records = lookup_records(plan.lookup.entry_window);
         }
     }
     if constexpr (Variant::supports_dflash) {
@@ -235,8 +235,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .output_rows         = TextConfig::output_rows,
                                          .batch_capacity      = plan.max_concurrency,
                                          .draft_window        = plan.draft_window,
-                                         .lookup_window       = plan.lookup_window,
-                                         .lookup_entry_window = plan.lookup_entry_window,
+                                         .lookup_window       = plan.lookup.lookup_window,
+                                         .lookup_entry_window = plan.lookup.entry_window,
                                          .backend             = plan.speculative_backend});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
@@ -440,9 +440,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.mtp()) {
-        // Batched rounds verify either the learned window or, when planned, the lookup window.
-        const std::int32_t batch_drafts =
-            static_cast<std::int32_t>(std::max(plan.draft_window, plan.lookup_window));
+        // Batched rounds verify the learned window or a planned lookup window.
+        const auto batch_drafts          = static_cast<std::int32_t>(plan.lookup.widest_window());
         const std::int32_t lookup_verify = batch_drafts + 1;
         WorkspaceLayoutBuilder mtp_prefill;
         text_common_root(mtp_prefill, chunk);
@@ -771,16 +770,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->context_lookup      = inputs.context_lookup;
-    const bool lookup_planned = inputs.speculative_backend == SpeculativeBackend::Mtp &&
-                                inputs.context_lookup.policy != ContextLookupPolicy::Off;
-    impl->lookup_window       = lookup_planned ? inputs.context_lookup.max_proposal : 0U;
-    // Adaptive lookup enters copies through a narrower tier when one fits strictly between the
-    // learned-draft window and the full lookup window.
-    constexpr std::uint32_t entry_window = kContextLookupEntryProposal;
-    const bool entry_planned  = inputs.context_lookup.policy == ContextLookupPolicy::Adaptive &&
-                                entry_window > inputs.draft_window &&
-                                entry_window < impl->lookup_window;
-    impl->lookup_entry_window = entry_planned ? entry_window : 0U;
+    impl->lookup =
+        plan_context_lookup(inputs.speculative_backend, inputs.draft_window, inputs.context_lookup);
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
@@ -797,9 +788,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            // The widest planned verification bounds every family: the learned-draft family and,
-            // when lookup is planned, the lookup family.
-            const std::uint32_t widest   = std::max(impl->draft_window, impl->lookup_window);
+            // The widest planned verification bounds every family.
+            const std::uint32_t widest   = impl->lookup.widest_window();
             const auto profiles          = mtp_graph_profiles(impl->capacity, widest);
             const std::size_t per_family = graph_topology_allowance(
                 profiles,
@@ -809,8 +799,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                 },
                 "MTP graph allowance");
-            const std::uint64_t families = 1ULL + (impl->lookup_window != 0 ? 1ULL : 0ULL) +
-                                           (impl->lookup_entry_window != 0 ? 1ULL : 0ULL);
+            const std::uint64_t families = impl->lookup.mtp_graph_families();
             impl->graph_allowance_bytes  = checked_mul(families * per_family, impl->max_concurrency,
                                                        "MTP exact-b graph allowance");
         } else {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
 #include <optional>
 #include <random>
@@ -346,6 +347,207 @@ void test_established_copy() {
            "a fully accepted copy was not established for the next round");
 }
 
+q36::ContextLookupPlan plan(ninfer::SpeculativeBackend backend, std::uint32_t draft_window,
+                            ninfer::ContextLookupPolicy policy, std::uint32_t max_proposal = 15) {
+    return q36::plan_context_lookup(backend, draft_window,
+                                    ninfer::ContextLookupOptions{.policy       = policy,
+                                                                 .min_suffix   = 16,
+                                                                 .max_proposal = max_proposal});
+}
+
+bool plans(const q36::ContextLookupPlan& actual, std::uint32_t lookup, std::uint32_t entry,
+           std::uint32_t families) {
+    return actual.lookup_window == lookup && actual.entry_window == entry &&
+           actual.mtp_graph_families() == families;
+}
+
+void test_planning() {
+    using ninfer::ContextLookupPolicy;
+    using ninfer::SpeculativeBackend;
+    // Off plans no lookup frame and no graph family beyond the learned-draft one.
+    const auto off = plan(SpeculativeBackend::Mtp, 4, ContextLookupPolicy::Off);
+    expect(plans(off, 0, 0, 1) && !off.lookup_planned() && off.widest_window() == 4,
+           "disabled lookup planned a lookup frame or graph family");
+    // Only MTP looks up context, whatever the (default fixed) policy says.
+    for (const auto backend :
+         {SpeculativeBackend::None, SpeculativeBackend::DFlash, SpeculativeBackend::DFlash2}) {
+        const auto other = q36::plan_context_lookup(backend, 7, ninfer::ContextLookupOptions{});
+        expect(!other.lookup_planned() && other.entry_window == 0,
+               "a non-MTP backend planned a lookup frame");
+    }
+
+    // Fixed verifies the configured proposal and never plans the entry tier.
+    expect(plans(plan(SpeculativeBackend::Mtp, 4, ContextLookupPolicy::Fixed), 15, 0, 2),
+           "fixed lookup did not plan one fifteen-token frame");
+    expect(plans(plan(SpeculativeBackend::Mtp, 4, ContextLookupPolicy::Fixed, 8), 8, 0, 2),
+           "fixed lookup did not follow the configured proposal");
+    // Adaptive adds the seven-token entry tier only strictly between the draft window and the
+    // full proposal.
+    expect(plans(plan(SpeculativeBackend::Mtp, 4, ContextLookupPolicy::Adaptive), 15, 7, 3),
+           "adaptive lookup did not plan the entry tier");
+    expect(plans(plan(SpeculativeBackend::Mtp, 6, ContextLookupPolicy::Adaptive, 8), 8, 7, 3),
+           "adaptive lookup did not plan the entry tier between six drafts and eight copies");
+    expect(plans(plan(SpeculativeBackend::Mtp, 7, ContextLookupPolicy::Adaptive), 15, 0, 2),
+           "adaptive lookup planned an entry tier no wider than the draft window");
+    expect(plans(plan(SpeculativeBackend::Mtp, 4, ContextLookupPolicy::Adaptive, 7), 7, 0, 2),
+           "adaptive lookup planned an entry tier as wide as the full proposal");
+
+    // Every accepted combination keeps the planned widths distinct and inside the lookup frame,
+    // so a verified row's block width identifies its frame.
+    for (std::uint32_t drafts = 1; drafts <= 7; ++drafts) {
+        for (std::uint32_t proposal = drafts + 1; proposal <= ninfer::kContextLookupMaximumProposal;
+             ++proposal) {
+            for (const auto policy : {ContextLookupPolicy::Fixed, ContextLookupPolicy::Adaptive}) {
+                const auto planned = plan(SpeculativeBackend::Mtp, drafts, policy, proposal);
+                bool valid         = planned.lookup_window == proposal &&
+                             planned.widest_window() == proposal &&
+                             (planned.entry_window == 0 ||
+                              (drafts < planned.entry_window && planned.entry_window < proposal));
+                for (const auto verification :
+                     {q36::MtpVerification::Drafts, q36::MtpVerification::LookupEntry,
+                      q36::MtpVerification::Lookup}) {
+                    const std::uint32_t width = planned.verify_window(verification);
+                    if (width != 0) {
+                        valid =
+                            valid && planned.verification_for_stride(width + 1U) == verification;
+                    }
+                }
+                expect(valid, "a planned lookup frame is ambiguous or outside the frame domain");
+            }
+        }
+    }
+}
+
+q36::ContextLookupRound select_round(const q36::ContextLookupPlan& planned,
+                                     std::initializer_list<q36::ContextLookupRow> rows) {
+    const std::vector<q36::ContextLookupRow> batch(rows);
+    return q36::select_context_lookup_round(planned, batch);
+}
+
+bool selects(const q36::ContextLookupRound& round, q36::MtpVerification verification,
+             std::uint32_t verify, std::uint32_t proposal) {
+    return round.verification == verification && round.verify == verify &&
+           round.proposal == proposal;
+}
+
+void test_round_selection() {
+    using ninfer::ContextLookupPolicy;
+    using ninfer::SpeculativeBackend;
+    using q36::MtpVerification;
+    const auto off      = plan(SpeculativeBackend::Mtp, 4, ContextLookupPolicy::Off);
+    const auto fixed    = plan(SpeculativeBackend::Mtp, 4, ContextLookupPolicy::Fixed);
+    const auto adaptive = plan(SpeculativeBackend::Mtp, 4, ContextLookupPolicy::Adaptive);
+    constexpr q36::ContextLookupRow established{.room = 100, .proposed = true, .established = true};
+    constexpr q36::ContextLookupRow probe{.room = 100, .proposed = true, .established = false};
+    constexpr q36::ContextLookupRow none{.room = 100, .proposed = false, .established = false};
+
+    expect(selects(select_round(off, {established}), MtpVerification::Drafts, 4, 4),
+           "disabled lookup widened a round");
+    expect(selects(select_round(fixed, {}), MtpVerification::Drafts, 4, 4),
+           "an empty batch widened a round");
+    // Fixed widens every agreeing copy to the full width and keeps one learned draft as the next
+    // agreement guard.
+    expect(selects(select_round(fixed, {probe}), MtpVerification::Lookup, 15, 1),
+           "fixed lookup did not verify a copy at the full width");
+    // Adaptive probes a copy that is not established yet with the entry tier, which regenerates
+    // the learned window; an established copy uses the full width.
+    expect(selects(select_round(adaptive, {probe}), MtpVerification::LookupEntry, 7, 4),
+           "adaptive lookup did not enter a new copy through the entry tier");
+    expect(selects(select_round(adaptive, {established}), MtpVerification::Lookup, 15, 1),
+           "adaptive lookup did not widen an established copy fully");
+    // Without an entry tier, adaptive verifies a new copy at the full width.
+    expect(selects(select_round(plan(SpeculativeBackend::Mtp, 7, ContextLookupPolicy::Adaptive),
+                                {probe}),
+                   MtpVerification::Lookup, 15, 1),
+           "adaptive lookup without an entry tier did not use the full width");
+
+    // Long verification is one batch topology: one row without a copy keeps the batch on the
+    // learned window, one unestablished row keeps it on the entry tier.
+    expect(
+        selects(select_round(adaptive, {established, probe}), MtpVerification::LookupEntry, 7, 4),
+        "an unestablished row did not hold the batch on the entry tier");
+    expect(selects(select_round(fixed, {established, none}), MtpVerification::Drafts, 4, 4),
+           "a row without a copy did not hold the batch on the learned window");
+    // A row whose room does not exceed the learned window keeps the batch narrow; a little more
+    // room widens it, and that row verifies only what fits.
+    const q36::ContextLookupRow full_budget{.room = 4, .proposed = true, .established = true};
+    const q36::ContextLookupRow tight_budget{.room = 5, .proposed = true, .established = true};
+    expect(selects(select_round(fixed, {established, full_budget}), MtpVerification::Drafts, 4, 4),
+           "a row without room beyond the learned window widened the batch");
+    const auto tight = select_round(fixed, {established, tight_budget});
+    expect(selects(tight, MtpVerification::Lookup, 15, 1) && tight.row_extent(5, 1) == 5,
+           "a row with little room did not verify only what fits");
+
+    // Room beyond a frame is clamped to it; a learned-draft row verifies the drafts it holds.
+    const auto full    = select_round(fixed, {established});
+    const auto entry   = select_round(adaptive, {probe});
+    const auto learned = select_round(off, {established});
+    expect(full.row_extent(1000, 1) == 15 && entry.row_extent(1000, 4) == 7 &&
+               learned.row_extent(1000, 4) == 4 && learned.row_extent(1000, 2) == 2 &&
+               learned.row_extent(1, 4) == 1,
+           "a round extent was not clamped to its frame, room and learned drafts");
+}
+
+void test_empty_history() {
+    // No history, or one no longer than the suffix, proposes nothing and plans a learned round.
+    const std::vector<TokenId> empty;
+    expect(!nearest(empty, 2, 15).has_value() && !nearest(tokens({1, 2}), 2, 15).has_value(),
+           "an empty or suffix-only history proposed a continuation");
+    expect(!q36::find_resumed_continuation(empty, 2, 15, {}, 0, 4, 96).has_value(),
+           "an empty history resumed a copy");
+    const std::array<TokenId, 1> draft{7};
+    for (const auto policy :
+         {ninfer::ContextLookupPolicy::Fixed, ninfer::ContextLookupPolicy::Adaptive}) {
+        auto lookup = controller(policy, 2, 0);
+        lookup.observe(empty);
+        const auto found = lookup.propose(empty, draft, 15);
+        const auto round =
+            select_round(plan(ninfer::SpeculativeBackend::Mtp, 4, policy),
+                         {q36::ContextLookupRow{.room = 100, .proposed = found.has_value()}});
+        expect(!found && !lookup.in_tool_call() &&
+                   round.verification == q36::MtpVerification::Drafts,
+               "an empty history widened a round");
+    }
+}
+
+void test_first_generated_tool_call() {
+    // The prompt is a source span and a separator; generation opens a tool call with its first
+    // token and then copies four source tokens.
+    const std::vector<TokenId> prompt = copied_ledger(0);
+    std::vector<TokenId> ledger       = prompt;
+    ledger.push_back(kDelimiters.open);
+    ledger.insert(ledger.end(), {1000, 1001, 1002, 1003});
+    const std::array<TokenId, 1> draft{1004};
+    const auto adaptive_plan =
+        plan(ninfer::SpeculativeBackend::Mtp, 4, ninfer::ContextLookupPolicy::Adaptive);
+
+    auto opened = controller(ninfer::ContextLookupPolicy::Adaptive, 4, prompt.size());
+    opened.observe(ledger);
+    expect(opened.in_tool_call() && opened.suffix_threshold() == 4,
+           "a tool call opened by the first generated token was not tracked");
+    const auto found = opened.propose(ledger, draft, 15);
+    expect(found.has_value() && found->tokens[0] == 1004 &&
+               !opened.established(*found, ledger.size()),
+           "a short copy inside the first tool call was not proposed as a probe");
+    const auto round = select_round(
+        adaptive_plan,
+        {q36::ContextLookupRow{.room = 100, .proposed = found.has_value(), .established = false}});
+    expect(round.verification == q36::MtpVerification::LookupEntry,
+           "a short copy inside the first tool call did not use the entry tier");
+
+    // The same delimiter as the last prompt token is not generated text, so the copy needs the
+    // plain-text suffix and is not proposed.
+    std::vector<TokenId> quoted = prompt;
+    quoted.push_back(kDelimiters.open);
+    const std::size_t quoted_prompt = quoted.size();
+    quoted.insert(quoted.end(), {1000, 1001, 1002, 1003});
+    auto text = controller(ninfer::ContextLookupPolicy::Adaptive, 4, quoted_prompt);
+    text.observe(quoted);
+    expect(!text.in_tool_call() && text.suffix_threshold() == 16 &&
+               !text.propose(quoted, draft, 15).has_value(),
+           "a prompt delimiter opened a tool-call region");
+}
+
 void test_resumed_search() {
     // Two sources of the same suffix; the one closest to the resume point wins.
     const auto history    = tokens({1, 2, 3, 40, 41, 9, 9, 1, 2, 3, 50, 51, 8, 1, 2, 3});
@@ -376,6 +578,10 @@ int main() {
     test_copy_continuation();
     test_established_copy();
     test_resumed_search();
+    test_planning();
+    test_round_selection();
+    test_empty_history();
+    test_first_generated_tool_call();
     if (failures != 0) {
         std::cerr << failures << " context lookup check(s) failed\n";
         return 1;

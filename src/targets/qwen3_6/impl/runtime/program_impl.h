@@ -737,11 +737,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      context_lookup(plan.context_lookup), lookup_window(plan.lookup_window),
-      lookup_entry_window(plan.lookup_entry_window), speculative_backend(plan.speculative_backend),
-      kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
-      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
-      causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      context_lookup(plan.context_lookup), lookup_plan(plan.lookup),
+      speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
+      proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
+      use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
+      kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -874,15 +874,17 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         replay_fold.has_value() != replay_records.has_value()) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
-    if (lookup_window != 0 && speculative_backend != SpeculativeBackend::Mtp) {
-        throw std::logic_error("MTP context lookup is planned without the MTP backend");
+    if (lookup_plan.draft_window != draft_window ||
+        (lookup_plan.lookup_planned() && speculative_backend != SpeculativeBackend::Mtp)) {
+        throw std::logic_error("MTP context lookup does not match the sequence plan");
     }
-    if (mtp_lookup_replay_records.has_value() != (lookup_window != 0) ||
+    if (mtp_lookup_replay_records.has_value() != lookup_plan.lookup_planned() ||
         mtp_lookup_replay_fold.has_value() != mtp_lookup_replay_records.has_value() ||
-        mtp_lookup_entry_replay_records.has_value() != (lookup_entry_window != 0) ||
+        mtp_lookup_entry_replay_records.has_value() != (lookup_plan.entry_window != 0) ||
         mtp_lookup_entry_replay_fold.has_value() != mtp_lookup_entry_replay_records.has_value() ||
-        (lookup_entry_window != 0 &&
-         (lookup_entry_window <= draft_window || lookup_entry_window >= lookup_window))) {
+        (lookup_plan.entry_window != 0 &&
+         (lookup_plan.entry_window <= draft_window ||
+          lookup_plan.entry_window >= lookup_plan.lookup_window))) {
         throw std::logic_error("MTP lookup ReplaySSM records do not match the sequence plan");
     }
     if (plan.persistent.dflash) {
@@ -949,8 +951,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (io.mtp_decode.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("MTP decode frame does not match the sequence plan");
     }
-    if (io.mtp_lookup_decode.has_value() != (lookup_window != 0) ||
-        io.mtp_lookup_entry_decode.has_value() != (lookup_entry_window != 0)) {
+    if (io.mtp_lookup_decode.has_value() != lookup_plan.lookup_planned() ||
+        io.mtp_lookup_entry_decode.has_value() != (lookup_plan.entry_window != 0)) {
         throw std::logic_error("MTP lookup decode frame does not match the sequence plan");
     }
     if (io.ordinary.has_value() != (speculative_backend == SpeculativeBackend::None)) {
@@ -10005,7 +10007,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.prefix_identity.swap(materialization_identity_);
         sequence.prefix_digests.swap(materialization_prefix_digests_);
         request.lookup =
-            lookup_window != 0
+            lookup_plan.lookup_planned()
                 ? ContextLookupController(context_lookup,
                                           ToolCallDelimiters{.open  = qwen3_6::kToolCallOpenToken,
                                                              .close = qwen3_6::kToolCallCloseToken},
@@ -10120,7 +10122,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     }
     const MtpVerification verification =
         speculative_backend == SpeculativeBackend::Mtp
-            ? mtp_verification(requests[lanes.front()].pending.row_stride)
+            ? lookup_plan.verification_for_stride(requests[lanes.front()].pending.row_stride)
             : MtpVerification::Drafts;
     ops::GdnReplayFoldPlan& active_replay_fold =
         verification == MtpVerification::Lookup        ? *mtp_lookup_replay_fold
@@ -10138,7 +10140,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
         }
         const PendingCandidate& pending = requests[lane].pending;
         if (speculative_backend == SpeculativeBackend::Mtp &&
-            mtp_verification(pending.row_stride) != verification) {
+            lookup_plan.verification_for_stride(pending.row_stride) != verification) {
             throw std::logic_error("speculative pending rows use different verification frames");
         }
         const SequenceState& sequence   = active_sequence(lane);
@@ -11270,13 +11272,14 @@ void ProgramImplCore::prepare_graphs() {
             }
         }
 
-        // Lookup supplies the wide target proposal. The full tier retains one learned draft only
-        // as the next-round agreement guard while a copy continues; the entry tier regenerates
-        // the configured window so a copy that ends inside the round leaves a full proposal.
+        // Lookup supplies the wide target proposal; the plan fixes each tier's verification width
+        // and the learned drafts it regenerates for the next round.
         const auto capture_lookup_family =
-            [&](DecodeGraphFamily& family, std::uint32_t lookup_k, std::uint32_t lookup_proposal_k,
-                GdnReplayRecords& records, qwen3_6::MtpDecodeState& frame) {
-                const auto lookup_profiles = mtp_graph_profiles(capacity, lookup_k);
+            [&](DecodeGraphFamily& family, MtpVerification verification, GdnReplayRecords& records,
+                qwen3_6::MtpDecodeState& frame) {
+                const std::uint32_t lookup_k          = lookup_plan.verify_window(verification);
+                const std::uint32_t lookup_proposal_k = lookup_plan.proposal_window(verification);
+                const auto lookup_profiles            = mtp_graph_profiles(capacity, lookup_k);
                 validate_graph_profiles(lookup_profiles, capacity - 1, "MTP lookup");
                 schedule::MtpBatchContext lookup_state{execution_core(&records),
                                                        decoder->text_kv,
@@ -11304,14 +11307,13 @@ void ProgramImplCore::prepare_graphs() {
                     }
                 }
             };
-        if (lookup_window != 0) {
-            capture_lookup_family(mtp_lookup_graphs, lookup_window, lookup_proposal_window(false),
+        if (lookup_plan.lookup_window != 0) {
+            capture_lookup_family(mtp_lookup_graphs, MtpVerification::Lookup,
                                   *mtp_lookup_replay_records, *io.mtp_lookup_decode);
         }
-        if (lookup_entry_window != 0) {
-            capture_lookup_family(mtp_lookup_entry_graphs, lookup_entry_window,
-                                  lookup_proposal_window(true), *mtp_lookup_entry_replay_records,
-                                  *io.mtp_lookup_entry_decode);
+        if (lookup_plan.entry_window != 0) {
+            capture_lookup_family(mtp_lookup_entry_graphs, MtpVerification::LookupEntry,
+                                  *mtp_lookup_entry_replay_records, *io.mtp_lookup_entry_decode);
         }
     }
     if (is_masked_draft_backend(speculative_backend)) {
@@ -11367,11 +11369,11 @@ void ProgramImplCore::prepare_graphs() {
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
-        if (lookup_window != 0) {
+        if (lookup_plan.lookup_window != 0) {
             instantiate_graph_family(mtp_lookup_graphs, "MTP lookup", device,
                                      prepare_representative);
         }
-        if (lookup_entry_window != 0) {
+        if (lookup_plan.entry_window != 0) {
             instantiate_graph_family(mtp_lookup_entry_graphs, "MTP lookup entry", device,
                                      prepare_representative);
         }
@@ -11423,11 +11425,10 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                         .view({TextConfig::token_domain});
     request.sampling_host     = config;
     request.speculative_stats = SpeculativeStats{
-        .backend      = speculative_backend,
-        .enabled      = speculative_backend != SpeculativeBackend::None,
-        .draft_window = draft_window,
-        .accepted_per_position =
-            std::vector<std::uint64_t>(std::max(draft_window, lookup_window), 0),
+        .backend               = speculative_backend,
+        .enabled               = speculative_backend != SpeculativeBackend::None,
+        .draft_window          = draft_window,
+        .accepted_per_position = std::vector<std::uint64_t>(lookup_plan.widest_window(), 0),
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -11992,12 +11993,10 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     std::array<std::array<TokenId, qwen3_6::kMtpLookupMaximumDrafts>, kMaximumConcurrency>
         lookup_drafts{};
     std::array<std::uint32_t, kMaximumConcurrency> lookup_agreed{};
-    std::array<std::uint32_t, kMaximumConcurrency> lookup_room{};
-    // Long verification is one batch topology: every row must have a useful lookup continuation
-    // that agrees with its learned MTP drafts before the batch opts in. The batch uses the full
-    // tier only when every row's copy is established.
-    bool use_lookup                = lookup_window != 0;
-    bool entry_tier                = false;
+    std::array<ContextLookupRow, kMaximumConcurrency> lookup_rows{};
+    // Long verification is one batch topology, so once one row cannot widen the remaining rows
+    // skip the history search; select_context_lookup_round makes the round decision.
+    bool lookup_candidate          = lookup_plan.lookup_planned();
     std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
@@ -12022,46 +12021,49 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             throw std::logic_error("MTP batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
-        if (lookup_window == 0) { continue; }
+
+        const std::uint32_t budget_room = budgets[row].generated_tokens_remaining > 1
+                                              ? budgets[row].generated_tokens_remaining - 1
+                                              : 0U;
+        ContextLookupRow& lookup_row    = lookup_rows[row];
+        lookup_row.room = std::min(budget_room, capacity - sequence.execution_frontier - 1);
+        if (!lookup_plan.lookup_planned()) { continue; }
         request.lookup.observe(sequence.ledger);
-        if (!use_lookup) { continue; }
-        lookup_room[row] = std::min(budgets[row].generated_tokens_remaining > 1
-                                        ? budgets[row].generated_tokens_remaining - 1
-                                        : 0U,
-                                    capacity - sequence.execution_frontier - 1);
-        const auto found =
-            lookup_room[row] > draft_window
-                ? request.lookup.propose(sequence.ledger,
-                                         std::span<const TokenId>(sequence.mtp_drafts.data(),
-                                                                  sequence.mtp_draft_count),
-                                         lookup_window)
-                : std::nullopt;
-        if (!found) {
-            use_lookup = false;
+        if (!lookup_candidate || lookup_row.room <= draft_window) {
+            lookup_candidate = false;
             continue;
         }
-        std::copy_n(found->tokens.begin(), lookup_window, lookup_drafts[row].begin());
-        lookup_agreed[row] = sequence.mtp_draft_count;
-        entry_tier = entry_tier || (lookup_entry_window != 0 &&
-                                    !request.lookup.established(*found, sequence.ledger.size()));
+        const auto found = request.lookup.propose(
+            sequence.ledger,
+            std::span<const TokenId>(sequence.mtp_drafts.data(), sequence.mtp_draft_count),
+            lookup_plan.lookup_window);
+        if (!found) {
+            lookup_candidate = false;
+            continue;
+        }
+        std::copy_n(found->tokens.begin(), lookup_plan.lookup_window, lookup_drafts[row].begin());
+        lookup_agreed[row]     = sequence.mtp_draft_count;
+        lookup_row.proposed    = true;
+        lookup_row.established = request.lookup.established(*found, sequence.ledger.size());
     }
-    const std::uint32_t lookup_verify = entry_tier ? lookup_entry_window : lookup_window;
-    for (std::size_t row = 0; use_lookup && row < lanes.size(); ++row) {
-        use_lookup = std::min(lookup_verify, lookup_room[row]) > draft_window;
-    }
-
-    const std::uint32_t verify_k   = use_lookup ? lookup_verify : draft_window;
-    const std::uint32_t proposal_k = use_lookup ? lookup_proposal_window(entry_tier) : draft_window;
+    const ContextLookupRound round = select_context_lookup_round(
+        lookup_plan, std::span<const ContextLookupRow>(lookup_rows.data(), lanes.size()));
+    const bool use_lookup          = round.lookup();
+    const std::uint32_t verify_k   = round.verify;
+    const std::uint32_t proposal_k = round.proposal;
     const std::uint32_t width      = verify_k + 1;
-    qwen3_6::MtpDecodeState& frame = !use_lookup  ? *io.mtp_decode
-                                     : entry_tier ? *io.mtp_lookup_entry_decode
-                                                  : *io.mtp_lookup_decode;
-    DecodeGraphFamily& graph_family = !use_lookup  ? mtp_graphs
-                                      : entry_tier ? mtp_lookup_entry_graphs
-                                                   : mtp_lookup_graphs;
-    GdnReplayRecords* replay_source = !use_lookup  ? &*replay_records
-                                      : entry_tier ? &*mtp_lookup_entry_replay_records
-                                                   : &*mtp_lookup_replay_records;
+    qwen3_6::MtpDecodeState& frame =
+        round.verification == MtpVerification::Lookup        ? *io.mtp_lookup_decode
+        : round.verification == MtpVerification::LookupEntry ? *io.mtp_lookup_entry_decode
+                                                             : *io.mtp_decode;
+    DecodeGraphFamily& graph_family =
+        round.verification == MtpVerification::Lookup        ? mtp_lookup_graphs
+        : round.verification == MtpVerification::LookupEntry ? mtp_lookup_entry_graphs
+                                                             : mtp_graphs;
+    GdnReplayRecords* replay_source =
+        round.verification == MtpVerification::Lookup        ? &*mtp_lookup_replay_records
+        : round.verification == MtpVerification::LookupEntry ? &*mtp_lookup_entry_replay_records
+                                                             : &*replay_records;
 
     const auto started = Clock::now();
     try {
@@ -12083,18 +12085,11 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         *mtp_host_ingress = {};
         *mtp_host_egress  = {};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            SequenceState& sequence           = active_sequence(lanes[row]);
-            const RequestControl& request     = requests[lanes[row]];
-            const std::uint32_t frontier      = sequence.execution_frontier;
-            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                    ? budgets[row].generated_tokens_remaining - 1
-                                                    : 0;
+            SequenceState& sequence       = active_sequence(lanes[row]);
+            const RequestControl& request = requests[lanes[row]];
+            const std::uint32_t frontier  = sequence.execution_frontier;
             const std::uint32_t extent =
-                use_lookup
-                    ? std::min({verify_k, max_by_budget,
-                                capacity - sequence.execution_frontier - 1})
-                    : std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
-                                capacity - sequence.execution_frontier - 1});
+                round.row_extent(lookup_rows[row].room, sequence.mtp_draft_count);
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -12185,7 +12180,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             }
             if (use_lookup) {
                 request.speculative_stats.lookup_rounds += 1;
-                request.speculative_stats.lookup_entry_rounds += entry_tier ? 1U : 0U;
+                request.speculative_stats.lookup_entry_rounds +=
+                    round.verification == MtpVerification::LookupEntry ? 1U : 0U;
                 request.speculative_stats.lookup_drafted_tokens += pcur;
                 request.speculative_stats.lookup_accepted_tokens +=
                     static_cast<std::uint32_t>(accepted_i);

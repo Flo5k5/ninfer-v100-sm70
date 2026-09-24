@@ -135,6 +135,16 @@ NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_score_real_test --output-on-failure
 ```
 
+The context-lookup integration test uses the same variable. It decodes one greedy copy-with-edits
+request with each `--lookup-policy` and checks that `off` verifies no copied token, `fixed` widens
+without the entry tier, and `adaptive` enters the edited copy through its entry tier; it loads the
+artifact three times:
+
+```bash
+NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_context_lookup_real_test --output-on-failure
+```
+
 Run the peer 35B-A3B route independently:
 
 ```bash
