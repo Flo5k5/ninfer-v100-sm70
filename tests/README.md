@@ -28,8 +28,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `targets/qwen3_6_35b_a3b/` — registered inventory, artifact-native diagnostic reference, MoE
   oracle, typed binding, selected-expert row access, 256K INT8 memory calculation, and the opt-in
   real public-Engine route;
-- `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
-  geometry behavior against a self-contained C++ fixture;
+- `test_ninfer_artifact_reader.cpp` — C++ v3 framing, directory, encoded-size, payload-span,
+  geometry, and official-recipe identity behavior against self-contained C++ fixtures;
 - `test_artifact_v2_rejection.cpp` — rejection of a v2 entry with guidance to the published v3
   artifacts, distinct from other entry versions;
 - `test_openai_schema.cpp`, `test_openai_responses.cpp`,

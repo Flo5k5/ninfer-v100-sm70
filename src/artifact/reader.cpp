@@ -9,6 +9,42 @@
 #include <limits>
 
 namespace ninfer::artifact {
+namespace {
+
+// A v3 directory records no (model_id, weights_id) identity, but the Volta targets still resolve
+// their weights profile from one. The converter records an official recipe (RECIPES in
+// tools/convert/official_recipes.py) by its name in provenance.recipe, and each one writes
+// exactly one registered weights contract. The weights id cannot be read off the name, and a
+// recipe file may assign any format, so only these names resolve.
+constexpr std::array kOfficialRecipes = {
+    std::pair{std::string_view{"qwen3_6_27b"}, std::string_view{"groupwise-int"}},
+    std::pair{std::string_view{"qwen3_8_27b"}, std::string_view{"groupwise-int"}},
+    std::pair{std::string_view{"qwen3_6_35b_a3b"}, std::string_view{"groupwise-int"}},
+    std::pair{std::string_view{"qwen3_6_27b_nvfp4"}, std::string_view{"nvfp4"}},
+    std::pair{std::string_view{"qwen3_8_27b_nvfp4"}, std::string_view{"nvfp4"}},
+};
+
+ArtifactIdentity derive_identity(const Directory& directory, const std::filesystem::path& entry) {
+    const auto recipe = directory.provenance.find("recipe");
+    if (recipe != directory.provenance.end() && recipe->is_string()) {
+        const auto& name = recipe->get_ref<const std::string&>();
+        for (const auto& [official, weights_id] : kOfficialRecipes) {
+            if (official == name) {
+                return {directory.metadata.value("name", std::string()), std::string(weights_id)};
+            }
+        }
+    }
+    std::string names;
+    for (const auto& [official, unused] : kOfficialRecipes) {
+        names += (names.empty() ? "" : ", ") + std::string(official);
+    }
+    const std::string problem = recipe == directory.provenance.end()
+                                    ? "provenance records no recipe"
+                                    : "unsupported recipe " + recipe->dump();
+    throw ArtifactError(entry.string() + ": " + problem + " (official recipes: " + names + ")");
+}
+
+} // namespace
 
 struct Reader::Impl {
     std::filesystem::path entry;
@@ -18,6 +54,7 @@ struct Reader::Impl {
     std::uint64_t file_bytes          = 0;
     mutable std::vector<std::unique_ptr<InputFile>> files;
     mutable std::vector<std::optional<WeightGeometry>> geometries;
+    mutable std::optional<ArtifactIdentity> identity;
 
     explicit Impl(const std::filesystem::path& path) : entry(path) {
         auto file = std::make_unique<InputFile>(entry);
@@ -86,18 +123,8 @@ struct Reader::Impl {
 Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {}
 
 const ArtifactIdentity& Reader::identity() const {
-    static ArtifactIdentity cached;
-    if (cached.model_id.empty()) {
-        const Directory& dir = directory();
-        cached.model_id   = dir.metadata.value("name", std::string());
-        cached.weights_id = dir.provenance.value("recipe", std::string());
-        // v3 recipe "qwen3_8_27b_nvfp4" -> v2 weights_id "nvfp4"
-        const auto last_underscore = cached.weights_id.rfind('_');
-        if (last_underscore != std::string::npos) {
-            cached.weights_id = cached.weights_id.substr(last_underscore + 1);
-        }
-    }
-    return cached;
+    if (!impl_->identity) { impl_->identity = derive_identity(directory(), impl_->entry); }
+    return *impl_->identity;
 }
 
 Reader::~Reader()                            = default;

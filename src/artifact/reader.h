@@ -39,6 +39,9 @@ public:
     [[nodiscard]] std::uint64_t file_bytes() const noexcept;
     [[nodiscard]] ObjectHandle find(std::string_view id) const;
     [[nodiscard]] const WeightGeometry& geometry(ObjectHandle handle) const;
+    // The v2 identity the Volta targets resolve: metadata.name, and the weights id of the official
+    // recipe recorded in provenance.recipe. Throws ArtifactError when provenance.recipe is not an
+    // official recipe; the directory stays readable.
     [[nodiscard]] const ArtifactIdentity& identity() const;
         void validate_object(ObjectHandle handle) const;
 

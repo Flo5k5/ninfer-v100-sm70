@@ -14,11 +14,9 @@ below describe the version-2 layout, which the Volta binder still addresses thro
 shim (`src/artifact/typed_binding.cpp`). The source transforms and payload encodings below remain
 the contract of this artifact.
 
-No v3 artifact of this model loads on this port yet. `Reader::identity` derives `a3b` from the
-recipe name, which `resolve_weights` rejects until the identity fix in
-[#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17) lands. Beyond that, the shim cannot
-resolve the MoE expert names that the binder addresses (`moe/routed_gate_up`, `moe/routed_down`, and
-their peers) to the v3 per-expert bindings.
+No v3 artifact of this model loads on this port yet. `Reader::identity` resolves its identity from
+the metadata name and the recipe, but the shim cannot resolve the MoE expert names that the binder
+addresses (`moe/routed_gate_up`, `moe/routed_down`, and their peers) to the v3 per-expert bindings.
 
 ## 1. Artifact identity and contents
 
