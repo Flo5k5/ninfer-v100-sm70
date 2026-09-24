@@ -5,12 +5,17 @@
 
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -26,10 +31,93 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
+constexpr const char* kExceptionText = "sentinel-exception-text: summarize my private notes";
+
+struct CustomError final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override { return kExceptionText; }
+};
+
+// The cause of whatever `action` throws, or "none" when it returns normally.
+std::string cause_of(const std::function<void()>& action) {
+    try {
+        action();
+    } catch (const std::exception& exception) {
+        const std::string cause = internal_failure_cause(exception);
+        if (cause.find("sentinel") != std::string::npos) { return "leaked what()"; }
+        return cause;
+    }
+    return "none";
+}
+
+int test_internal_failure_causes() {
+    int failures = 0;
+    failures += check(cause_of([] { throw std::bad_alloc(); }) == "out_of_memory",
+                      "allocation failure cause mismatch");
+    failures += check(cause_of([] {
+                          [[maybe_unused]] const Json parsed = Json::parse("{\"sentinel\": ");
+                      }) == "json_error_101",
+                      "JSON parse failure did not report its library id");
+    failures +=
+        check(cause_of([] { (void)Json(std::string("sentinel \xFF")).dump(); }) == "json_error_316",
+              "invalid UTF-8 serialization did not report its library id");
+    failures +=
+        check(cause_of([] {
+                  throw std::system_error(
+                      std::make_error_code(std::errc::no_such_file_or_directory), kExceptionText);
+              }) == "system_error_" +
+                        std::to_string(static_cast<int>(std::errc::no_such_file_or_directory)),
+              "system error cause did not report its code");
+    failures +=
+        check(cause_of([] { throw std::invalid_argument(kExceptionText); }) == "invalid_argument" &&
+                  cause_of([] { throw std::out_of_range(kExceptionText); }) == "out_of_range" &&
+                  cause_of([] { throw std::length_error(kExceptionText); }) == "length_error" &&
+                  cause_of([] { throw std::domain_error(kExceptionText); }) == "logic_error" &&
+                  cause_of([] { throw std::logic_error(kExceptionText); }) == "logic_error",
+              "logic error cause mismatch");
+    failures += check(
+        cause_of([] { throw ApiException(ApiError{.message = kExceptionText}); }) == "api_error" &&
+            cause_of([] { throw std::runtime_error(kExceptionText); }) == "runtime_error" &&
+            cause_of([] { throw CustomError(); }) == "exception",
+        "runtime or custom exception cause mismatch");
+
+    // A wrapper keeps the wrapped exception's cause, including a non-standard one.
+    failures += check(cause_of([] {
+                          try {
+                              throw std::bad_alloc();
+                          } catch (...) {
+                              std::throw_with_nested(std::runtime_error(kExceptionText));
+                          }
+                      }) == "out_of_memory",
+                      "nested exception cause was not unwrapped");
+    failures += check(cause_of([] {
+                          try {
+                              throw 7;
+                          } catch (...) {
+                              std::throw_with_nested(std::runtime_error(kExceptionText));
+                          }
+                      }) == "unknown",
+                      "nested non-standard exception cause mismatch");
+
+    const RequestFailure internal =
+        make_internal_request_failure(RequestFailurePhase::ResponseRender, std::bad_alloc());
+    failures += check(internal.classification == RequestFailureClass::Internal &&
+                          internal.http_status == 500 && internal.error_type == "internal_error" &&
+                          internal.cause == "out_of_memory",
+                      "internal request failure did not keep its cause");
+    failures +=
+        check(make_unknown_internal_request_failure(RequestFailurePhase::Http).cause == "unknown",
+              "non-standard internal failure cause mismatch");
+    failures +=
+        check(make_request_failure(RequestFailurePhase::Generation, ApiError{}).cause.empty() &&
+                  make_client_disconnected_failure(RequestFailurePhase::Transport).cause.empty(),
+              "a failure without an internal exception reported a cause");
+    return failures;
+}
+
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures = test_internal_failure_causes();
 
     bool protected_artifact_rejected = false;
     try {
@@ -276,7 +364,8 @@ int main() {
     prepared.preparation.built_patch_bytes             = 49152;
 
     const RequestLogMetadata metadata{
-        .model                             = "qwen3.6-27b",
+        .served_model                      = "qwen3.6-27b",
+        .requested_model                   = "qwen3.6-27b",
         .stream                            = false,
         .output_tokens_explicit            = true,
         .preserve_thinking_semantic_change = true,
@@ -299,6 +388,9 @@ int main() {
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
+    failures += check(started.at("request").at("model") == "qwen3.6-27b" &&
+                          started.at("request").at("requested_model") == "qwen3.6-27b",
+                      "served model or requested model alias missing from start record");
     failures += check(started.at("request").at("requested_output_tokens") == 4096,
                       "request output budget missing");
     failures += check(started.at("request").at("enable_thinking") == true,
@@ -343,10 +435,33 @@ int main() {
                           rejected.at("request").at("resolved_reasoning_effort").is_null(),
                       "rejection log fabricated a resolved reasoning effort");
     failures += check(rejected.at("error").at("status") == 400 &&
+                          rejected.at("error").at("type") == "invalid_request_error" &&
                           rejected.at("error").at("code") == "context_length_exceeded" &&
-                          rejected.at("error").at("param") == "messages" &&
-                          rejected.at("error").at("message") == preparation_error.message,
-                      "preparation rejection API error missing");
+                          rejected.at("error").at("param") == "messages",
+                      "preparation rejection API error classification missing");
+    failures += check(!rejected.at("error").contains("message") &&
+                          rejected.at("error").at("cause").is_null() &&
+                          rejected.dump().find("sentinel-client-value") == std::string::npos,
+                      "preparation rejection record retained the client-facing error message");
+    const RequestRejectionLogContext internal_rejection_context =
+        make_request_rejection_log_context(
+            13, "openai_chat_completions", request, metadata,
+            ApiError{.status = 500, .type = "internal_error", .message = "sentinel-client-value"},
+            std::length_error("sentinel-client-value"));
+    const Json internal_rejection =
+        Json::parse(format_request_rejected_json("serve-test", 2501, internal_rejection_context));
+    failures +=
+        check(internal_rejection.at("error") == Json{{"status", 500},
+                                                     {"type", "internal_error"},
+                                                     {"code", nullptr},
+                                                     {"param", nullptr},
+                                                     {"cause", "length_error"}} &&
+                  internal_rejection.dump().find("sentinel-client-value") == std::string::npos,
+              "internal preparation rejection lost its cause or kept exception text");
+    failures += check(render_request_rejected(internal_rejection_context).message ==
+                          "req#13 failed during prepare | openai-chat non-stream | HTTP 500 | "
+                          "internal error (length error) | messages 2 | media 1",
+                      "operational internal rejection did not render its cause");
     const OperationalRecord client_rejection = render_request_rejected(rejected_context);
     failures += check(
         client_rejection.severity == OperationalSeverity::Info &&
@@ -522,25 +637,119 @@ int main() {
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
 
+    const RequestFailure media_failure = make_generation_request_failure(
+        ApiError{.status  = 400,
+                 .message = "sentinel-client-value: cannot decode the supplied image",
+                 .param   = "messages",
+                 .code    = "invalid_media"});
     const Json error =
-        Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
+        Json::parse(format_request_error_json("serve-test", 4000, context, media_failure));
     failures += check(error.at("event") == "request_error", "request error event mismatch");
-    failures += check(error.at("error").at("message") == "generation failed",
-                      "request error message missing");
+    failures += check(error.at("error") == Json{{"phase", "generation"},
+                                                {"status", 400},
+                                                {"type", "invalid_request_error"},
+                                                {"code", "invalid_media"},
+                                                {"param", "messages"},
+                                                {"cause", nullptr}},
+                      "request error classification mismatch or free-text message retained");
+    failures += check(error.dump().find("sentinel-client-value") == std::string::npos,
+                      "request error record retained the client-facing error message");
 
-    const OperationalRecord internal_failure = render_request_failure(
-        context,
-        make_internal_request_failure(RequestFailurePhase::Generation, "sentinel-internal-detail"));
+    const RequestFailure internal =
+        make_internal_request_failure(RequestFailurePhase::Generation, std::bad_alloc());
+    const Json internal_error =
+        Json::parse(format_request_error_json("serve-test", 4001, context, internal));
+    failures += check(internal_error.at("error") == Json{{"phase", "generation"},
+                                                         {"status", 500},
+                                                         {"type", "internal_error"},
+                                                         {"code", nullptr},
+                                                         {"param", nullptr},
+                                                         {"cause", "out_of_memory"}},
+                      "internal request error classification mismatch");
+    const Json exception_text_error = Json::parse(format_request_error_json(
+        "serve-test", 4003, context,
+        make_internal_request_failure(
+            RequestFailurePhase::ResponseRender,
+            std::runtime_error("sentinel-client-value: generated text"))));
     failures +=
-        check(internal_failure.severity == OperationalSeverity::Error &&
-                  internal_failure.message.find("sentinel-internal-detail") == std::string::npos,
-              "operational internal failure severity or data policy mismatch");
+        check(exception_text_error.at("error").at("cause") == "runtime_error" &&
+                  exception_text_error.dump().find("sentinel-client-value") == std::string::npos,
+              "internal request error record retained exception text");
+    const Json disconnect_error = Json::parse(format_request_error_json(
+        "serve-test", 4002, context,
+        make_client_disconnected_failure(RequestFailurePhase::Transport)));
+    failures += check(disconnect_error.at("error").at("phase") == "transport" &&
+                          disconnect_error.at("error").at("status") == 499 &&
+                          disconnect_error.at("error").at("code") == "client_disconnected",
+                      "client disconnect request error classification mismatch");
+
+    const OperationalRecord internal_failure = render_request_failure(context, internal);
+    failures += check(internal_failure.severity == OperationalSeverity::Error &&
+                          internal_failure.message ==
+                              "req#7 failed during generation | openai-chat | HTTP 500 | "
+                              "internal error (out of memory)",
+                      "operational internal failure severity or rendering mismatch");
+    const OperationalRecord media_record = render_request_failure(context, media_failure);
+    failures += check(media_record.message.find("invalid media") != std::string::npos &&
+                          media_record.message.find("sentinel-client-value") == std::string::npos,
+                      "operational client failure rendered the client-facing error message");
     const OperationalRecord disconnected = render_request_failure(
         context, make_client_disconnected_failure(RequestFailurePhase::Transport));
     failures += check(disconnected.severity == OperationalSeverity::Info &&
                           disconnected.message.find("req#7 cancelled during transport") !=
                               std::string::npos,
                       "client disconnect is not an informational cancellation");
+
+    // Anthropic accepts any non-empty model string, so the client's value is logged only when it
+    // has the shape of a model identifier; the served model ID is always recorded.
+    failures += check(
+        log_safe_model_alias("claude-sonnet-4-5@20250929") == "claude-sonnet-4-5@20250929" &&
+            log_safe_model_alias("us.anthropic.claude-3-7-sonnet-20250219-v1:0") ==
+                "us.anthropic.claude-3-7-sonnet-20250219-v1:0" &&
+            log_safe_model_alias("anthropic/claude_opus-4.1") == "anthropic/claude_opus-4.1" &&
+            log_safe_model_alias(std::string(128, 'a')) == std::string(128, 'a'),
+        "identifier-shaped model aliases were not kept");
+    failures += check(log_safe_model_alias("") == "other" &&
+                          log_safe_model_alias(std::string(129, 'a')) == "other" &&
+                          log_safe_model_alias("claude sonnet") == "other" &&
+                          log_safe_model_alias("claude\nsecond-record") == "other" &&
+                          log_safe_model_alias("mod\xC3\xA8le") == "other" &&
+                          log_safe_model_alias("model\"}") == "other",
+                      "a model value that is not an identifier was logged");
+
+    const std::string model_sentinel = "sentinel-model-value: summarize my private notes";
+    const std::string oversized_model(1U << 20U, 'm');
+    for (const std::string& requested_model : {model_sentinel, oversized_model}) {
+        const RequestLogMetadata anthropic_metadata{
+            .served_model = "qwen3.6-27b", .requested_model = requested_model, .stream = true};
+        const RequestLogContext anthropic_context = make_request_log_context(
+            9, "anthropic_messages", request, anthropic_metadata, prepared);
+        const RequestRejectionLogContext anthropic_rejection = make_request_rejection_log_context(
+            10, "anthropic_messages", request, anthropic_metadata, preparation_error);
+        const std::vector<std::string> records{
+            format_request_start_json("serve-test", 4100, anthropic_context),
+            format_request_done_json("serve-test", 4101, anthropic_context, outcome),
+            format_request_error_json("serve-test", 4102, anthropic_context, media_failure),
+            format_request_rejected_json("serve-test", 4103, anthropic_rejection),
+        };
+        for (const std::string& record : records) {
+            const Json parsed = Json::parse(record);
+            failures += check(parsed.at("request").at("model") == "qwen3.6-27b" &&
+                                  parsed.at("request").at("requested_model") == "other",
+                              "free-text Anthropic model was not replaced by its alias");
+            failures += check(record.find("sentinel-model-value") == std::string::npos &&
+                                  record.size() < 16384,
+                              "a request record retained the client's model value");
+        }
+    }
+    const RequestLogMetadata aliased_metadata{.served_model    = "qwen3.6-27b",
+                                              .requested_model = "claude-sonnet-4-5"};
+    const Json aliased = Json::parse(format_request_start_json(
+        "serve-test", 4104,
+        make_request_log_context(11, "anthropic_messages", request, aliased_metadata, prepared)));
+    failures += check(aliased.at("request").at("model") == "qwen3.6-27b" &&
+                          aliased.at("request").at("requested_model") == "claude-sonnet-4-5",
+                      "identifier-shaped Anthropic model alias was not logged");
 
     ThroughputReport throughput;
     throughput.interval_seconds                         = 2.0;
@@ -670,6 +879,10 @@ int main() {
         ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
          ".jsonl");
     std::filesystem::remove(log_path);
+    const RequestLogMetadata free_text_model_metadata{.served_model    = "qwen3.6-27b",
+                                                      .requested_model = model_sentinel};
+    const RequestLogContext free_text_model_context = make_request_log_context(
+        12, "anthropic_messages", request, free_text_model_metadata, prepared);
     {
         JsonlRequestLog writer(log_path.string());
         writer.write_request_start(context);
@@ -677,29 +890,31 @@ int main() {
     {
         JsonlRequestLog writer(log_path.string());
         writer.write_request_rejected(rejected_context);
-        writer.write_request_error(context, "generation failed");
+        writer.write_request_error(context, media_failure);
+        writer.write_request_start(free_text_model_context);
+        writer.write_request_done(free_text_model_context, outcome);
     }
     std::ifstream input(log_path);
-    std::string first_line;
-    std::string second_line;
-    std::string third_line;
-    std::string extra_line;
-    std::getline(input, first_line);
-    std::getline(input, second_line);
-    std::getline(input, third_line);
-    std::getline(input, extra_line);
-    failures += check(!first_line.empty() && !second_line.empty() && !third_line.empty() &&
-                          extra_line.empty(),
-                      "JSONL writer did not append exactly one flushed line per event");
-    if (!first_line.empty() && !second_line.empty() && !third_line.empty()) {
-        failures += check(Json::parse(first_line).at("event") == "request_start",
-                          "first appended event mismatch");
-        failures += check(Json::parse(second_line).at("event") == "request_rejected",
-                          "second appended event mismatch");
-        failures += check(Json::parse(third_line).at("event") == "request_error",
-                          "third appended event mismatch");
+    std::vector<std::string> lines;
+    std::string file_contents;
+    for (std::string line; std::getline(input, line);) {
+        file_contents += line;
+        lines.push_back(std::move(line));
     }
     input.close();
+    const std::vector<std::string> expected_events{
+        "request_start", "request_rejected", "request_error", "request_start", "request_done"};
+    bool events_match = lines.size() == expected_events.size();
+    for (std::size_t index = 0; events_match && index < lines.size(); ++index) {
+        events_match = !lines[index].empty() &&
+                       Json::parse(lines[index]).at("event") == expected_events[index];
+    }
+    failures +=
+        check(events_match, "JSONL writer did not append exactly one flushed line per event");
+    failures += check(file_contents.find("sentinel-client-value") == std::string::npos,
+                      "JSONL file retained a client-facing error message");
+    failures += check(file_contents.find("sentinel-model-value") == std::string::npos,
+                      "JSONL file retained a free-text client model value");
     std::filesystem::remove(log_path);
 
     if (failures == 0) { std::cout << "ok\n"; }

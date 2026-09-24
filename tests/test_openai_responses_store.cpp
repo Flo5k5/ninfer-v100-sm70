@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -99,6 +100,25 @@ int test_oversized_record() {
     return failures;
 }
 
+int test_disabled_store() {
+    OpenAIResponsesStore store = OpenAIResponsesStore::disabled();
+    int failures               = 0;
+    failures += check(!store.enabled() && OpenAIResponsesStore(1, 1).enabled(),
+                      "only the disabled store reports disabled storage");
+
+    bool insertion_rejected = false;
+    try {
+        store.put(record("resp_secret", append_openai_response_context(
+                                            {}, {text_turn(ninfer::ChatRole::User, "secret")})));
+    } catch (const std::logic_error&) { insertion_rejected = true; }
+    failures += check(insertion_rejected, "disabled store accepted a Response");
+    failures += check(store.size() == 0 && store.bytes() == 0,
+                      "disabled store retained Response bytes after a rejected insertion");
+    failures += check(store.get("resp_secret") == nullptr && !store.erase("resp_secret"),
+                      "disabled store resolved or deleted a Response ID");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -106,6 +126,7 @@ int main() {
     failures += test_context_dag();
     failures += test_lru_and_delete();
     failures += test_oversized_record();
+    failures += test_disabled_store();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

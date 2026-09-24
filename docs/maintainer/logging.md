@@ -100,15 +100,22 @@ and HTTP records must not contain:
 - prompt text, generated content, reasoning text, tool arguments/results, or prior conversation;
 - raw image, video, audio, tokenizer, tensor, StateImage, or KV payloads;
 - request bodies or arbitrary client-controlled headers;
-- full data URLs or unredacted query strings.
+- full data URLs or unredacted query strings;
+- a client-chosen model name that is not an identifier. Request records carry the served model ID
+  and `log_safe_model_alias()` of the client's `model`: at most 128 characters from
+  `[A-Za-z0-9._:@/-]`, otherwise `other`. This shape filter keeps free text and oversized values
+  out; a value of that shape is logged as sent.
 
 Filesystem paths are permitted only when they are operator-selected local configuration or output
 paths and are necessary to diagnose the operation. A component that cannot prove a resident-service
 value safe emits an identity/count/digest or omits it. Serve request/response/HTTP operational
 records never include raw `ApiError.message`, arbitrary `exception.what()`, a request body, or an
 unclassified request path. Trusted startup/configuration errors and the local one-shot CLI's own
-input diagnostics may retain their detailed exception text. The protocol response and request
-JSONL may retain an exact error string when their independent contracts require it.
+input diagnostics may retain their detailed exception text. Only the protocol response carries the
+exact error message. The request JSONL never carries `ApiError.message` or `what()` text: failure
+records hold the phase, HTTP status, type, code, and parameter, and an internal failure adds a
+content-free `cause` named after the exception type (`internal_failure_cause()`), never after its
+message.
 
 ## 6. Producer rules
 
@@ -167,7 +174,8 @@ explicit emergency cases above remain direct outputs because they are different 
 
 Logging tests protect NInfer-owned observable semantics, not private object shape. The request-log
 test covers the consumed JSONL schema, representative request/throughput pretty records, Serve
-failure severity, and exclusion of arbitrary client error text. The pretty-logging test covers the
-observable Service and Tool prefixes. The corpus consumer test protects its exact schema-version
-agreement with Serve. Startup progress coordination is verified through terminal and redirected
-paths when that code changes; registry, mutex, getter, and constructor tests are not retained.
+failure severity and cause, and exclusion of client error text, exception text, and free-text model
+values. The pretty-logging test covers the observable Service and Tool prefixes. The corpus
+consumer test protects its exact schema-version agreement with Serve. Startup progress coordination
+is verified through terminal and redirected paths when that code changes; registry, mutex, getter,
+and constructor tests are not retained.

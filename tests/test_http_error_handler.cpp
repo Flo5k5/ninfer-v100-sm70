@@ -1,13 +1,19 @@
 #include "serve/http_server.h"
+#include "serve/openai_responses.h"
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
 using Json = nlohmann::json;
+using ninfer::serve::ApiError;
+using ninfer::serve::ApiException;
 using ninfer::serve::ServeOptions;
 
 int check(bool condition, const char* message) {
@@ -16,10 +22,88 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
+ServeOptions parse_options(std::vector<std::string> arguments) {
+    std::vector<char*> argv;
+    for (std::string& argument : arguments) { argv.push_back(argument.data()); }
+    return ninfer::serve::parse_serve_options(static_cast<int>(argv.size()), argv.data());
+}
+
+ApiError api_error(const std::function<void()>& action) {
+    try {
+        action();
+    } catch (const ApiException& exception) { return exception.error(); } catch (...) {
+        return ApiError{.status = 0, .message = "wrong exception"};
+    }
+    return ApiError{.status = 0, .message = "no exception"};
+}
+
+// The Responses handler composes these calls: parsed options build the store, the store sets the
+// request limits, and the limits drive Create parsing and prompt resolution.
+int test_responses_store_wiring() {
+    using namespace ninfer::serve;
+    int failures = 0;
+
+    const ServeOptions retaining =
+        parse_options({"ninfer-serve", "model.ninfer", "--default-max-tokens", "77"});
+    OpenAIResponsesStore retaining_store = make_openai_responses_store(retaining);
+    const RequestLimits retaining_limits =
+        make_openai_responses_request_limits(retaining, retaining_store);
+    const RequestJson omitted = {{"model", "m"}, {"input", "hello"}};
+    failures += check(retaining_store.enabled() && retaining_limits.response_store_enabled &&
+                          retaining_limits.default_max_tokens == 77 &&
+                          parse_openai_responses_create_request(omitted, retaining_limits).store,
+                      "a default server did not retain Responses by default");
+
+    const ServeOptions storeless =
+        parse_options({"ninfer-serve", "model.ninfer", "--no-response-store"});
+    OpenAIResponsesStore store = make_openai_responses_store(storeless);
+    const RequestLimits limits = make_openai_responses_request_limits(storeless, store);
+    failures += check(!store.enabled() && !limits.response_store_enabled &&
+                          limits.default_max_tokens == storeless.default_max_tokens,
+                      "--no-response-store did not reach the Responses request limits");
+
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(omitted, limits);
+    const OpenAIResponsesResolvedPrompt resolved =
+        resolve_openai_responses_prompt(request.prompt, store, "resp_unstored", request.store);
+    failures += check(!request.store && !resolved.session_key && store.size() == 0,
+                      "an omitted store was retained by a server without a Responses store");
+
+    RequestJson explicit_false = omitted;
+    explicit_false["store"]    = false;
+    failures += check(!parse_openai_responses_create_request(explicit_false, limits).store,
+                      "store=false was not served without a Responses store");
+
+    RequestJson explicit_true = omitted;
+    explicit_true["store"]    = true;
+    const ApiError store_error =
+        api_error([&] { (void)parse_openai_responses_create_request(explicit_true, limits); });
+    failures += check(store_error.status == 400 && store_error.code == "store_not_supported" &&
+                          store_error.param == "store",
+                      "store=true was not rejected by a server without a Responses store");
+
+    RequestJson continuation             = omitted;
+    continuation["previous_response_id"] = "resp_unstored";
+    const OpenAIResponsesCreateRequest child =
+        parse_openai_responses_create_request(continuation, limits);
+    const ApiError chain_error = api_error([&] {
+        (void)resolve_openai_responses_prompt(child.prompt, store, "resp_child", child.store);
+    });
+    const OpenAIResponsesPromptRequest counted =
+        parse_openai_responses_input_tokens_request(continuation, limits);
+    const ApiError count_error = api_error(
+        [&] { (void)resolve_openai_responses_prompt(counted, store, std::nullopt, false); });
+    failures +=
+        check(chain_error.status == 400 && chain_error.code == "previous_response_not_supported" &&
+                  count_error.code == "previous_response_not_supported",
+              "previous_response_id was accepted by a server without a Responses store");
+    return failures;
+}
+
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures = test_responses_store_wiring();
     ServeOptions options;
     options.max_request_bytes = 1234;
 

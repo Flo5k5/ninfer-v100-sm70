@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,6 +30,12 @@ int check(bool condition, const std::string& message) {
 RequestLimits limits() {
     RequestLimits value;
     value.default_max_tokens = 256;
+    return value;
+}
+
+RequestLimits storeless_limits() {
+    RequestLimits value          = limits();
+    value.response_store_enabled = false;
     return value;
 }
 
@@ -980,6 +987,78 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+int test_disabled_response_store() {
+    OpenAIResponsesStore store = OpenAIResponsesStore::disabled();
+    const Json base            = {{"model", "m"}, {"input", "hello"}};
+    int failures               = 0;
+
+    const OpenAIResponsesCreateRequest omitted =
+        parse_openai_responses_create_request(base, storeless_limits());
+    failures += check(!omitted.store, "omitted store did not default to false without a store");
+    const OpenAIResponsesResolvedPrompt resolved =
+        resolve_openai_responses_prompt(omitted.prompt, store, "resp_unstored", omitted.store);
+    failures +=
+        check(resolved.generation.messages.size() == 1 && !resolved.session_key &&
+                  !resolved.cache_hints.session_key &&
+                  resolved.cache_hints.retention == ninfer::CacheRetentionHint::Disposable &&
+                  !resolved.cache_hints.update_session_index,
+              "unstored Response was served with an Engine session");
+    const BuiltOpenAIResponse built =
+        make_openai_response_object("resp_unstored", 123, omitted, {}, sample_outcome());
+    failures +=
+        check(built.body.at("store") == false, "unstored Response did not echo store=false");
+    OpenAIResponsesEventStream stream("resp_unstored_stream", 123, omitted, {});
+    const Json created = parse_event(stream.start().front());
+    failures += check(created.at("type") == "response.created" &&
+                          created.at("response").at("store") == false,
+                      "unstored streaming Response did not echo store=false");
+
+    Json explicit_false     = base;
+    explicit_false["store"] = false;
+    failures +=
+        check(!parse_openai_responses_create_request(explicit_false, storeless_limits()).store,
+              "explicit store=false was not served without a store");
+
+    Json explicit_true         = base;
+    explicit_true["store"]     = true;
+    const ApiError store_error = api_error(
+        [&] { (void)parse_openai_responses_create_request(explicit_true, storeless_limits()); });
+    failures += check(store_error.status == 400 && store_error.code == "store_not_supported" &&
+                          store_error.param == "store",
+                      "store=true was not rejected when the server retains no Responses");
+    failures += check(parse_openai_responses_create_request(explicit_true, limits()).store,
+                      "store=true was rejected although the server retains Responses");
+
+    Json continuation                    = base;
+    continuation["previous_response_id"] = "resp_unstored";
+    const OpenAIResponsesCreateRequest child =
+        parse_openai_responses_create_request(continuation, storeless_limits());
+    const ApiError chain_error = api_error([&] {
+        (void)resolve_openai_responses_prompt(child.prompt, store, "resp_child", child.store);
+    });
+    failures +=
+        check(chain_error.status == 400 && chain_error.code == "previous_response_not_supported" &&
+                  chain_error.param == "previous_response_id",
+              "previous_response_id was not rejected when the server retains no Responses");
+    const OpenAIResponsesPromptRequest counted =
+        parse_openai_responses_input_tokens_request(continuation, storeless_limits());
+    failures +=
+        check(api_code([&] {
+                  (void)resolve_openai_responses_prompt(counted, store, std::nullopt, false);
+              }) == "previous_response_not_supported",
+              "input token counting accepted previous_response_id without a store");
+
+    // A request that reaches resolution with store=true despite a disabled store fails before
+    // generation instead of planning a retained session.
+    bool retention_refused = false;
+    try {
+        (void)resolve_openai_responses_prompt(omitted.prompt, store, "resp_unstored", true);
+    } catch (const std::logic_error&) { retention_refused = true; }
+    failures +=
+        check(retention_refused, "prompt resolution planned a stored Response without a store");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -997,6 +1076,7 @@ int main() {
     failures += test_response_object();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();
+    failures += test_disabled_response_store();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

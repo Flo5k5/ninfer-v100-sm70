@@ -12,22 +12,47 @@ from tools.bench.run_serve_corpus import (
     Fixture,
     RunSpec,
     build_result_record,
+    describe_request_error,
     require_server_log_identity,
     summary_row,
 )
 
 
-def test_request_log_v20_identity_is_accepted() -> None:
+def test_request_log_v21_identity_is_accepted() -> None:
     current = {
         "artifact_type": "ninfer_serve_request_log",
-        "schema_version": 20,
+        "schema_version": 21,
         "event": "server_start",
     }
     require_server_log_identity(current, "server_start")
 
-    stale = dict(current, schema_version=19)
+    stale = dict(current, schema_version=20)
     with pytest.raises(CampaignError):
         require_server_log_identity(stale, "server_start")
+
+
+def test_request_error_is_described_from_its_classification() -> None:
+    event = {
+        "event": "request_error",
+        "error": {
+            "phase": "generation",
+            "status": 500,
+            "type": "internal_error",
+            "code": None,
+            "param": None,
+            "cause": None,
+        },
+    }
+    assert describe_request_error(event) == "HTTP 500 internal_error during generation"
+    event["error"]["cause"] = "out_of_memory"
+    assert (
+        describe_request_error(event)
+        == "HTTP 500 internal_error (out_of_memory) during generation"
+    )
+    event["error"]["cause"] = None
+    event["error"]["code"] = "request_queue_timeout"
+    assert describe_request_error(event) == "HTTP 500 request_queue_timeout during generation"
+    assert describe_request_error({"event": "request_error"}) == "unclassified request error"
 
 
 def test_result_record_parses_request_host_exposure() -> None:
@@ -53,7 +78,7 @@ def test_result_record_parses_request_host_exposure() -> None:
     response = {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
     event = {
         "artifact_type": "ninfer_serve_request_log",
-        "schema_version": 20,
+        "schema_version": 21,
         "event": "request_done",
         "request": {
             "model": spec.model_id,

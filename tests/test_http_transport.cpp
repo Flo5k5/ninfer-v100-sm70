@@ -1,4 +1,7 @@
 #include "serve/http_transport.h"
+#include "serve/request_events.h"
+
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -115,6 +118,32 @@ int test_sse_transport() {
     return failures;
 }
 
+// Streaming handlers see only the ResponseRenderFailure wrapper; the logged cause must still name
+// the exception that rendering raised, here invalid UTF-8 in generated text.
+int test_render_failure_keeps_cause() {
+    std::vector<std::string> writes;
+    httplib::DataSink sink;
+    sink.write = [&](const char* data, std::size_t size) {
+        writes.emplace_back(data, size);
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    std::atomic<bool> cancelled{false};
+    SseTransport transport(sink, cancelled);
+
+    std::string cause;
+    try {
+        ninfer::serve::render_and_write(transport, [] {
+            return "data: " + nlohmann::json(std::string("sentinel-generated-text \xFF")).dump() +
+                   "\n\n";
+        });
+    } catch (const ninfer::serve::ResponseRenderFailure& failure) {
+        cause = ninfer::serve::internal_failure_cause(failure);
+    }
+    return check(cause == "json_error_316" && writes.empty(),
+                 "a response rendering failure lost the cause of the exception it wraps");
+}
+
 int test_sse_response_headers() {
     httplib::Response response;
     ninfer::serve::prepare_sse_response(response);
@@ -208,8 +237,8 @@ int test_inherited_socket_liveness() {
 } // namespace
 
 int main() {
-    int failures =
-        test_sse_transport() + test_sse_response_headers() + test_prompt_json_member_order();
+    int failures = test_sse_transport() + test_render_failure_keeps_cause() +
+                   test_sse_response_headers() + test_prompt_json_member_order();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
 #endif

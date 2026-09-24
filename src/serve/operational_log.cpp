@@ -182,6 +182,7 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
     } else {
         append_clause(out, classification_name(failure.classification));
     }
+    if (!failure.cause.empty()) { out << " (" << pretty_code(failure.cause) << ')'; }
 }
 
 } // namespace
@@ -215,8 +216,8 @@ OperationalRecord render_request_start(const RequestLogContext& context) {
 }
 
 OperationalRecord render_request_rejected(const RequestRejectionLogContext& context) {
-    const RequestFailure failure =
-        make_request_failure(RequestFailurePhase::Prepare, context.error);
+    RequestFailure failure = make_request_failure(RequestFailurePhase::Prepare, context.error);
+    failure.cause          = context.cause;
     std::ostringstream out;
     const char* status = "failed";
     if (failure.classification == RequestFailureClass::ClientDisconnected) {
