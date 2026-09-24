@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import re
 import struct
-import tempfile
 
 import pytest
 from safetensors.torch import save_file
@@ -19,6 +18,8 @@ from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorSpec
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.qwen3_8_27b import reencode_nvfp4
+
+from ..path_fragments import assert_no_path_fragments
 
 
 # Miniature geometry: the tool reads shapes from the base artifact, not from constants.
@@ -296,23 +297,13 @@ def _stored_sha256(directory: Path) -> dict[str, str]:
             for name, meta in header.items() if name != "__metadata__"}
 
 
-def _assert_no_path_fragments(text: str, tmp_path: Path) -> None:
-    """No JSON string (member name or value) is, or starts like, a local filesystem path."""
-
-    for fragment in (str(tmp_path), str(Path.home()), tempfile.gettempdir(), "/home/", "/tmp/",
-                     "/private/", "/Users/", "/data/", "/var/"):
-        assert fragment not in text, fragment
-    # A JSON string (member name or value) that starts like an absolute or home path.
-    assert not re.findall(r'"(?:/|~|\\\\|[A-Za-z]:)', text)
-
-
 def _assert_no_local_paths(artifact: Path, tmp_path: Path) -> None:
     """No directory JSON string is a filesystem path or names a home or temporary directory."""
 
     with artifact.open("rb") as handle:
         _, json_bytes, _ = HEADER.unpack(handle.read(HEADER.size))
         text = handle.read(json_bytes).decode("utf-8")
-    _assert_no_path_fragments(text, tmp_path)
+    assert_no_path_fragments(text, tmp_path)
 
 
 def _report(tmp_path) -> dict:
@@ -416,7 +407,7 @@ def test_reencode_report_names_the_artifact_by_name_only(tmp_path) -> None:
     report = _report(tmp_path)
     assert report["artifact"] == out_path.name
     assert "/" not in report["artifact"] and "\\" not in report["artifact"]
-    _assert_no_path_fragments(json.dumps(report), tmp_path)
+    assert_no_path_fragments(json.dumps(report), tmp_path)
 
 
 def test_donor_words_everywhere_without_weights(tmp_path) -> None:
