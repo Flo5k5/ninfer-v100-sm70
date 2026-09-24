@@ -157,8 +157,10 @@ int run(const Options& options) {
     const auto weights_profile = target::Package::resolve_weights(reader.identity());
     ninfer::artifact::Binder binder(reader);
     auto load_plan = target::Package::plan_load(binder, engine, weights_profile);
+    // materialize() consumes its plan, and construct_loaded_model() still takes the load plan.
+    auto materialization = load_plan.materialization();
     auto materialized =
-        ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
+        ninfer::artifact::materialize(reader, std::move(materialization), device, nullptr);
     auto model =
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
     auto frontend = target::Package::make_frontend(*model, engine);
