@@ -461,6 +461,8 @@ def describe_request_error(event: dict[str, Any]) -> str:
     if not isinstance(error, dict):
         return "unclassified request error"
     reason = error.get("code") or error.get("type") or "unclassified error"
+    if error.get("cause"):
+        reason = f"{reason} ({error['cause']})"
     return f"HTTP {error.get('status', '?')} {reason} during {error.get('phase', 'unknown phase')}"
 
 

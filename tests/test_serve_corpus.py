@@ -40,9 +40,16 @@ def test_request_error_is_described_from_its_classification() -> None:
             "type": "internal_error",
             "code": None,
             "param": None,
+            "cause": None,
         },
     }
     assert describe_request_error(event) == "HTTP 500 internal_error during generation"
+    event["error"]["cause"] = "out_of_memory"
+    assert (
+        describe_request_error(event)
+        == "HTTP 500 internal_error (out_of_memory) during generation"
+    )
+    event["error"]["cause"] = None
     event["error"]["code"] = "request_queue_timeout"
     assert describe_request_error(event) == "HTTP 500 request_queue_timeout during generation"
     assert describe_request_error({"event": "request_error"}) == "unclassified request error"

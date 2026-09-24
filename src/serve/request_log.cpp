@@ -284,11 +284,12 @@ Json optional_identifier(const std::string& value) {
 }
 
 // ApiError::message is deliberately not serialized: it can quote client input or model output.
-Json error_json(const ApiError& error) {
-    return Json{{"status", error.status},
-                {"type", error.type},
-                {"code", optional_identifier(error.code)},
-                {"param", optional_identifier(error.param)}};
+Json rejection_error_json(const RequestRejectionLogContext& context) {
+    return Json{{"status", context.error.status},
+                {"type", context.error.type},
+                {"code", optional_identifier(context.error.code)},
+                {"param", optional_identifier(context.error.param)},
+                {"cause", optional_identifier(context.cause)}};
 }
 
 const char* failure_phase_name(RequestFailurePhase phase) {
@@ -314,7 +315,8 @@ Json failure_json(const RequestFailure& failure) {
                 {"status", failure.http_status},
                 {"type", failure.error_type},
                 {"code", optional_identifier(failure.error_code)},
-                {"param", optional_identifier(failure.param)}};
+                {"param", optional_identifier(failure.param)},
+                {"cause", optional_identifier(failure.cause)}};
 }
 
 Json arena_json(const ninfer::ArenaMemorySummary& arena) {
@@ -578,7 +580,7 @@ std::string format_request_rejected_json(const std::string& server_instance_id,
     Json record       = event_base(server_instance_id, timestamp, "request_rejected");
     record["phase"]   = "prepare";
     record["request"] = rejected_request_json(context);
-    record["error"]   = error_json(context.error);
+    record["error"]   = rejection_error_json(context);
     return record.dump();
 }
 
