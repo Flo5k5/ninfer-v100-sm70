@@ -18,9 +18,8 @@ It supports text, image, and video input through a local CLI or OpenAI-/Anthropi
 
 Artifacts contain the exact model weights, tokenizer, chat template, and required media frontend resources.
 NInfer loads only version-3 artifacts, which replaced the version-2 files in these repositories on
-2026-09-15. Download any artifact obtained before that date again. On this Volta port, the two `nvfp4`
-artifacts and the Qwen3.6-27B and Qwen3.8-27B `groupwise-int` artifacts load today; the
-Qwen3.6-35B-A3B MoE weights have no v3 binding yet.
+2026-09-15. Download any artifact obtained before that date again. All five artifacts load on this
+Volta port.
 
 ## Performance
 
