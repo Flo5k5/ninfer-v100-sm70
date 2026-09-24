@@ -852,8 +852,9 @@ but Serve throughput is always a persistent record. Redirected stderr contains n
 sequences. Pretty values use readable units and rounded rates; use the independent request JSONL for
 complete fields and full precision. At every `--log-level`, operational records never contain
 prompts, generated text, tool names or arguments, request bodies, credentials, or error messages;
-failures are reported by phase, HTTP status, and error code. `debug` and `trace` add only startup
-and resource-planning detail.
+failures are reported by phase, HTTP status, error code, and, for an unexpected exception, the
+content-free cause described under [Structured request log](#structured-request-log). `debug` and
+`trace` add only startup and resource-planning detail.
 If a tool marker is returned to text because its structure or tool identity cannot be represented,
 Serve emits one warning with only the failure classification, never the generated markup.
 
@@ -874,9 +875,9 @@ they do not infer request behavior from process-global counter deltas.
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
-| `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the HTTP status/type/code/parameter of a synchronous preparation rejection |
+| `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the HTTP status/type/code/parameter/cause of a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
-| `request_error` | the resolved request configuration and the failure `phase` (`generation`, `response_render`, or `transport`) with its HTTP status/type/code/parameter |
+| `request_error` | the resolved request configuration and the failure `phase` (`generation`, `response_render`, or `transport`) with its HTTP status/type/code/parameter/cause |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 
 `requested_reasoning_effort` is the client value or `null` when omitted.
@@ -890,6 +891,13 @@ OpenAI endpoints accept only the served ID, so `requested_model` repeats it ther
 when an operator's `--model-id` falls outside that shape. Anthropic clients may send any string:
 text with spaces or other characters, or a longer value, is written as `other`, but a value of that
 shape is written as sent, so clients should not put secrets or user text in `model`.
+
+`error.cause` is `null` unless an unexpected exception caused the failure. It then names the
+exception type, never its message: `out_of_memory`, `json_error_<id>` with the JSON library's
+exception id (for example `json_error_316` for invalid UTF-8), `system_error_<code>`,
+`invalid_argument`, `out_of_range`, `length_error`, `logic_error`, `api_error`, `runtime_error`,
+`exception`, or `unknown` for a non-standard exception. A response-rendering failure reports the
+exception that rendering raised.
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments

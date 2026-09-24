@@ -403,7 +403,7 @@ void HttpServer::register_routes() {
             } catch (const std::exception& e) {
                 operational_log_.http_failure(
                     endpoint_name(req.path),
-                    make_internal_request_failure(RequestFailurePhase::Http),
+                    make_internal_request_failure(RequestFailurePhase::Http, e),
                     response_request_id(res));
                 if (req.path.rfind("/v1/messages", 0) == 0) {
                     ApiError error;
@@ -416,7 +416,7 @@ void HttpServer::register_routes() {
             } catch (...) {
                 operational_log_.http_failure(
                     endpoint_name(req.path),
-                    make_internal_request_failure(RequestFailurePhase::Http),
+                    make_unknown_internal_request_failure(RequestFailurePhase::Http),
                     response_request_id(res));
                 ApiError error;
                 error.status  = 500;

@@ -254,8 +254,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         write_openai_error(res, responses_error(exception.error()));
         return;
     } catch (const std::exception& exception) {
-        operational_log_.http_failure("openai_responses",
-                                      make_internal_request_failure(RequestFailurePhase::Http));
+        operational_log_.http_failure(
+            "openai_responses",
+            make_internal_request_failure(RequestFailurePhase::Http, exception));
         write_openai_error(res, internal_error(exception));
         return;
     }
@@ -283,7 +284,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     } catch (const std::exception& exception) {
         const ApiError error = internal_error(exception);
         record_request_rejected(make_request_rejection_log_context(
-            req_id, "openai_responses", resolved.generation, metadata, error));
+            req_id, "openai_responses", resolved.generation, metadata, error, exception));
         write_openai_error(res, error);
         return;
     }
@@ -303,7 +304,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             write_openai_error(res, error);
             return;
         } catch (const std::exception& exception) {
-            lifecycle->failure(make_internal_request_failure(RequestFailurePhase::Generation));
+            lifecycle->failure(
+                make_internal_request_failure(RequestFailurePhase::Generation, exception));
             write_openai_error(res, internal_error(exception));
             return;
         }
@@ -321,7 +323,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             return;
         } catch (const std::exception& exception) {
             lifecycle->response_failure(
-                make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                make_internal_request_failure(RequestFailurePhase::ResponseRender, exception));
             write_openai_error(res, internal_error(exception));
             return;
         }
@@ -343,7 +345,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             return;
         } catch (const std::exception& exception) {
             lifecycle->response_failure(
-                make_internal_request_failure(RequestFailurePhase::ResponseStore));
+                make_internal_request_failure(RequestFailurePhase::ResponseStore, exception));
             write_openai_error(res, internal_error(exception));
             return;
         }
@@ -352,7 +354,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             set_owned_json_content(res, response->body.dump(), prepared.lifetime);
         } catch (const std::exception& exception) {
             lifecycle->response_failure(
-                make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                make_internal_request_failure(RequestFailurePhase::ResponseRender, exception));
             write_openai_error(res, internal_error(exception));
         }
         return;
@@ -389,9 +391,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         lifecycle->response_failure(
                             make_client_disconnected_failure(RequestFailurePhase::Transport));
                         return false;
-                    } catch (const ResponseRenderFailure&) {
-                        lifecycle->response_failure(
-                            make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                    } catch (const ResponseRenderFailure& exception) {
+                        lifecycle->response_failure(make_internal_request_failure(
+                            RequestFailurePhase::ResponseRender, exception));
                         return false;
                     }
                 };
@@ -403,8 +405,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     return false;
                 } catch (const ResponseRenderFailure& exception) {
                     const ApiError error = internal_error(exception);
-                    lifecycle->failure(
-                        make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception));
                     return send_failed(error);
                 }
 
@@ -428,8 +430,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     return false;
                 } catch (const ResponseRenderFailure& exception) {
                     const ApiError error = internal_error(exception);
-                    lifecycle->failure(
-                        make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception));
                     return send_failed(error);
                 } catch (const ApiException& exception) {
                     const ApiError error = responses_error(exception.error());
@@ -438,7 +440,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 } catch (const std::exception& exception) {
                     const ApiError error = internal_error(exception);
                     lifecycle->failure(
-                        make_internal_request_failure(RequestFailurePhase::Generation));
+                        make_internal_request_failure(RequestFailurePhase::Generation, exception));
                     return send_failed(error);
                 }
 
@@ -453,8 +455,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     return send_failed(error);
                 } catch (const std::exception& exception) {
                     const ApiError error = internal_error(exception);
-                    lifecycle->response_failure(
-                        make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception));
                     return send_failed(error);
                 }
 
@@ -470,8 +472,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     return send_failed(error);
                 } catch (const std::exception& exception) {
                     const ApiError error = internal_error(exception);
-                    lifecycle->response_failure(
-                        make_internal_request_failure(RequestFailurePhase::ResponseStore));
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseStore, exception));
                     return send_failed(error);
                 }
 
@@ -480,8 +482,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     terminal = stream->encoder->terminal(finished->response);
                 } catch (const std::exception& exception) {
                     const ApiError error = internal_error(exception);
-                    lifecycle->response_failure(
-                        make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception));
                     return send_failed(error);
                 }
                 try {
@@ -503,7 +505,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 }
             });
     } catch (const std::exception& exception) {
-        lifecycle->failure(make_internal_request_failure(RequestFailurePhase::ResponseRender));
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception));
         write_openai_error(res, internal_error(exception));
     }
 }
@@ -523,8 +526,9 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
     } catch (const ApiException& exception) {
         write_openai_error(res, responses_error(exception.error()));
     } catch (const std::exception& exception) {
-        operational_log_.http_failure("openai_responses_input_tokens",
-                                      make_internal_request_failure(RequestFailurePhase::Http));
+        operational_log_.http_failure(
+            "openai_responses_input_tokens",
+            make_internal_request_failure(RequestFailurePhase::Http, exception));
         write_openai_error(res, internal_error(exception));
     }
 }

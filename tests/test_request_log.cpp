@@ -5,12 +5,16 @@
 
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -27,10 +31,93 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
+constexpr const char* kExceptionText = "sentinel-exception-text: summarize my private notes";
+
+struct CustomError final : std::exception {
+    [[nodiscard]] const char* what() const noexcept override { return kExceptionText; }
+};
+
+// The cause of whatever `action` throws, or "none" when it returns normally.
+std::string cause_of(const std::function<void()>& action) {
+    try {
+        action();
+    } catch (const std::exception& exception) {
+        const std::string cause = internal_failure_cause(exception);
+        if (cause.find("sentinel") != std::string::npos) { return "leaked what()"; }
+        return cause;
+    }
+    return "none";
+}
+
+int test_internal_failure_causes() {
+    int failures = 0;
+    failures += check(cause_of([] { throw std::bad_alloc(); }) == "out_of_memory",
+                      "allocation failure cause mismatch");
+    failures += check(cause_of([] {
+                          [[maybe_unused]] const Json parsed = Json::parse("{\"sentinel\": ");
+                      }) == "json_error_101",
+                      "JSON parse failure did not report its library id");
+    failures +=
+        check(cause_of([] { (void)Json(std::string("sentinel \xFF")).dump(); }) == "json_error_316",
+              "invalid UTF-8 serialization did not report its library id");
+    failures +=
+        check(cause_of([] {
+                  throw std::system_error(
+                      std::make_error_code(std::errc::no_such_file_or_directory), kExceptionText);
+              }) == "system_error_" +
+                        std::to_string(static_cast<int>(std::errc::no_such_file_or_directory)),
+              "system error cause did not report its code");
+    failures +=
+        check(cause_of([] { throw std::invalid_argument(kExceptionText); }) == "invalid_argument" &&
+                  cause_of([] { throw std::out_of_range(kExceptionText); }) == "out_of_range" &&
+                  cause_of([] { throw std::length_error(kExceptionText); }) == "length_error" &&
+                  cause_of([] { throw std::domain_error(kExceptionText); }) == "logic_error" &&
+                  cause_of([] { throw std::logic_error(kExceptionText); }) == "logic_error",
+              "logic error cause mismatch");
+    failures += check(
+        cause_of([] { throw ApiException(ApiError{.message = kExceptionText}); }) == "api_error" &&
+            cause_of([] { throw std::runtime_error(kExceptionText); }) == "runtime_error" &&
+            cause_of([] { throw CustomError(); }) == "exception",
+        "runtime or custom exception cause mismatch");
+
+    // A wrapper keeps the wrapped exception's cause, including a non-standard one.
+    failures += check(cause_of([] {
+                          try {
+                              throw std::bad_alloc();
+                          } catch (...) {
+                              std::throw_with_nested(std::runtime_error(kExceptionText));
+                          }
+                      }) == "out_of_memory",
+                      "nested exception cause was not unwrapped");
+    failures += check(cause_of([] {
+                          try {
+                              throw 7;
+                          } catch (...) {
+                              std::throw_with_nested(std::runtime_error(kExceptionText));
+                          }
+                      }) == "unknown",
+                      "nested non-standard exception cause mismatch");
+
+    const RequestFailure internal =
+        make_internal_request_failure(RequestFailurePhase::ResponseRender, std::bad_alloc());
+    failures += check(internal.classification == RequestFailureClass::Internal &&
+                          internal.http_status == 500 && internal.error_type == "internal_error" &&
+                          internal.cause == "out_of_memory",
+                      "internal request failure did not keep its cause");
+    failures +=
+        check(make_unknown_internal_request_failure(RequestFailurePhase::Http).cause == "unknown",
+              "non-standard internal failure cause mismatch");
+    failures +=
+        check(make_request_failure(RequestFailurePhase::Generation, ApiError{}).cause.empty() &&
+                  make_client_disconnected_failure(RequestFailurePhase::Transport).cause.empty(),
+              "a failure without an internal exception reported a cause");
+    return failures;
+}
+
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures = test_internal_failure_causes();
 
     bool protected_artifact_rejected = false;
     try {
@@ -353,8 +440,28 @@ int main() {
                           rejected.at("error").at("param") == "messages",
                       "preparation rejection API error classification missing");
     failures += check(!rejected.at("error").contains("message") &&
+                          rejected.at("error").at("cause").is_null() &&
                           rejected.dump().find("sentinel-client-value") == std::string::npos,
                       "preparation rejection record retained the client-facing error message");
+    const RequestRejectionLogContext internal_rejection_context =
+        make_request_rejection_log_context(
+            13, "openai_chat_completions", request, metadata,
+            ApiError{.status = 500, .type = "internal_error", .message = "sentinel-client-value"},
+            std::length_error("sentinel-client-value"));
+    const Json internal_rejection =
+        Json::parse(format_request_rejected_json("serve-test", 2501, internal_rejection_context));
+    failures +=
+        check(internal_rejection.at("error") == Json{{"status", 500},
+                                                     {"type", "internal_error"},
+                                                     {"code", nullptr},
+                                                     {"param", nullptr},
+                                                     {"cause", "length_error"}} &&
+                  internal_rejection.dump().find("sentinel-client-value") == std::string::npos,
+              "internal preparation rejection lost its cause or kept exception text");
+    failures += check(render_request_rejected(internal_rejection_context).message ==
+                          "req#13 failed during prepare | openai-chat non-stream | HTTP 500 | "
+                          "internal error (length error) | messages 2 | media 1",
+                      "operational internal rejection did not render its cause");
     const OperationalRecord client_rejection = render_request_rejected(rejected_context);
     failures += check(
         client_rejection.severity == OperationalSeverity::Info &&
@@ -542,20 +649,32 @@ int main() {
                                                 {"status", 400},
                                                 {"type", "invalid_request_error"},
                                                 {"code", "invalid_media"},
-                                                {"param", "messages"}},
+                                                {"param", "messages"},
+                                                {"cause", nullptr}},
                       "request error classification mismatch or free-text message retained");
     failures += check(error.dump().find("sentinel-client-value") == std::string::npos,
                       "request error record retained the client-facing error message");
 
-    const RequestFailure internal = make_internal_request_failure(RequestFailurePhase::Generation);
+    const RequestFailure internal =
+        make_internal_request_failure(RequestFailurePhase::Generation, std::bad_alloc());
     const Json internal_error =
         Json::parse(format_request_error_json("serve-test", 4001, context, internal));
     failures += check(internal_error.at("error") == Json{{"phase", "generation"},
                                                          {"status", 500},
                                                          {"type", "internal_error"},
                                                          {"code", nullptr},
-                                                         {"param", nullptr}},
+                                                         {"param", nullptr},
+                                                         {"cause", "out_of_memory"}},
                       "internal request error classification mismatch");
+    const Json exception_text_error = Json::parse(format_request_error_json(
+        "serve-test", 4003, context,
+        make_internal_request_failure(
+            RequestFailurePhase::ResponseRender,
+            std::runtime_error("sentinel-client-value: generated text"))));
+    failures +=
+        check(exception_text_error.at("error").at("cause") == "runtime_error" &&
+                  exception_text_error.dump().find("sentinel-client-value") == std::string::npos,
+              "internal request error record retained exception text");
     const Json disconnect_error = Json::parse(format_request_error_json(
         "serve-test", 4002, context,
         make_client_disconnected_failure(RequestFailurePhase::Transport)));
@@ -568,7 +687,7 @@ int main() {
     failures += check(internal_failure.severity == OperationalSeverity::Error &&
                           internal_failure.message ==
                               "req#7 failed during generation | openai-chat | HTTP 500 | "
-                              "internal error",
+                              "internal error (out of memory)",
                       "operational internal failure severity or rendering mismatch");
     const OperationalRecord media_record = render_request_failure(context, media_failure);
     failures += check(media_record.message.find("invalid media") != std::string::npos &&

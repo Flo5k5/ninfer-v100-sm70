@@ -26,9 +26,9 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
     } catch (const std::exception& exception) {
-        operational_log_.http_failure("anthropic_count_tokens",
-                                      make_internal_request_failure(RequestFailurePhase::Http),
-                                      request_id);
+        operational_log_.http_failure(
+            "anthropic_count_tokens",
+            make_internal_request_failure(RequestFailurePhase::Http, exception), request_id);
         ApiError error;
         error.status  = 500;
         error.message = exception.what();
@@ -50,9 +50,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         write_anthropic_error(res, exception.error(), request_id);
         return;
     } catch (const std::exception& exception) {
-        operational_log_.http_failure("anthropic_messages",
-                                      make_internal_request_failure(RequestFailurePhase::Http),
-                                      request_id);
+        operational_log_.http_failure(
+            "anthropic_messages",
+            make_internal_request_failure(RequestFailurePhase::Http, exception), request_id);
         ApiError error;
         error.status  = 500;
         error.message = exception.what();
@@ -83,7 +83,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         error.type    = "internal_error";
         error.message = exception.what();
         record_request_rejected(make_request_rejection_log_context(
-            req_id, "anthropic_messages", request.generation, metadata, error));
+            req_id, "anthropic_messages", request.generation, metadata, error, exception));
         write_anthropic_error(res, error, request_id);
         return;
     }
@@ -105,7 +105,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             write_anthropic_error(res, error, request_id);
             return;
         } catch (const std::exception& exception) {
-            lifecycle->failure(make_internal_request_failure(RequestFailurePhase::Generation));
+            lifecycle->failure(
+                make_internal_request_failure(RequestFailurePhase::Generation, exception));
             ApiError error;
             error.status  = 500;
             error.message = exception.what();
@@ -123,7 +124,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             write_anthropic_error(res, error, request_id);
         } catch (const std::exception& exception) {
             lifecycle->response_failure(
-                make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                make_internal_request_failure(RequestFailurePhase::ResponseRender, exception));
             ApiError error;
             error.status  = 500;
             error.message = exception.what();
@@ -157,9 +158,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                         lifecycle->response_failure(
                             make_client_disconnected_failure(RequestFailurePhase::Transport));
                         return false;
-                    } catch (const ResponseRenderFailure&) {
-                        lifecycle->response_failure(
-                            make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                    } catch (const ResponseRenderFailure& exception) {
+                        lifecycle->response_failure(make_internal_request_failure(
+                            RequestFailurePhase::ResponseRender, exception));
                         return false;
                     }
                 };
@@ -184,8 +185,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
                     return false;
                 } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(
-                        make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception));
                     ApiError error;
                     error.status  = 500;
                     error.message = exception.what();
@@ -196,7 +197,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     return send_error(error);
                 } catch (const std::exception& exception) {
                     lifecycle->failure(
-                        make_internal_request_failure(RequestFailurePhase::Generation));
+                        make_internal_request_failure(RequestFailurePhase::Generation, exception));
                     ApiError error;
                     error.status  = 500;
                     error.message = exception.what();
@@ -208,8 +209,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 try {
                     terminal = encoder->finish(outcome);
                 } catch (const std::exception& exception) {
-                    lifecycle->response_failure(
-                        make_internal_request_failure(RequestFailurePhase::ResponseRender));
+                    lifecycle->response_failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception));
                     ApiError error;
                     error.status  = 500;
                     error.message = exception.what();
@@ -233,7 +234,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 }
             });
     } catch (const std::exception& exception) {
-        lifecycle->failure(make_internal_request_failure(RequestFailurePhase::ResponseRender));
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception));
         ApiError error;
         error.status  = 500;
         error.message = exception.what();

@@ -1,6 +1,11 @@
 #include "serve/request_events.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
+#include <new>
+#include <stdexcept>
+#include <system_error>
 #include <utility>
 
 namespace ninfer::serve {
@@ -77,6 +82,42 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     return context;
 }
 
+RequestRejectionLogContext make_request_rejection_log_context(
+    std::uint64_t id, std::string protocol, const GenerationRequest& request,
+    const RequestLogMetadata& metadata, ApiError error, const std::exception& cause) {
+    RequestRejectionLogContext context = make_request_rejection_log_context(
+        id, std::move(protocol), request, metadata, std::move(error));
+    context.cause = internal_failure_cause(cause);
+    return context;
+}
+
+std::string internal_failure_cause(const std::exception& exception) {
+    if (const auto* wrapper = dynamic_cast<const std::nested_exception*>(&exception);
+        wrapper != nullptr && wrapper->nested_ptr() != nullptr) {
+        try {
+            wrapper->rethrow_nested();
+        } catch (const std::exception& nested) {
+            return internal_failure_cause(nested);
+        } catch (...) { return "unknown"; }
+    }
+    if (dynamic_cast<const std::bad_alloc*>(&exception) != nullptr) { return "out_of_memory"; }
+    if (const auto* json = dynamic_cast<const nlohmann::json::exception*>(&exception)) {
+        return "json_error_" + std::to_string(json->id);
+    }
+    if (const auto* system = dynamic_cast<const std::system_error*>(&exception)) {
+        return "system_error_" + std::to_string(system->code().value());
+    }
+    if (dynamic_cast<const std::invalid_argument*>(&exception) != nullptr) {
+        return "invalid_argument";
+    }
+    if (dynamic_cast<const std::out_of_range*>(&exception) != nullptr) { return "out_of_range"; }
+    if (dynamic_cast<const std::length_error*>(&exception) != nullptr) { return "length_error"; }
+    if (dynamic_cast<const std::logic_error*>(&exception) != nullptr) { return "logic_error"; }
+    if (dynamic_cast<const ApiException*>(&exception) != nullptr) { return "api_error"; }
+    if (dynamic_cast<const std::runtime_error*>(&exception) != nullptr) { return "runtime_error"; }
+    return "exception";
+}
+
 RequestFailure make_request_failure(RequestFailurePhase phase, const ApiError& error) {
     RequestFailureClass classification = RequestFailureClass::Internal;
     if (error.status == 499 || error.code == "client_disconnected") {
@@ -111,12 +152,24 @@ RequestFailure make_generation_request_failure(const ApiError& error) {
     return failure;
 }
 
-RequestFailure make_internal_request_failure(RequestFailurePhase phase) {
+RequestFailure make_internal_request_failure(RequestFailurePhase phase,
+                                             const std::exception& exception) {
     return RequestFailure{
         .phase          = phase,
         .classification = RequestFailureClass::Internal,
         .http_status    = 500,
         .error_type     = "internal_error",
+        .cause          = internal_failure_cause(exception),
+    };
+}
+
+RequestFailure make_unknown_internal_request_failure(RequestFailurePhase phase) {
+    return RequestFailure{
+        .phase          = phase,
+        .classification = RequestFailureClass::Internal,
+        .http_status    = 500,
+        .error_type     = "internal_error",
+        .cause          = "unknown",
     };
 }
 

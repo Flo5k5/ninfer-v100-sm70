@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -62,6 +63,7 @@ struct RequestRejectionLogContext {
     bool has_tool_history = false;
     std::optional<RequestedReasoningEffort> requested_reasoning_effort;
     ApiError error;
+    std::string cause; // internal rejections only; see internal_failure_cause()
 };
 
 enum class RequestFailurePhase : std::uint8_t {
@@ -85,8 +87,8 @@ enum class RequestFailureClass : std::uint8_t {
 
 // Log-safe failure description shared by the operational and JSONL sinks. It deliberately has no
 // free-text message: API error messages and exception text can quote prompts, generated output,
-// tool arguments, or media locations, so no log record may carry them. Type, code, and parameter
-// are server-defined identifiers; the complete message is returned only to the client.
+// tool arguments, or media locations, so no log record may carry them. Type, code, parameter, and
+// cause are server-defined identifiers; the complete message is returned only to the client.
 struct RequestFailure {
     RequestFailurePhase phase          = RequestFailurePhase::Generation;
     RequestFailureClass classification = RequestFailureClass::Internal;
@@ -94,6 +96,7 @@ struct RequestFailure {
     std::string error_type;
     std::string error_code;
     std::string param;
+    std::string cause; // internal failures only; see internal_failure_cause()
 };
 
 struct ThroughputReport {
@@ -120,10 +123,24 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               const GenerationRequest& request,
                                                               const RequestLogMetadata& metadata,
                                                               ApiError error);
+// A preparation rejection caused by an unexpected exception keeps only its content-free cause.
+RequestRejectionLogContext make_request_rejection_log_context(
+    std::uint64_t id, std::string protocol, const GenerationRequest& request,
+    const RequestLogMetadata& metadata, ApiError error, const std::exception& cause);
+
+// Content-free name of the exception behind an internal failure, derived from its dynamic type and
+// never from what(): `out_of_memory`, `json_error_<id>` for a JSON library exception,
+// `system_error_<code>`, `invalid_argument`, `out_of_range`, `length_error`, `logic_error`,
+// `api_error`, `runtime_error`, or `exception`. An exception that wraps another through
+// std::nested_exception reports the cause of the wrapped one.
+[[nodiscard]] std::string internal_failure_cause(const std::exception& exception);
 
 [[nodiscard]] RequestFailure make_request_failure(RequestFailurePhase phase, const ApiError& error);
 [[nodiscard]] RequestFailure make_generation_request_failure(const ApiError& error);
-[[nodiscard]] RequestFailure make_internal_request_failure(RequestFailurePhase phase);
+[[nodiscard]] RequestFailure make_internal_request_failure(RequestFailurePhase phase,
+                                                           const std::exception& exception);
+// For a caught object that is not a std::exception; its cause is `unknown`.
+[[nodiscard]] RequestFailure make_unknown_internal_request_failure(RequestFailurePhase phase);
 [[nodiscard]] RequestFailure make_client_disconnected_failure(RequestFailurePhase phase);
 
 } // namespace ninfer::serve
