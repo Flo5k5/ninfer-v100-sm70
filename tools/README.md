@@ -21,6 +21,7 @@ selected tool.
 | Compare logits dumps (KLD, top-1, PPL) and gate a quantization | [`kld/kld.py`](kld/kld.py), [runbook](../docs/perplexity.md#runbook) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
+| Check that every `sm_70` target compiles and links | [`v100/build-all-targets.sh`](v100/build-all-targets.sh); [full-build check](../docs/v100.md#full-build-check) |
 
 ## Artifact workflow
 
