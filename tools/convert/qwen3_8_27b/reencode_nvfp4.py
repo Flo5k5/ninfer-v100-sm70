@@ -74,7 +74,7 @@ from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, encode_nvfp4
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
 from tools.artifact.writer import ArtifactWriter
-from tools.convert.common.provenance import input_label, strip_local_paths
+from tools.convert.common.provenance import input_label, local_name, strip_local_paths
 from tools.convert.qwen3_8_27b.graft_single_source import SourceCheckpoint
 from tools.convert.qwen3_8_27b.reencode_nvfp4_numeric import (
     RelativeError,
@@ -229,7 +229,7 @@ def _specs(base: Artifact) -> list:
 def _record(arguments, base: Artifact, targets: Sequence[Target], removed: list[str]) -> dict:
     record = {
         "tool": TOOL,
-        "base": arguments.base.name,
+        "base": local_name(arguments.base),
         "base_artifact_id": base.artifact_id.hex(),
         "donor": {"label": arguments.donor_label},
         "layers": sorted({target.layer for target in targets}),
@@ -286,7 +286,7 @@ def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Enco
         writer.abort()
         raise
     return {
-        "artifact": arguments.out.name,
+        "artifact": local_name(arguments.out),
         "bytes": arguments.out.stat().st_size,
         "recipe": provenance.get("recipe"),
         "reencode_record_sha256": hashlib.sha256(

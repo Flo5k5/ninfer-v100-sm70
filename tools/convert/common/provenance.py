@@ -1,15 +1,18 @@
 """Provenance records that name their inputs without local filesystem paths.
 
-An artifact's directory JSON travels with the artifact. A local path describes one machine (its
-home, scratch or mount directories), not the input, so converters that record provenance name
-their inputs by label or repository id, and remove the path members that an earlier artifact's
-provenance carries before extending it.
+An artifact's directory JSON travels with the artifact, and a converter's side report travels
+with both. A local path describes one machine (its home, scratch or mount directories), not the
+input, so converters name their inputs by label or repository id, record a local file or
+directory by its name (a file with the SHA-256 digest of its contents), and remove the path
+members that an earlier artifact's provenance carries before extending it.
 """
 
 from __future__ import annotations
 
 import argparse
-from pathlib import PureWindowsPath
+import hashlib
+import os
+from pathlib import Path, PureWindowsPath
 
 
 def is_local_path(value: str) -> bool:
@@ -25,6 +28,28 @@ def is_local_path(value: str) -> bool:
         return True
     parts = value.replace("\\", "/").split("/")
     return "." in parts or ".." in parts
+
+
+def local_name(path: str | Path) -> str:
+    """Name to record for a local file or directory: the last component of its absolute path.
+
+    ``.`` and ``..`` components are normalized first, so ``..`` records the name of the directory
+    it denotes rather than ``..`` itself. Normalization is lexical: a symbolic link keeps the name
+    it was given.
+    """
+
+    name = Path(os.path.abspath(path)).name
+    if not name:
+        raise ValueError(f"{os.fspath(path)!r} has no file or directory name to record")
+    return name
+
+
+def file_record(path: str | Path) -> dict[str, str]:
+    """Record of a local input file: its name and the SHA-256 digest of its contents."""
+
+    with Path(path).open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    return {"name": local_name(path), "sha256": digest}
 
 
 def input_label(value: str) -> str:
