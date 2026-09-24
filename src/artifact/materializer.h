@@ -63,8 +63,8 @@ public:
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
-    // Port Volta : la vue modèle v2 référence l'arène des poids pour le reporting mémoire
-    // (capacity / used / peak). Aucune allocation n'y est faite après matérialisation.
+    // Volta port: the v2 model view references the weight arena for memory reporting
+    // (capacity / used / peak). Nothing is allocated from it after materialization.
     [[nodiscard]] DeviceArena& device_arena();
 
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
