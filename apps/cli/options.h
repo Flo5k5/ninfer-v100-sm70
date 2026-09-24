@@ -24,7 +24,9 @@ struct Options {
     std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
 
-    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache                  = KvCacheStorage::BFloat16;
+    TextResidualStorage text_residual        = TextResidualStorage::BFloat16;
+    PrefillAttentionKernel prefill_attention = PrefillAttentionKernel::Automatic;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;

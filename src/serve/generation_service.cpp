@@ -242,6 +242,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
+    engine_options.text_residual            = options_.text_residual;
+    engine_options.prefill_attention        = options_.prefill_attention;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;

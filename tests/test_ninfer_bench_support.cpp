@@ -170,6 +170,27 @@ int test_cli_contract() {
                               "NVFP4 report name");
     failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Fp8KeyNvfp4Value), "k8v4",
                               "K8V4 report name");
+    failures += expect(fp8.text_residual == ninfer::TextResidualStorage::BFloat16 &&
+                           fp8.prefill_attention == ninfer::PrefillAttentionKernel::Automatic,
+                       "numerics defaults");
+    const qb::BenchOptions numerics =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--text-residual", "fp32",
+                        "--prefill-attention", "flash"});
+    failures += expect(numerics.text_residual == ninfer::TextResidualStorage::Float32 &&
+                           numerics.prefill_attention == ninfer::PrefillAttentionKernel::Flash,
+                       "numerics flags");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test(
+                {"ninfer_bench", "--weights", "model.ninfer", "--text-residual", "tf32"});
+        },
+        "unknown text residual");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test(
+                {"ninfer_bench", "--weights", "model.ninfer", "--prefill-attention", "none"});
+        },
+        "unknown prefill attention kernel");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
@@ -286,6 +307,8 @@ qb::BenchEnvironment sample_environment() {
     env.max_context                       = 4096;
     env.prefill_chunk                     = 1024;
     env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
+    env.text_residual                     = ninfer::TextResidualStorage::Float32;
+    env.prefill_attention                 = ninfer::PrefillAttentionKernel::SplitD;
     env.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
     env.speculative.draft_tokens          = 5;
     env.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
@@ -329,6 +352,9 @@ int test_report_contract() {
     failures += expect(report.at("memory").at("cuda_graph_allowance_bytes") == 150000000ULL,
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
+    failures += expect(report.at("config").at("text_residual") == "fp32" &&
+                           report.at("config").at("prefill_attention") == "splitd",
+                       "numerics config");
     failures += expect(report.at("config").at("speculative_backend") == "mtp", "spec backend");
     failures += expect(report.at("config").at("draft_tokens") == 5, "spec draft tokens");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
