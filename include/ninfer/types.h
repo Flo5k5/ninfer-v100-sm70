@@ -75,11 +75,42 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash2,
 };
 
+// MTP context lookup proposes the continuation of an earlier occurrence of the current suffix and
+// verifies it in a wider target block. The target still verifies every token; the policy decides
+// only when a round widens (on sm_70 a greedy near tie can resolve differently at another width).
+enum class ContextLookupPolicy : std::uint8_t {
+    Off,      // learned MTP drafts only; no lookup verification frame is planned
+    Fixed,    // widen whenever the last min_suffix tokens recur and agree with the MTP drafts
+    Adaptive, // per-request suffix thresholds, split by tool-call region, tuned by outcomes
+};
+
+inline constexpr std::uint32_t kContextLookupMinimumSuffix   = 2;
+inline constexpr std::uint32_t kContextLookupMaximumSuffix   = 64;
+inline constexpr std::uint32_t kContextLookupMaximumProposal = 15;
+// Adaptive lookup enters a copy with this narrower verification when it lies strictly between the
+// MTP draft window and max_proposal: eight query columns stay on the attention route of the
+// learned-draft window, and cost a fraction of the full lookup width.
+inline constexpr std::uint32_t kContextLookupEntryProposal = 7;
+
+struct ContextLookupOptions {
+    ContextLookupPolicy policy = ContextLookupPolicy::Fixed;
+    // Fixed: the exact suffix that must recur. Adaptive: the floor of the per-request suffix
+    // thresholds. Tool-call arguments start at it, other text starts at 16 (or the floor if
+    // higher) and moves toward it after rounds that pay; it also resumes an interrupted copy.
+    std::uint32_t min_suffix = 16;
+    // Copied tokens verified per lookup round; startup-fixed because it sets the verification
+    // width. It must exceed the MTP draft window.
+    std::uint32_t max_proposal = kContextLookupMaximumProposal;
+};
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
-    // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
+    // Startup-fixed K: MTP 1..7; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Applies to MTP only; other backends ignore it. With Off, min_suffix and max_proposal are
+    // unused and not validated.
+    ContextLookupOptions context_lookup;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -690,6 +721,15 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    // MTP rounds that verified a copied context continuation; a subset of `rounds`. Entry rounds
+    // are the subset verified by the narrower adaptive entry tier.
+    std::uint64_t lookup_rounds          = 0;
+    std::uint64_t lookup_entry_rounds    = 0;
+    std::uint64_t lookup_drafted_tokens  = 0;
+    std::uint64_t lookup_accepted_tokens = 0;
+    // Submit-to-completion wall time of MTP rounds with and without a copied continuation.
+    double lookup_round_seconds = 0.0;
+    double mtp_round_seconds    = 0.0;
 };
 
 struct ThinkingBudgetStats {

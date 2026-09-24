@@ -39,6 +39,17 @@ void validate_spec(const RoundStateSpec& spec) {
         throw std::invalid_argument(
             "RoundState DFlash draft window exceeds the decode frame domain");
     }
+    if (spec.lookup_window != 0 &&
+        (spec.backend != SpeculativeBackend::Mtp || spec.lookup_window <= spec.draft_window ||
+         spec.lookup_window > kMtpLookupMaximumDrafts)) {
+        throw std::invalid_argument(
+            "RoundState MTP lookup window must exceed the draft window within the lookup domain");
+    }
+    if (spec.lookup_entry_window != 0 && (spec.lookup_entry_window <= spec.draft_window ||
+                                          spec.lookup_entry_window >= spec.lookup_window)) {
+        throw std::invalid_argument(
+            "RoundState MTP lookup entry window must lie between the draft and lookup windows");
+    }
     if (spec.batch_capacity == 0 || spec.batch_capacity > kMaximumConcurrency) {
         throw std::invalid_argument("RoundState batch capacity must be in [1,8]");
     }
@@ -169,9 +180,16 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                 add_tensor(builder, DType::I32, {batch, ar_steps}, prefix);
         };
         add_decode(layout.mtp_decode.emplace(), columns, "MTP decode frame");
-        add_decode(layout.mtp_lookup_decode.emplace(),
-                   static_cast<std::int32_t>(kMtpLookupMaximumWidth),
-                   "MTP lookup decode frame");
+        if (layout.spec.lookup_window != 0) {
+            add_decode(layout.mtp_lookup_decode.emplace(),
+                       static_cast<std::int32_t>(layout.spec.lookup_window + 1U),
+                       "MTP lookup decode frame");
+        }
+        if (layout.spec.lookup_entry_window != 0) {
+            add_decode(layout.mtp_lookup_entry_decode.emplace(),
+                       static_cast<std::int32_t>(layout.spec.lookup_entry_window + 1U),
+                       "MTP lookup entry decode frame");
+        }
     }
     if (is_masked_draft_backend(layout.spec.backend)) {
         layout.dflash_prefill.emplace().produced_count = i32(1, "DFlash prefill produced count");
@@ -388,7 +406,12 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     }
     if (layout.mtp_lookup_decode) {
         mtp_lookup_decode.emplace(backing, *layout.mtp_lookup_decode, layout.spec.batch_capacity,
-                                  kMtpLookupMaximumDrafts, layout.spec.draft_window);
+                                  layout.spec.lookup_window, layout.spec.draft_window);
+    }
+    if (layout.mtp_lookup_entry_decode) {
+        mtp_lookup_entry_decode.emplace(backing, *layout.mtp_lookup_entry_decode,
+                                        layout.spec.batch_capacity, layout.spec.lookup_entry_window,
+                                        layout.spec.draft_window);
     }
     if (layout.dflash_decode) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,

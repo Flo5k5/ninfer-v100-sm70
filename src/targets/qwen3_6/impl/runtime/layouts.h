@@ -7,6 +7,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "targets/qwen3_6/impl/runtime/context_lookup.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/state_image.h>
@@ -38,6 +39,7 @@ struct PersistentLayout {
     qwen3_6::StateImageDeviceLayout state_images;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<GdnReplayRecordLayout> mtp_lookup_replay_records;
+    std::optional<GdnReplayRecordLayout> mtp_lookup_entry_replay_records;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
@@ -79,6 +81,7 @@ struct SequencePlanningInputs {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
+    ContextLookupOptions context_lookup;
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
@@ -102,6 +105,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
+    ContextLookupOptions context_lookup;
+    // MTP verification frames derived from the backend, draft window and lookup options.
+    ContextLookupPlan lookup;
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;

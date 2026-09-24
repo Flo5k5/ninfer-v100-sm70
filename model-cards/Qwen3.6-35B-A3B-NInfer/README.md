@@ -133,7 +133,7 @@ For DFlash, the measured block-8 configuration uses seven draft tokens:
   --lm-head-draft
 ```
 
-`--draft-tokens` accepts `1..5` for MTP and `1..15` for DFlash. The DFlash value `7` is the
+`--draft-tokens` accepts `1..7` for MTP and `1..15` for DFlash. The DFlash value `7` is the
 measured block-length-eight profile; `15` uses the companion's full native 16-position block. MTP
 and DFlash are mutually exclusive backend selections. DFlash may be combined with `--vision` for
 image or video prompts; it accelerates generated-text decode, not Vision encode or target prefill.

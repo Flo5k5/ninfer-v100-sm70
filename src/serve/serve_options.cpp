@@ -80,6 +80,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--no-response-store] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--lookup-policy off|fixed|adaptive] [--lookup-min-suffix N] "
+           "[--lookup-max-proposal N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--default-reasoning-effort LEVEL] [--reasoning-effort-alias FROM=TO] "
            "[--omitted-thinking-as-summarized] "
@@ -124,7 +126,20 @@ std::string serve_usage_text(const char* argv0) {
            "visible Thinking instead of rejecting it\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --lookup-policy selects MTP context lookup (default fixed): a round verifies up "
+           "to\n"
+           "       --lookup-max-proposal tokens (default 15) copied from an earlier occurrence of "
+           "the current\n"
+           "       suffix. fixed needs --lookup-min-suffix recurring tokens (default 16). adaptive "
+           "starts\n"
+           "       tool-call arguments at that suffix and other text at 16 (or the suffix if "
+           "higher), moves\n"
+           "       both toward it after paying rounds, resumes interrupted copies from it, and "
+           "enters copies\n"
+           "       with 7 tokens when --draft-tokens < 7 < --lookup-max-proposal (one more MTP "
+           "graph family).\n"
+           "       off plans no lookup.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -144,6 +159,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool kv_capacity_explicit             = false;
     bool context_capacity_explicit        = false;
     bool response_store_capacity_explicit = false;
+    product::ContextLookupFlags lookup_flags;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -285,6 +301,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--lookup-policy") {
+            options.speculative.context_lookup.policy =
+                product::parse_context_lookup_policy(require_value("--lookup-policy"));
+            lookup_flags.policy = true;
+        } else if (arg == "--lookup-min-suffix") {
+            options.speculative.context_lookup.min_suffix = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lookup-min-suffix"), "lookup-min-suffix"));
+            lookup_flags.min_suffix = true;
+        } else if (arg == "--lookup-max-proposal") {
+            options.speculative.context_lookup.max_proposal =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--lookup-max-proposal"), "lookup-max-proposal"));
+            lookup_flags.max_proposal = true;
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
@@ -406,7 +435,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
-    product::validate_speculative_cli_options(options.speculative);
+    product::validate_speculative_cli_options(options.speculative, lookup_flags);
     if (options.api_key.empty()) {
         // Process arguments are world-readable through /proc; the environment is not.
         if (const char* key = std::getenv("NINFER_API_KEY"); key != nullptr) {

@@ -14,6 +14,10 @@
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::size_t kTokenDomain = 248077;
+// Tool-call delimiters of the registered tokenizer; the MTP context-lookup policy uses them to
+// recognize tool-call arguments in generated text.
+inline constexpr TokenId kToolCallOpenToken  = 248058;
+inline constexpr TokenId kToolCallCloseToken = 248059;
 
 struct FrontendOptions {
     bool vision_enabled                    = true;

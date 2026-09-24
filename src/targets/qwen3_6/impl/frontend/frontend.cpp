@@ -59,6 +59,11 @@ constexpr std::array<std::pair<std::string_view, TokenId>, 4> kVisionSpecialToke
     {"<|video_pad|>", 248057},
 }};
 
+constexpr std::array<std::pair<std::string_view, TokenId>, 2> kToolCallTokens = {{
+    {"<tool_call>", kToolCallOpenToken},
+    {"</tool_call>", kToolCallCloseToken},
+}};
+
 constexpr std::array<std::pair<std::string_view, TokenId>, 7> kConfigOnlyTokens = {{
     {"<|audio_start|>", 248070},
     {"<|audio_end|>", 248071},
@@ -270,6 +275,13 @@ void validate_registered_tokenizer(const fi::Tokenizer& tokenizer) {
         if (encoded.size() != 1 || encoded.front() != expected) {
             throw std::invalid_argument("artifact tokenizer does not match registered Vision token "
                                         "IDs");
+        }
+    }
+    for (const auto& [text, expected] : kToolCallTokens) {
+        const std::vector<int> encoded = tokenizer.encode(text);
+        if (encoded.size() != 1 || encoded.front() != expected) {
+            throw std::invalid_argument(
+                "artifact tokenizer does not match registered tool-call token IDs");
         }
     }
     for (const auto& [text, expected] : kConfigOnlyTokens) {

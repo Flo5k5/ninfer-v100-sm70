@@ -7,6 +7,7 @@
 
 #include "ninfer/engine.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
@@ -222,6 +223,25 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                 positions << speculative.accepted_per_position[i];
             }
             print_metric(backend + " accepted by pos", positions.str());
+        }
+        if (speculative.lookup_rounds != 0) {
+            print_metric("lookup rounds", std::to_string(speculative.lookup_rounds) + " (" +
+                                              std::to_string(speculative.lookup_entry_rounds) +
+                                              " entry)");
+            print_metric("lookup accepted tokens",
+                         std::to_string(speculative.lookup_accepted_tokens) + "/" +
+                             std::to_string(speculative.lookup_drafted_tokens));
+            std::ostringstream round_ms;
+            round_ms << std::fixed << std::setprecision(2)
+                     << 1000.0 * speculative.lookup_round_seconds /
+                            static_cast<double>(speculative.lookup_rounds)
+                     << " ms lookup, "
+                     << 1000.0 * speculative.mtp_round_seconds /
+                            static_cast<double>(std::max<std::uint64_t>(
+                                1, speculative.rounds + speculative.fallback_steps -
+                                       speculative.lookup_rounds))
+                     << " ms draft";
+            print_metric("round time", round_ms.str());
         }
     }
 }

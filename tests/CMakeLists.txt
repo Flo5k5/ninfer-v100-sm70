@@ -100,7 +100,8 @@ ninfer_add_test(ninfer_perplexity_preflight_test
 target_include_directories(ninfer_perplexity_preflight_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/perplexity)
 ninfer_add_test(ninfer_cli_options_test
-  SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
+  SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
+  LIBRARIES ninfer_product_logging)
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
@@ -127,6 +128,8 @@ ninfer_add_test(ninfer_qwen3_6_frontend_test
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+ninfer_add_test(ninfer_qwen3_6_context_lookup_test
+  SOURCES targets/qwen3_6/test_context_lookup.cpp)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -161,6 +164,10 @@ ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
   SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_score_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_context_lookup_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_context_lookup_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_context_lookup_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR

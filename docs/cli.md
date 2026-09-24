@@ -205,8 +205,11 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
+| `--draft-tokens N` | MTP `1..7`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--lookup-policy off\|fixed\|adaptive` | MTP context lookup, requires `--spec mtp`; see [V100 context lookup](v100.md#context-lookup-mtp) | `fixed` |
+| `--lookup-min-suffix N` | `2..64`, requires `fixed` or `adaptive`; fixed: recurring suffix length; adaptive: floor of the per-request suffix thresholds (tool-call arguments start at it, other text starts at 16, or at N if higher, and moves toward it after paying rounds) and the suffix that resumes an interrupted copy | `16` |
+| `--lookup-max-proposal N` | copied tokens verified per lookup round, above the MTP window and at most `15`, requires `fixed` or `adaptive`; adaptive also plans a 7-token entry tier (one more MTP graph family) when `--draft-tokens` < 7 < N | `15` |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
