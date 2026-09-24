@@ -35,7 +35,8 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
                                              std::string_view api_key) noexcept;
 
 // The Responses store a server built from these options uses. --no-response-store selects the
-// disabled store, which is what guarantees that no Responses content outlives its request.
+// disabled store, so no Response object, input Item, or continuation context is ever retained. It
+// does not affect the Engine prefix cache or the media cache.
 [[nodiscard]] OpenAIResponsesStore make_openai_responses_store(const ServeOptions& options);
 
 // Request limits of the Responses Create and input-token endpoints of a server built from these
