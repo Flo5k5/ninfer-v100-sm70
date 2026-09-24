@@ -1092,9 +1092,12 @@ int test_official_resource_guards() {
     nlohmann::json mismatched_config   = nlohmann::json::parse(mismatched.tokenizer_config_json);
     mismatched_config["chat_template"] = reasoning_effort_template_source();
     mismatched.tokenizer_config_json   = mismatched_config.dump();
-    failures +=
-        check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(mismatched); }),
-              "different standalone and tokenizer-config chat templates were accepted");
+    // v3 artifacts ship an NInfer-modified chat_template.jinja while tokenizer_config.json
+    // keeps the stock template as the fallback source: a mismatch is legitimate (the standalone
+    // resource wins at compile time), so the old equal-templates guard is gone by design.
+    failures += check(
+        !throws_invalid_argument([&] { (void)FrontendFactory::create_component(mismatched); }),
+        "a different tokenizer-config chat template was rejected");
 
     FrontendResources unknown = resources("{{ messages }}");
     failures +=
