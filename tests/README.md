@@ -47,6 +47,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v14 reports;
 - `test_bench_matrix.py` — schema-v14 report consumption by the Python matrix summarizer;
 - `test_serve_corpus.py` — current serving request-log identity at the measurement consumer;
+- `test_artifact_typed_binding.cpp` — resolution of the fused Qwen3.6-35B-A3B MoE parents that the
+  Volta binder requests by v2 name onto the v3 logical parameters that cover them, and rejection
+  of a v3 layout whose parameters are out of v2 row order, incomplete, or a partial slice;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.
