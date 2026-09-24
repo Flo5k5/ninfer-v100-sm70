@@ -11,6 +11,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -276,7 +277,8 @@ int main() {
     prepared.preparation.built_patch_bytes             = 49152;
 
     const RequestLogMetadata metadata{
-        .model                             = "qwen3.6-27b",
+        .served_model                      = "qwen3.6-27b",
+        .requested_model                   = "qwen3.6-27b",
         .stream                            = false,
         .output_tokens_explicit            = true,
         .preserve_thinking_semantic_change = true,
@@ -299,6 +301,9 @@ int main() {
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
+    failures += check(started.at("request").at("model") == "qwen3.6-27b" &&
+                          started.at("request").at("requested_model") == "qwen3.6-27b",
+                      "served model or requested model alias missing from start record");
     failures += check(started.at("request").at("requested_output_tokens") == 4096,
                       "request output budget missing");
     failures += check(started.at("request").at("enable_thinking") == true,
@@ -576,6 +581,57 @@ int main() {
                               std::string::npos,
                       "client disconnect is not an informational cancellation");
 
+    // Anthropic accepts any non-empty model string, so the client's value is logged only when it
+    // has the shape of a model identifier; the served model ID is always recorded.
+    failures += check(
+        log_safe_model_alias("claude-sonnet-4-5@20250929") == "claude-sonnet-4-5@20250929" &&
+            log_safe_model_alias("us.anthropic.claude-3-7-sonnet-20250219-v1:0") ==
+                "us.anthropic.claude-3-7-sonnet-20250219-v1:0" &&
+            log_safe_model_alias("anthropic/claude_opus-4.1") == "anthropic/claude_opus-4.1" &&
+            log_safe_model_alias(std::string(128, 'a')) == std::string(128, 'a'),
+        "identifier-shaped model aliases were not kept");
+    failures += check(log_safe_model_alias("") == "other" &&
+                          log_safe_model_alias(std::string(129, 'a')) == "other" &&
+                          log_safe_model_alias("claude sonnet") == "other" &&
+                          log_safe_model_alias("claude\nsecond-record") == "other" &&
+                          log_safe_model_alias("mod\xC3\xA8le") == "other" &&
+                          log_safe_model_alias("model\"}") == "other",
+                      "a model value that is not an identifier was logged");
+
+    const std::string model_sentinel = "sentinel-model-value: summarize my private notes";
+    const std::string oversized_model(1U << 20U, 'm');
+    for (const std::string& requested_model : {model_sentinel, oversized_model}) {
+        const RequestLogMetadata anthropic_metadata{
+            .served_model = "qwen3.6-27b", .requested_model = requested_model, .stream = true};
+        const RequestLogContext anthropic_context = make_request_log_context(
+            9, "anthropic_messages", request, anthropic_metadata, prepared);
+        const RequestRejectionLogContext anthropic_rejection = make_request_rejection_log_context(
+            10, "anthropic_messages", request, anthropic_metadata, preparation_error);
+        const std::vector<std::string> records{
+            format_request_start_json("serve-test", 4100, anthropic_context),
+            format_request_done_json("serve-test", 4101, anthropic_context, outcome),
+            format_request_error_json("serve-test", 4102, anthropic_context, media_failure),
+            format_request_rejected_json("serve-test", 4103, anthropic_rejection),
+        };
+        for (const std::string& record : records) {
+            const Json parsed = Json::parse(record);
+            failures += check(parsed.at("request").at("model") == "qwen3.6-27b" &&
+                                  parsed.at("request").at("requested_model") == "other",
+                              "free-text Anthropic model was not replaced by its alias");
+            failures += check(record.find("sentinel-model-value") == std::string::npos &&
+                                  record.size() < 16384,
+                              "a request record retained the client's model value");
+        }
+    }
+    const RequestLogMetadata aliased_metadata{.served_model    = "qwen3.6-27b",
+                                              .requested_model = "claude-sonnet-4-5"};
+    const Json aliased = Json::parse(format_request_start_json(
+        "serve-test", 4104,
+        make_request_log_context(11, "anthropic_messages", request, aliased_metadata, prepared)));
+    failures += check(aliased.at("request").at("model") == "qwen3.6-27b" &&
+                          aliased.at("request").at("requested_model") == "claude-sonnet-4-5",
+                      "identifier-shaped Anthropic model alias was not logged");
+
     ThroughputReport throughput;
     throughput.interval_seconds                         = 2.0;
     throughput.computed_prefill_tokens                  = 100;
@@ -704,6 +760,10 @@ int main() {
         ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
          ".jsonl");
     std::filesystem::remove(log_path);
+    const RequestLogMetadata free_text_model_metadata{.served_model    = "qwen3.6-27b",
+                                                      .requested_model = model_sentinel};
+    const RequestLogContext free_text_model_context = make_request_log_context(
+        12, "anthropic_messages", request, free_text_model_metadata, prepared);
     {
         JsonlRequestLog writer(log_path.string());
         writer.write_request_start(context);
@@ -712,31 +772,30 @@ int main() {
         JsonlRequestLog writer(log_path.string());
         writer.write_request_rejected(rejected_context);
         writer.write_request_error(context, media_failure);
+        writer.write_request_start(free_text_model_context);
+        writer.write_request_done(free_text_model_context, outcome);
     }
     std::ifstream input(log_path);
-    std::string first_line;
-    std::string second_line;
-    std::string third_line;
-    std::string extra_line;
-    std::getline(input, first_line);
-    std::getline(input, second_line);
-    std::getline(input, third_line);
-    std::getline(input, extra_line);
-    failures += check(!first_line.empty() && !second_line.empty() && !third_line.empty() &&
-                          extra_line.empty(),
-                      "JSONL writer did not append exactly one flushed line per event");
-    if (!first_line.empty() && !second_line.empty() && !third_line.empty()) {
-        failures += check(Json::parse(first_line).at("event") == "request_start",
-                          "first appended event mismatch");
-        failures += check(Json::parse(second_line).at("event") == "request_rejected",
-                          "second appended event mismatch");
-        failures += check(Json::parse(third_line).at("event") == "request_error",
-                          "third appended event mismatch");
-        failures += check((first_line + second_line + third_line).find("sentinel-client-value") ==
-                              std::string::npos,
-                          "JSONL file retained a client-facing error message");
+    std::vector<std::string> lines;
+    std::string file_contents;
+    for (std::string line; std::getline(input, line);) {
+        file_contents += line;
+        lines.push_back(std::move(line));
     }
     input.close();
+    const std::vector<std::string> expected_events{
+        "request_start", "request_rejected", "request_error", "request_start", "request_done"};
+    bool events_match = lines.size() == expected_events.size();
+    for (std::size_t index = 0; events_match && index < lines.size(); ++index) {
+        events_match = !lines[index].empty() &&
+                       Json::parse(lines[index]).at("event") == expected_events[index];
+    }
+    failures +=
+        check(events_match, "JSONL writer did not append exactly one flushed line per event");
+    failures += check(file_contents.find("sentinel-client-value") == std::string::npos,
+                      "JSONL file retained a client-facing error message");
+    failures += check(file_contents.find("sentinel-model-value") == std::string::npos,
+                      "JSONL file retained a free-text client model value");
     std::filesystem::remove(log_path);
 
     if (failures == 0) { std::cout << "ok\n"; }

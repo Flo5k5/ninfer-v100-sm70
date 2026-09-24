@@ -100,7 +100,11 @@ and HTTP records must not contain:
 - prompt text, generated content, reasoning text, tool arguments/results, or prior conversation;
 - raw image, video, audio, tokenizer, tensor, StateImage, or KV payloads;
 - request bodies or arbitrary client-controlled headers;
-- full data URLs or unredacted query strings.
+- full data URLs or unredacted query strings;
+- a client-chosen model name that is not an identifier. Request records carry the served model ID
+  and `log_safe_model_alias()` of the client's `model`: at most 128 characters from
+  `[A-Za-z0-9._:@/-]`, otherwise `other`. This shape filter keeps free text and oversized values
+  out; a value of that shape is logged as sent.
 
 Filesystem paths are permitted only when they are operator-selected local configuration or output
 paths and are necessary to diagnose the operation. A component that cannot prove a resident-service
