@@ -109,7 +109,7 @@ Run the native Python suites with the project Python environment:
 ```bash
 python3 -m pytest \
   tests/artifact tests/convert \
-  tests/test_bench_matrix.py tests/test_serve_corpus.py
+  tests/test_bench_matrix.py tests/test_serve_corpus.py tests/test_context_lookup_bench.py
 ```
 
 The Python suites cover generic artifact framing and exact converter inventories, source recipes,
