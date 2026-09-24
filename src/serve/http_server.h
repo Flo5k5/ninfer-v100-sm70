@@ -38,6 +38,12 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 // disabled store, which is what guarantees that no Responses content outlives its request.
 [[nodiscard]] OpenAIResponsesStore make_openai_responses_store(const ServeOptions& options);
 
+// Request limits of the Responses Create and input-token endpoints of a server built from these
+// options over `store`. Without a store, an omitted `store` field means false and `store: true` is
+// rejected before generation.
+[[nodiscard]] RequestLimits make_openai_responses_request_limits(const ServeOptions& options,
+                                                                 const OpenAIResponsesStore& store);
+
 class HttpServer {
 public:
     HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);

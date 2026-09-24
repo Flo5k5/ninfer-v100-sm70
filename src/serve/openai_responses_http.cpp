@@ -238,15 +238,22 @@ Json paginated_input_items(const httplib::Request& request, const std::vector<Js
 
 } // namespace
 
+RequestLimits make_openai_responses_request_limits(const ServeOptions& options,
+                                                   const OpenAIResponsesStore& store) {
+    RequestLimits limits;
+    limits.default_max_tokens     = options.default_max_tokens;
+    limits.response_store_enabled = store.enabled();
+    return limits;
+}
+
 void HttpServer::handle_responses(const httplib::Request& req, httplib::Response& res) {
     OpenAIResponsesCreateRequest request;
     OpenAIResponsesResolvedPrompt resolved;
     const std::string id = new_openai_response_id();
     try {
-        RequestLimits limits;
-        limits.default_max_tokens     = options_.default_max_tokens;
-        limits.response_store_enabled = openai_responses_store_.enabled();
-        request = parse_openai_responses_create_request(parse_json_body(req), limits);
+        request = parse_openai_responses_create_request(
+            parse_json_body(req),
+            make_openai_responses_request_limits(options_, openai_responses_store_));
         validate_openai_model(request.prompt.model, public_model_id_);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
@@ -513,10 +520,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
 void HttpServer::handle_response_input_tokens(const httplib::Request& req, httplib::Response& res) {
     try {
-        RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
-        OpenAIResponsesPromptRequest request =
-            parse_openai_responses_input_tokens_request(parse_json_body(req), limits);
+        OpenAIResponsesPromptRequest request = parse_openai_responses_input_tokens_request(
+            parse_json_body(req),
+            make_openai_responses_request_limits(options_, openai_responses_store_));
         validate_openai_model(request.model, public_model_id_);
         OpenAIResponsesResolvedPrompt resolved =
             resolve_openai_responses_prompt(request, openai_responses_store_, std::nullopt, false);

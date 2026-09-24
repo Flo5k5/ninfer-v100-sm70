@@ -71,7 +71,7 @@ artifacts. See [`tools/bench/ttft/README.md`](bench/ttft/README.md).
 
 ## Serving smoke
 
-After starting `ninfer-serve` in another terminal:
+After starting `ninfer-serve --vision` in another terminal:
 
 ```bash
 python3 -m tools.smoke.serve_contract \
@@ -80,7 +80,11 @@ python3 -m tools.smoke.serve_contract \
 ```
 
 The client exercises OpenAI, Anthropic, streaming, usage, multimodal, and tool-call response
-surfaces against the resident process.
+surfaces against the resident process. Pass `--no-response-store` when the server runs with that
+option: the client then requires Responses to be served but never stored, continued, retrieved,
+listed, cancelled, or deleted. Pass `--no-vision` for a server started without `--vision`; media
+requests must then fail with `vision_disabled`. For a server with an API key, export the key as
+`NINFER_API_KEY`; the client sends it as a Bearer token.
 
 For typed rewrite-checkpoint and thinking-history behavior, the managed smoke script launches a
 real server and consumes the repository fixture:
