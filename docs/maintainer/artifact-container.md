@@ -13,8 +13,8 @@ The Volta binder still addresses the version-2 object names and `(model_id, weig
 below through its v2-to-v3 shim (`src/artifact/typed_binding.cpp`, `Reader::identity`), so they
 remain the contract its bindings check. `Reader::identity` derives the identity from the v3
 metadata name and the official recipe name. The shim cannot yet resolve the Qwen3.6-35B-A3B MoE
-expert weights; the [weight conversion guide](../weight-conversion.md#what-this-port-runs) lists
-what loads. The framing and directory sections describe the version-2 file format that v3 replaced.
+expert weights; the README's [Models](../../README.md#models) section says which artifacts load on
+this port. The framing and directory sections describe the version-2 file format that v3 replaced.
 
 ## 1. Format overview
 

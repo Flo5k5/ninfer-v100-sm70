@@ -15,8 +15,7 @@ counts, and identities below describe the version-2 layout, which the Volta bind
 addresses: its v2-to-v3 shim (`src/artifact/typed_binding.cpp`) resolves each name to the v3
 object that its logical bindings cover, and derives the identity from the v3 metadata name and
 recipe. The source transforms and payload encodings below remain the contract of both artifacts.
-The [weight conversion guide](../weight-conversion.md#what-this-port-runs) lists which of them
-load on this port.
+The README's [Models](../../README.md#models) section says which of them load on this port.
 
 ## 1. Artifact identity and contents
 
