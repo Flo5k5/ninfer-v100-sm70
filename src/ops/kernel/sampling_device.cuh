@@ -315,11 +315,20 @@ __device__ inline void sampling_sort_tile_desc(float* vals, int* idxs) {
     }
 }
 
+// Candidates arrive sorted by descending adjusted logit. A candidate of zero weight (a logit of
+// minus infinity written by a token mask, or an exponent underflow) ends the support whatever the
+// filters: the inverse-CDF draws fall back to the last support entry when rounding leaves the
+// uniform past the accumulated mass, and that entry must carry probability. A row whose best
+// candidate is minus infinity has no weight at all; it keeps its first candidate as a one-point
+// support rather than normalizing NaN weights.
 __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, float* cand_val,
                                                   int* cand_idx, float* prob, int* n_support,
                                                   int n) {
     const int tid = threadIdx.x;
-    if (tid == 0) {
+    if (tid == 0 && !(cand_val[0] > -CUDART_INF_F)) {
+        prob[0]    = 1.0f;
+        *n_support = 1;
+    } else if (tid == 0) {
         const float inv_temp = 1.0f / cfg.temperature;
         const float m        = cand_val[0] * inv_temp;
         float sum            = 0.0f;
@@ -335,6 +344,7 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
         float cum                = 0.0f;
         int support              = 0;
         for (int j = 0; j < n; ++j) {
+            if (!(prob[j] > 0.0f)) { break; }
             if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
             cum += prob[j];
             support = j + 1;
