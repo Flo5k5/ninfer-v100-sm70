@@ -18,11 +18,11 @@ import torch
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import TensorObject
 from tools.convert.qwen3_8_27b.graft_single_source import SourceCheckpoint
-from tools.convert.qwen3_8_27b.inventory_nvfp4 import MODEL_ID
 from tools.convert.qwen3_8_27b.reencode_nvfp4_numeric import divisor_word, reciprocal_divisor
 
 
 NVFP4_FORMAT = "nvfp4"
+BASE_NAME = "qwen3.8-27b"
 BASE_RECIPE = "qwen3_8_27b_nvfp4"
 UNQUANTIZED_DTYPES = ("BF16", "F16", "F32")
 # Tensor suffixes per donor layout: packed codes, E4M3 block scales, FP32 tensor scale.
@@ -122,8 +122,8 @@ def check_base(base: Artifact) -> None:
 
     name = base.directory.metadata.get("name")
     recipe = base.directory.provenance.get("recipe")
-    if name != MODEL_ID or recipe != BASE_RECIPE:
-        raise ReencodeError(f"base is {name}/{recipe}, expected {MODEL_ID}/{BASE_RECIPE}")
+    if name != BASE_NAME or recipe != BASE_RECIPE:
+        raise ReencodeError(f"base is {name}/{recipe}, expected {BASE_NAME}/{BASE_RECIPE}")
     if "reencode" in base.directory.provenance:
         raise ReencodeError("base is already re-encoded; start from the original artifact")
 

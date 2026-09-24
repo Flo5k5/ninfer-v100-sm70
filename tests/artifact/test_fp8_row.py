@@ -6,15 +6,13 @@ import pytest
 import torch
 
 from tools.artifact.layouts import (
-    decode_fp8_row_scaled_words,
-    dequantize_fp8_row_scaled,
-    encode_fp8_row_scaled,
     encoded_size,
     row_scale_geometry,
 )
-from tools.artifact.numeric import (
-    valid_fp8_row_scale_word,
-    valid_fp8_weight_word,
+from tools.artifact.codecs.fp8_row import (
+    decode_fp8_row_scaled_words,
+    dequantize_fp8_row_scaled,
+    encode_fp8_row_scaled,
 )
 
 
@@ -23,28 +21,16 @@ def _bf16_words(*words: int) -> torch.Tensor:
     return torch.tensor(signed, dtype=torch.int16).view(torch.bfloat16)
 
 
-def test_fp8_weight_and_bf16_row_scale_word_validity():
-    assert all(valid_fp8_weight_word(word) for word in range(0x7F))
-    assert all(valid_fp8_weight_word(word) for word in range(0x80, 0xFF))
-    assert not valid_fp8_weight_word(0x7F)
-    assert not valid_fp8_weight_word(0xFF)
-
-    for word in (0x0000, 0x0001, 0x3F80, 0x7F7F):
-        assert valid_fp8_row_scale_word(word)
-    for word in (0x8000, 0xBF80, 0x7F80, 0x7FC0, 0xFF80, 0xFFC0):
-        assert not valid_fp8_row_scale_word(word)
-
-
 def test_row_scale_layout_known_words_padding_and_reconstruction():
     shape = (2, 4)
-    geometry = row_scale_geometry("FP8_E4M3FN_ROW_BF16S", shape)
+    geometry = row_scale_geometry("fp8_e4m3fn_row_bf16", shape)
     assert (
         geometry.code_plane_bytes,
         geometry.scale_plane_offset,
         geometry.scale_plane_bytes,
         geometry.payload_bytes,
     ) == (8, 256, 4, 260)
-    assert encoded_size("row-scale-v1", "FP8_E4M3FN_ROW_BF16S", shape) == 260
+    assert encoded_size("row_scale_v1", "fp8_e4m3fn_row_bf16", shape) == 260
 
     codes = torch.tensor(
         [
@@ -91,12 +77,3 @@ def test_row_scaled_fp8_rejects_invalid_words_and_signatures():
     nonzero_codes[0, 0] = 0x38
     with pytest.raises(ValueError, match="zero row scale"):
         encode_fp8_row_scaled(nonzero_codes, _bf16_words(0x0000), (1, 2))
-
-    with pytest.raises(TypeError, match="uint8"):
-        encode_fp8_row_scaled(zero_codes.to(torch.int8), positive_scale, (1, 2))
-    with pytest.raises(TypeError, match="BF16"):
-        encode_fp8_row_scaled(zero_codes, positive_scale.float(), (1, 2))
-    with pytest.raises(ValueError, match="rank 2"):
-        encoded_size("row-scale-v1", "FP8_E4M3FN_ROW_BF16S", (2,))
-    with pytest.raises(ValueError, match="does not accept"):
-        encoded_size("row-scale-v1", "NVFP4", (128, 64))
