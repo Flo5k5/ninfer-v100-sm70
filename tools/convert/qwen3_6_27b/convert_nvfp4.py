@@ -25,6 +25,7 @@ from tools.artifact.layouts import (
     encode_direct,
     encode_nvfp4,
 )
+from tools.convert.common import provenance
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
@@ -278,11 +279,11 @@ def _materialize_base_tensor(
     return tensor
 
 
-def _build_report(
+def build_conversion_report(
     *,
     preflight: ConversionPreflight,
     output: Path,
-    arguments: Mapping[str, object],
+    requested_device: str,
     objects: Sequence[ArtifactObject],
     elapsed_seconds: float,
     final_bytes: int,
@@ -294,9 +295,25 @@ def _build_report(
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
-        model_dir=preflight.base_dir,
+        sources={
+            "base": {
+                "repository": recipe.BASE_REPOSITORY,
+                "revision": recipe.BASE_REVISION,
+                "name": provenance.local_name(preflight.base_dir),
+            },
+            "nvfp4": {
+                "repository": recipe.NVFP4_REPOSITORY,
+                "revision": recipe.NVFP4_REVISION,
+                "name": provenance.local_name(preflight.nvfp4_dir),
+            },
+        },
         out_path=output,
-        arguments=arguments,
+        arguments={
+            "model": provenance.local_name(preflight.base_dir),
+            "nvfp4_model": provenance.local_name(preflight.nvfp4_dir),
+            "out": provenance.local_name(output),
+            "device": requested_device,
+        },
         config_summary=preflight.config_summary,
         source_preflight=preflight.base_source,
         objects=objects,
@@ -305,19 +322,6 @@ def _build_report(
         device=device,
         ranking_path=ranking,
     )
-    report["source"] = {
-        "base": {
-            "repository": recipe.BASE_REPOSITORY,
-            "revision": recipe.BASE_REVISION,
-            "model_path": str(preflight.base_dir.resolve()),
-        },
-        "nvfp4": {
-            "repository": recipe.NVFP4_REPOSITORY,
-            "revision": recipe.NVFP4_REVISION,
-            "model_path": str(preflight.nvfp4_dir.resolve()),
-        },
-        "ranking_path": str(ranking.resolve()),
-    }
     report["source_preflight"] = {
         "base": {
             "recipes": preflight.base_source.recipe_count,
@@ -401,16 +405,10 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    arguments = {
-        "model": str(model_dir),
-        "nvfp4_model": str(nvfp4_model_dir),
-        "out": str(out_path),
-        "device": requested_device,
-    }
-    report = _build_report(
+    report = build_conversion_report(
         preflight=preflight,
         output=output,
-        arguments=arguments,
+        requested_device=requested_device,
         objects=preflight.object_plan.objects,
         elapsed_seconds=elapsed,
         final_bytes=final_bytes,

@@ -23,6 +23,7 @@ from tools.artifact.container import (
     ArtifactObject,
     ArtifactWriter,
 )
+from tools.convert.common import provenance
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
@@ -254,7 +255,7 @@ def build_conversion_report(
     *,
     model_dir: str | Path,
     out_path: str | Path,
-    arguments: Mapping[str, object],
+    requested_device: str,
     config_summary: Mapping[str, object],
     source_preflight: recipe.SourcePreflight,
     objects: Sequence[ArtifactObject],
@@ -272,9 +273,13 @@ def build_conversion_report(
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
-        model_dir=model_dir,
+        sources={"base": {"name": provenance.local_name(model_dir)}},
         out_path=out_path,
-        arguments=arguments,
+        arguments={
+            "model": provenance.local_name(model_dir),
+            "out": provenance.local_name(out_path),
+            "device": requested_device,
+        },
         config_summary=config_summary,
         source_preflight=source_preflight,
         objects=objects,
@@ -334,15 +339,10 @@ def convert(
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
-    arguments = {
-        "model": str(model_dir),
-        "out": str(out_path),
-        "device": requested_device,
-    }
     report = build_conversion_report(
         model_dir=model,
         out_path=output,
-        arguments=arguments,
+        requested_device=requested_device,
         config_summary=preflight.config_summary,
         source_preflight=preflight.source,
         objects=preflight.object_plan.objects,

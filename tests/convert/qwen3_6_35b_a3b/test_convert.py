@@ -4,7 +4,6 @@ import torch
 
 from tools.convert.qwen3_6_35b_a3b import (
     convert,
-    draft_head,
     inventory,
     recipe,
 )
@@ -17,11 +16,13 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
     plan = convert.build_object_plan(resources)
     base_source = recipe.SourcePreflight(883, 1045, 26, {"BF16": 1045})
     dflash_source = recipe.SourcePreflight(51, 69, 1, {"BF16": 69})
+    ranking = tmp_path / "ranking.i64"
+    ranking.write_bytes(bytes(8))
     report = convert.build_conversion_report(
         model_dir=tmp_path / "model",
         dflash_model_dir=tmp_path / "dflash",
         out_path=tmp_path / "model.ninfer",
-        arguments={},
+        requested_device="cpu",
         base_config_summary={"text": {"hidden_size": 2048}},
         dflash_config_summary={"hidden_size": 2048},
         base_source_preflight=base_source,
@@ -30,7 +31,7 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
         elapsed_seconds=1.0,
         final_bytes=123,
         device=torch.device("cpu"),
-        ranking_path=draft_head.DEFAULT_RANKING,
+        ranking_path=ranking,
         revision="test-revision",
         environment={"python": "test"},
     )
@@ -41,18 +42,12 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
     }
     assert report["target_key"] == inventory.TARGET_KEY
     assert report["recipe_id"] == convert.RECIPE_ID
-    assert report["source"]["base_model_path"] == str(
-        (tmp_path / "model").resolve()
-    )
-    assert report["source"]["dflash_model_path"] == str(
-        (tmp_path / "dflash").resolve()
-    )
     assert report["source_preflight"]["base"]["tensors"] == 1045
     assert report["source_preflight"]["dflash"]["tensors"] == 69
     assert report["source_preflight"]["combined"]["tensors"] == 1114
-    assert report["source"]["gguf_evidence_path"] == str(
-        convert.GGUF_EVIDENCE_PATH
-    )
+    assert report["source"]["gguf_evidence"] == {
+        "name": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    }
     assert report["draft_head"] == {
         "rows": 131072,
         "tokenizer_vocab_size": 248077,

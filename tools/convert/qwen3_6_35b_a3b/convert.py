@@ -24,6 +24,7 @@ from typing import Mapping, Sequence
 import torch
 
 from tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
+from tools.convert.common import provenance
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
@@ -34,10 +35,7 @@ from . import draft_head, inventory, recipe
 
 RECIPE_ID = "qwen3_6_35b_a3b-v2"
 ENCODER_PROFILE = "MAXABS_F16_RECIP_RNE_V1"
-GGUF_EVIDENCE_PATH = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/"
-    "gguf-ud-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-)
+GGUF_EVIDENCE_NAME = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 
 _ROOT_CONFIG = {
     "architectures": ["Qwen3_5MoeForConditionalGeneration"],
@@ -400,7 +398,7 @@ def build_conversion_report(
     model_dir: str | Path,
     dflash_model_dir: str | Path,
     out_path: str | Path,
-    arguments: Mapping[str, object],
+    requested_device: str,
     base_config_summary: Mapping[str, object],
     dflash_config_summary: Mapping[str, object],
     base_source_preflight: recipe.SourcePreflight,
@@ -438,9 +436,18 @@ def build_conversion_report(
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
-        model_dir=model_dir,
+        sources={
+            "base": {"name": provenance.local_name(model_dir)},
+            "dflash": {"name": provenance.local_name(dflash_model_dir)},
+            "gguf_evidence": {"name": GGUF_EVIDENCE_NAME},
+        },
         out_path=out_path,
-        arguments=arguments,
+        arguments={
+            "model": provenance.local_name(model_dir),
+            "dflash_model": provenance.local_name(dflash_model_dir),
+            "out": provenance.local_name(out_path),
+            "device": requested_device,
+        },
         config_summary={
             "base": dict(base_config_summary),
             "dflash": dict(dflash_config_summary),
@@ -453,10 +460,6 @@ def build_conversion_report(
         ranking_path=ranking_path,
         revision=revision,
         environment_summary=environment,
-    )
-    report["source"]["base_model_path"] = report["source"].pop("model_path")
-    report["source"]["dflash_model_path"] = str(
-        Path(dflash_model_dir).resolve()
     )
     report["source_preflight"] = {
         "base": {
@@ -484,7 +487,6 @@ def build_conversion_report(
         "ranking_source_target": draft_head.RANKING_SOURCE_TARGET,
         "shared_semantic_vocabulary": True,
     }
-    report["source"]["gguf_evidence_path"] = str(GGUF_EVIDENCE_PATH)
     report["quantization"] = {
         "encoder_profile": ENCODER_PROFILE,
         "component_tensor_bytes": {
@@ -581,17 +583,11 @@ def convert(
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
-    arguments = {
-        "model": str(model_dir),
-        "dflash_model": str(dflash_model_dir),
-        "out": str(out_path),
-        "device": requested_device,
-    }
     report = build_conversion_report(
         model_dir=model,
         dflash_model_dir=dflash_model,
         out_path=output,
-        arguments=arguments,
+        requested_device=requested_device,
         base_config_summary=preflight.base_config_summary,
         dflash_config_summary=preflight.dflash_config_summary,
         base_source_preflight=preflight.base_source,

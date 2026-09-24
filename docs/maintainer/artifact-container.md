@@ -354,7 +354,7 @@ A writer:
 Payload-relative offsets avoid any fixed-point dependency on the final JSON length. Physical object
 order is a converter decision and is never a model binding key.
 
-Source paths, source tensor names, transforms, quantization assignment rationale, converter
+Source identities, source tensor names, transforms, quantization assignment rationale, converter
 revision, command line, timings, and environment belong to the model-specific conversion
 specification or an external descriptive conversion report. A sidecar does not participate in
 loading and is not required for artifact validity.
@@ -369,10 +369,15 @@ Version 2 requires no checksum, digest, signature, publisher identity, or sideca
 inventory, layout, and source-value verification catch the classes of mistakes relevant to the
 project's own conversion workflow; they are not an identity system for externally supplied files.
 
-A descriptive conversion report remains useful. It may record source path, command, recipe and
-converter revisions, source-config summary, environment, object/byte summaries, elapsed time, and
-final size. These records explain how an artifact was produced without becoming runtime validity or
-strict reproducibility requirements.
+A descriptive conversion report remains useful. It may record source identities, command, recipe
+and converter revisions, source-config summary, environment, object/byte summaries, elapsed time,
+and final size. These records explain how an artifact was produced without becoming runtime
+validity or strict reproducibility requirements.
+
+The report travels apart from the machine that wrote it, so it never records a local filesystem
+path. It names each input by its file or directory name, adds the repository id and revision where
+the converter pins them and the SHA-256 digest of a file's contents, and names the artifact by its
+file name.
 
 ## 9. Evolution
 
