@@ -58,8 +58,10 @@ void test_duplicate_members() {
         std::string_view text;
         std::string_view member;
     };
+
     constexpr Case cases[] = {
         {R"({"objects":[],"bindings":{},"objects":[]})", "objects"},
+        {R"({"a":1,"b":2,"c":3,"b":4})", "b"},
         {R"({"bindings":{"a":{"object":"x","begin":0,"object":"y"}}})", "object"},
         {R"({"objects":[{"id":"a"},{"id":"b","kind":"tensor","id":"c"}]})", "id"},
         {R"([[{"u":{"a":1,"b":{"c":[0,{"d":1,"e":2,"d":3}]}}}]])", "d"},
@@ -108,7 +110,8 @@ void test_parse_errors() {
     }
 }
 
-// Parsing stays linear in the number of sibling objects, and a repeat is still found among them.
+// Parsing stays linear in the number of sibling objects, and a repeat of the first or of a middle
+// one is still found among them.
 // 100,000 sibling objects, more than the 35B-A3B directory's 65,000: nlohmann's callback parser,
 // which rescans the enclosing container after each nested object, took hundreds of times as long
 // as Json::parse on this text.
@@ -127,9 +130,12 @@ void test_sibling_objects() {
     require(checked < 10 * plain, "sibling objects: parse_json took " + std::to_string(checked) +
                                       " s, nlohmann::json::parse " + std::to_string(plain) + " s");
 
-    const auto message = rejection(sibling_objects(kCount, "b0"));
-    require(message == std::string(kLabel) + ": duplicate JSON member b0",
-            "sibling objects: unexpected rejection of a repeated first binding: " + message);
+    for (const std::string_view repeat : {"b0", "b25000"}) {
+        const auto message = rejection(sibling_objects(kCount, repeat));
+        require(message == std::string(kLabel) + ": duplicate JSON member " + std::string(repeat),
+                "sibling objects: unexpected rejection of a repeated " + std::string(repeat) +
+                    ": " + message);
+    }
 }
 
 } // namespace
