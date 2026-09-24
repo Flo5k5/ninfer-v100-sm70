@@ -29,7 +29,53 @@ namespace ninfer::product {
     return "unknown";
 }
 
+[[nodiscard]] inline ContextLookupPolicy parse_context_lookup_policy(std::string_view value) {
+    if (value == "off") { return ContextLookupPolicy::Off; }
+    if (value == "fixed") { return ContextLookupPolicy::Fixed; }
+    if (value == "adaptive") { return ContextLookupPolicy::Adaptive; }
+    throw std::invalid_argument("invalid lookup policy: " + std::string(value));
+}
+
+[[nodiscard]] inline const char* context_lookup_policy_name(ContextLookupPolicy policy) noexcept {
+    switch (policy) {
+    case ContextLookupPolicy::Off:
+        return "off";
+    case ContextLookupPolicy::Fixed:
+        return "fixed";
+    case ContextLookupPolicy::Adaptive:
+        return "adaptive";
+    }
+    return "unknown";
+}
+
+// Shared by the CLI and the server: both expose the same MTP context-lookup flags.
+inline void validate_context_lookup_cli_options(const SpeculativeOptions& options) {
+    const ContextLookupOptions& lookup = options.context_lookup;
+    const ContextLookupOptions defaults;
+    if (options.backend != SpeculativeBackend::Mtp) {
+        if (lookup.policy != defaults.policy || lookup.min_suffix != defaults.min_suffix ||
+            lookup.max_proposal != defaults.max_proposal) {
+            throw std::invalid_argument("--lookup-policy, --lookup-min-suffix and "
+                                        "--lookup-max-proposal require --spec mtp");
+        }
+        return;
+    }
+    if (lookup.min_suffix < kContextLookupMinimumSuffix ||
+        lookup.min_suffix > kContextLookupMaximumSuffix) {
+        throw std::invalid_argument("--lookup-min-suffix must be in [" +
+                                    std::to_string(kContextLookupMinimumSuffix) + "," +
+                                    std::to_string(kContextLookupMaximumSuffix) + "]");
+    }
+    if (lookup.max_proposal <= options.draft_tokens ||
+        lookup.max_proposal > kContextLookupMaximumProposal) {
+        throw std::invalid_argument(
+            "--lookup-max-proposal must exceed --draft-tokens and be at most " +
+            std::to_string(kContextLookupMaximumProposal));
+    }
+}
+
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    validate_context_lookup_cli_options(options);
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {

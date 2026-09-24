@@ -82,7 +82,8 @@ std::string usage_text(const char* argv0) {
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
-           "       [--lm-head-draft]\n"
+           "       [--lm-head-draft] [--lookup-policy off|fixed|adaptive] [--lookup-min-suffix N]\n"
+           "       [--lookup-max-proposal N]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -144,6 +145,15 @@ Options parse_options(int argc, char** argv) {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--lookup-policy") {
+            options.speculative.context_lookup.policy =
+                product::parse_context_lookup_policy(value(arg));
+        } else if (arg == "--lookup-min-suffix") {
+            options.speculative.context_lookup.min_suffix =
+                parse_u32(value(arg), "lookup-min-suffix");
+        } else if (arg == "--lookup-max-proposal") {
+            options.speculative.context_lookup.max_proposal =
+                parse_u32(value(arg), "lookup-max-proposal");
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {

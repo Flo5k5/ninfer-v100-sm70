@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -151,10 +152,11 @@ void test_decoder_layout() {
 void test_round_layout() {
     ninfer::LayoutBuilder builder;
     q36::RoundStateLayout round = q36::begin_round_state_layout(
-        builder, q36::RoundStateSpec{.hidden       = 32,
-                                     .output_rows  = 128,
-                                     .draft_window = 5,
-                                     .backend      = ninfer::SpeculativeBackend::Mtp});
+        builder, q36::RoundStateSpec{.hidden        = 32,
+                                     .output_rows   = 128,
+                                     .draft_window  = 5,
+                                     .lookup_window = 15,
+                                     .backend       = ninfer::SpeculativeBackend::Mtp});
     const ninfer::TensorRegion exact_prefill =
         builder.add_tensor(ninfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
     q36::complete_round_state_layout(builder, round);
@@ -176,6 +178,75 @@ void test_round_layout() {
                round.mtp_lookup_decode->alignment_ids.shape[0] == 16 &&
                round.mtp_lookup_decode->ar_positions.shape[1] == 4,
            "MTP lookup frame verifies fifteen tokens but proposes five");
+
+    ninfer::LayoutBuilder narrow_builder;
+    q36::RoundStateLayout narrow = q36::begin_round_state_layout(
+        narrow_builder, q36::RoundStateSpec{.hidden        = 32,
+                                            .output_rows   = 128,
+                                            .draft_window  = 4,
+                                            .lookup_window = 8,
+                                            .backend       = ninfer::SpeculativeBackend::Mtp});
+    q36::complete_round_state_layout(narrow_builder, narrow);
+    (void)narrow_builder.finish(256);
+    expect(narrow.mtp_lookup_decode.has_value() &&
+               narrow.mtp_lookup_decode->alignment_ids.shape[0] == 9 &&
+               narrow.mtp_lookup_decode->target_logits.shape[1] == 9 &&
+               !narrow.mtp_lookup_entry_decode.has_value(),
+           "MTP lookup frame follows the configured lookup window");
+
+    ninfer::LayoutBuilder tiered_builder;
+    q36::RoundStateLayout tiered = q36::begin_round_state_layout(
+        tiered_builder, q36::RoundStateSpec{.hidden              = 32,
+                                            .output_rows         = 128,
+                                            .draft_window        = 4,
+                                            .lookup_window       = 15,
+                                            .lookup_entry_window = 7,
+                                            .backend = ninfer::SpeculativeBackend::Mtp});
+    q36::complete_round_state_layout(tiered_builder, tiered);
+    (void)tiered_builder.finish(256);
+    expect(tiered.mtp_lookup_decode.has_value() &&
+               tiered.mtp_lookup_decode->alignment_ids.shape[0] == 16 &&
+               tiered.mtp_lookup_entry_decode.has_value() &&
+               tiered.mtp_lookup_entry_decode->alignment_ids.shape[0] == 8 &&
+               tiered.mtp_lookup_entry_decode->ar_positions.shape[1] == 3,
+           "MTP lookup entry frame verifies seven tokens and keeps the learned window");
+    for (const std::uint32_t entry : {4U, 15U}) {
+        bool rejected = false;
+        try {
+            ninfer::LayoutBuilder invalid_builder;
+            (void)q36::begin_round_state_layout(
+                invalid_builder, q36::RoundStateSpec{.hidden              = 32,
+                                                     .output_rows         = 128,
+                                                     .draft_window        = 4,
+                                                     .lookup_window       = 15,
+                                                     .lookup_entry_window = entry,
+                                                     .backend = ninfer::SpeculativeBackend::Mtp});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "a lookup entry window outside (draft, lookup) is accepted");
+    }
+
+    ninfer::LayoutBuilder no_lookup_builder;
+    q36::RoundStateLayout no_lookup = q36::begin_round_state_layout(
+        no_lookup_builder, q36::RoundStateSpec{.hidden       = 32,
+                                               .output_rows  = 128,
+                                               .draft_window = 4,
+                                               .backend      = ninfer::SpeculativeBackend::Mtp});
+    q36::complete_round_state_layout(no_lookup_builder, no_lookup);
+    (void)no_lookup_builder.finish(256);
+    expect(no_lookup.mtp_decode.has_value() && !no_lookup.mtp_lookup_decode.has_value(),
+           "disabled context lookup plans no lookup frame");
+
+    bool narrow_lookup_rejected = false;
+    try {
+        ninfer::LayoutBuilder invalid_builder;
+        (void)q36::begin_round_state_layout(
+            invalid_builder, q36::RoundStateSpec{.hidden        = 32,
+                                                 .output_rows   = 128,
+                                                 .draft_window  = 4,
+                                                 .lookup_window = 4,
+                                                 .backend       = ninfer::SpeculativeBackend::Mtp});
+    } catch (const std::invalid_argument&) { narrow_lookup_rejected = true; }
+    expect(narrow_lookup_rejected, "a lookup window no wider than the draft window is rejected");
 
     ninfer::LayoutBuilder speculative_builder;
     q36::RoundStateLayout dflash = q36::begin_round_state_layout(

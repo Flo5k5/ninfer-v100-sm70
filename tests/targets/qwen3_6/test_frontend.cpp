@@ -212,8 +212,8 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
          added(31, "assistant\n"), added(32, "\n"), added(248045, "<|im_start|>", true),
          added(248046, "<|im_end|>", true), added(248053, "<|vision_start|>", true),
          added(248054, "<|vision_end|>", true), added(248056, "<|image_pad|>", true),
-         added(248057, "<|video_pad|>", true), added(248068, "<think>"),
-         added(248069, "</think>")});
+         added(248057, "<|video_pad|>", true), added(248058, "<tool_call>"),
+         added(248059, "</tool_call>"), added(248068, "<think>"), added(248069, "</think>")});
     nlohmann::json vocab = nlohmann::json::object();
     for (int value = 0; value <= 255; ++value) {
         const auto byte                = static_cast<std::uint8_t>(value);

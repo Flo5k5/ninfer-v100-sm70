@@ -24,7 +24,12 @@ struct RoundStateSpec {
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
-    SpeculativeBackend backend   = SpeculativeBackend::None;
+    // MTP context-lookup verification drafts; zero plans no lookup frame.
+    std::uint32_t lookup_window = 0;
+    // Narrower lookup frame used to enter a copy; zero plans none. It lies strictly between the
+    // draft window and lookup_window.
+    std::uint32_t lookup_entry_window = 0;
+    SpeculativeBackend backend        = SpeculativeBackend::None;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -168,6 +173,7 @@ struct RoundStateLayout {
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
     std::optional<MtpDecodeStateLayout> mtp_lookup_decode;
+    std::optional<MtpDecodeStateLayout> mtp_lookup_entry_decode;
     std::optional<DFlashDecodeStateLayout> dflash_decode;
     bool complete = false;
 };
@@ -309,6 +315,7 @@ struct RoundState {
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;
     std::optional<MtpDecodeState> mtp_lookup_decode;
+    std::optional<MtpDecodeState> mtp_lookup_entry_decode;
     std::optional<DFlashDecodeState> dflash_decode;
 
     RoundState() = default;

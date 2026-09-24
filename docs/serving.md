@@ -800,6 +800,9 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--lookup-policy off\|fixed\|adaptive` | MTP context lookup; see [V100 context lookup](v100.md#context-lookup-mtp) | `fixed` |
+| `--lookup-min-suffix N` | `2..64`; fixed: recurring suffix length; adaptive: shortest suffix, used to resume an interrupted copy and inside tool calls | `16` |
+| `--lookup-max-proposal N` | copied tokens verified per lookup round, above the MTP window and at most `15` | `15` |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
@@ -914,7 +917,10 @@ Aborted planning attempts are not published.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, and
+`mtp_round_seconds`; its nested `lookup` object counts the MTP context-lookup subset (`rounds`,
+`entry_rounds`, `drafted_tokens`, `accepted_tokens`, `round_seconds`). Round seconds are
+submit-to-completion wall time of rounds without and with a copied continuation. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
 For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.

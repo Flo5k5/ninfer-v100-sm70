@@ -284,6 +284,10 @@ int main() {
                       "speculative backend missing");
     failures +=
         check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
+    failures += check(server.at("engine").at("context_lookup").at("policy") == "fixed" &&
+                          server.at("engine").at("context_lookup").at("min_suffix") == 16 &&
+                          server.at("engine").at("context_lookup").at("max_proposal") == 15,
+                      "context lookup configuration missing");
     failures += check(
         server.at("engine").at("context_cost").at("transfer_source") == "external" &&
             server.at("engine").at("context_cost").at("prefill_source") == "compiled-default" &&
@@ -510,6 +514,12 @@ int main() {
     outcome.metrics.speculative_accepted_tokens       = 720;
     outcome.metrics.speculative_fallback_steps        = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.speculative_lookup_rounds          = 12;
+    outcome.metrics.speculative_lookup_entry_rounds    = 5;
+    outcome.metrics.speculative_lookup_draft_tokens    = 180;
+    outcome.metrics.speculative_lookup_accepted_tokens = 150;
+    outcome.metrics.speculative_lookup_round_seconds   = 0.5;
+    outcome.metrics.speculative_mtp_round_seconds      = 10.25;
     outcome.metrics.materialization                   = {
                           .predicted_now_ns           = 200000,
                           .predicted_future_loss_ns   = 50000,
@@ -568,6 +578,13 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
+    failures += check(done.at("speculative").at("lookup").at("rounds") == 12 &&
+                          done.at("speculative").at("lookup").at("entry_rounds") == 5 &&
+                          done.at("speculative").at("lookup").at("drafted_tokens") == 180 &&
+                          done.at("speculative").at("lookup").at("accepted_tokens") == 150 &&
+                          done.at("speculative").at("lookup").at("round_seconds") == 0.5 &&
+                          done.at("speculative").at("mtp_round_seconds") == 10.25,
+                      "context lookup counters missing");
     failures += check(done.at("materialization").at("predicted_total_ns") == 250000 &&
                           done.at("materialization").at("targets_evaluated") == 7 &&
                           done.at("materialization").at("stop_reason") == "queue_exhausted" &&
