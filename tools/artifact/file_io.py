@@ -1,15 +1,24 @@
-"""Keep large offline transfers from retaining whole artifacts in Linux's page cache."""
+"""Keep large offline transfers from retaining whole artifacts in Linux's page cache.
+
+Only Linux has the page-cache controls used here (``fdatasync`` and ``posix_fadvise``). Elsewhere,
+for example when the Python suites run on macOS, the kernel manages the cache and both calls are
+skipped.
+"""
 
 from __future__ import annotations
 
 import os
+import sys
 
 IO_CHUNK_BYTES = 8 * 1024 * 1024
 WRITEBACK_BYTES = 64 * 1024 * 1024
 _PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
+_LINUX = sys.platform.startswith("linux")
 
 
 def discard_cached_pages(fd: int, offset: int = 0, count: int | None = None) -> None:
+    if not _LINUX:
+        return
     if count is None:
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     elif count > 0:
@@ -32,8 +41,9 @@ class Writeback:
             self.flush()
 
     def flush(self) -> None:
-        for fd in self._fds:
-            os.fdatasync(fd)
-            discard_cached_pages(fd)
+        if _LINUX:
+            for fd in self._fds:
+                os.fdatasync(fd)
+                discard_cached_pages(fd)
         self._fds.clear()
         self._bytes = 0
