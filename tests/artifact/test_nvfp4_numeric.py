@@ -7,8 +7,7 @@ import pytest
 import torch
 
 from tools.artifact.codecs.nvfp4 import dequantize_nvfp4, encode_nvfp4
-
-from tools.artifact.numeric import (
+from tools.artifact.formats import (
     decode_e2m1_word,
     decode_e4m3fn_word,
     valid_nvfp4_scale_word,
