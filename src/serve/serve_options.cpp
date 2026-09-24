@@ -153,6 +153,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool kv_capacity_explicit             = false;
     bool context_capacity_explicit        = false;
     bool response_store_capacity_explicit = false;
+    product::ContextLookupFlags lookup_flags;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -297,13 +298,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--lookup-policy") {
             options.speculative.context_lookup.policy =
                 product::parse_context_lookup_policy(require_value("--lookup-policy"));
+            lookup_flags.policy = true;
         } else if (arg == "--lookup-min-suffix") {
             options.speculative.context_lookup.min_suffix = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--lookup-min-suffix"), "lookup-min-suffix"));
+            lookup_flags.min_suffix = true;
         } else if (arg == "--lookup-max-proposal") {
             options.speculative.context_lookup.max_proposal =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--lookup-max-proposal"), "lookup-max-proposal"));
+            lookup_flags.max_proposal = true;
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
@@ -425,7 +429,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
-    product::validate_speculative_cli_options(options.speculative);
+    product::validate_speculative_cli_options(options.speculative, lookup_flags);
     if (options.api_key.empty()) {
         // Process arguments are world-readable through /proc; the environment is not.
         if (const char* key = std::getenv("NINFER_API_KEY"); key != nullptr) {

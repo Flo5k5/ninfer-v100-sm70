@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -168,8 +169,37 @@ int main() {
         } catch (const std::invalid_argument&) { return true; }
         return false;
     };
+    const auto lookup_rejection = [&](std::vector<std::string> arguments) -> std::string {
+        try {
+            (void)parse(std::move(arguments));
+        } catch (const std::invalid_argument& error) { return error.what(); }
+        return {};
+    };
     failures += check(lookup_rejected({"ninfer-serve", "model.ninfer", "--lookup-policy", "off"}),
                       "context lookup flags were accepted without MTP");
+    // An explicit flag is validated even when its value equals the default.
+    failures += check(lookup_rejected({"ninfer-serve", "model.ninfer", "--lookup-policy", "fixed"}),
+                      "an explicit default lookup policy was accepted without MTP");
+    failures +=
+        check(lookup_rejected({"ninfer-serve", "model.ninfer", "--lookup-max-proposal", "15"}),
+              "an explicit default lookup proposal was accepted without MTP");
+    // With lookup off, a suffix or proposal size is rejected as unused rather than checked against
+    // the draft window.
+    const ServeOptions off_wide_drafts = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                                "--draft-tokens", "7", "--lookup-policy", "off"});
+    failures +=
+        check(off_wide_drafts.speculative.context_lookup.policy == ninfer::ContextLookupPolicy::Off,
+              "--lookup-policy off was rejected with a seven-token draft window");
+    failures +=
+        check(lookup_rejection({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                "7", "--lookup-policy", "off", "--lookup-max-proposal", "6"})
+                      .find("--lookup-policy fixed or adaptive") != std::string::npos,
+              "a lookup proposal with --lookup-policy off was not rejected as unused");
+    failures +=
+        check(lookup_rejection({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                "4", "--lookup-policy", "off", "--lookup-min-suffix", "16"})
+                      .find("--lookup-policy fixed or adaptive") != std::string::npos,
+              "a lookup suffix with --lookup-policy off was not rejected as unused");
     failures += check(lookup_rejected({"ninfer-serve", "model.ninfer", "--spec", "dflash",
                                        "--draft-tokens", "7", "--lookup-min-suffix", "8"}),
                       "context lookup flags were accepted with DFlash");

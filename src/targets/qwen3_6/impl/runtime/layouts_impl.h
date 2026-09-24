@@ -714,7 +714,9 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
             throw std::invalid_argument("MTP draft window must be in [1,7]");
         }
+        // Disabled lookup plans no frame, so its suffix and proposal sizes are unused.
         const ContextLookupOptions& lookup = options.speculative.context_lookup;
+        if (lookup.policy == ContextLookupPolicy::Off) { break; }
         if (lookup.min_suffix < kContextLookupMinimumSuffix ||
             lookup.min_suffix > kContextLookupMaximumSuffix) {
             throw std::invalid_argument("MTP context-lookup suffix must be in [2,64]");

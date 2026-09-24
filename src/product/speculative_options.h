@@ -48,15 +48,32 @@ namespace ninfer::product {
     return "unknown";
 }
 
+// The MTP context-lookup flags a command line gave explicitly. Validation depends on which flags
+// were given, not on whether a value happens to equal its default.
+struct ContextLookupFlags {
+    bool policy       = false;
+    bool min_suffix   = false;
+    bool max_proposal = false;
+
+    [[nodiscard]] bool any() const noexcept { return policy || min_suffix || max_proposal; }
+};
+
 // Shared by the CLI and the server: both expose the same MTP context-lookup flags.
-inline void validate_context_lookup_cli_options(const SpeculativeOptions& options) {
+inline void validate_context_lookup_cli_options(const SpeculativeOptions& options,
+                                                const ContextLookupFlags& given) {
     const ContextLookupOptions& lookup = options.context_lookup;
-    const ContextLookupOptions defaults;
     if (options.backend != SpeculativeBackend::Mtp) {
-        if (lookup.policy != defaults.policy || lookup.min_suffix != defaults.min_suffix ||
-            lookup.max_proposal != defaults.max_proposal) {
+        if (given.any()) {
             throw std::invalid_argument("--lookup-policy, --lookup-min-suffix and "
                                         "--lookup-max-proposal require --spec mtp");
+        }
+        return;
+    }
+    if (lookup.policy == ContextLookupPolicy::Off) {
+        // Disabled lookup plans no frame, so a suffix or proposal size would have no effect.
+        if (given.min_suffix || given.max_proposal) {
+            throw std::invalid_argument("--lookup-min-suffix and --lookup-max-proposal require "
+                                        "--lookup-policy fixed or adaptive");
         }
         return;
     }
@@ -74,8 +91,11 @@ inline void validate_context_lookup_cli_options(const SpeculativeOptions& option
     }
 }
 
-inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
-    validate_context_lookup_cli_options(options);
+// `lookup_flags` names the context-lookup flags the command line gave; a command without those
+// flags passes none.
+inline void validate_speculative_cli_options(const SpeculativeOptions& options,
+                                             const ContextLookupFlags& lookup_flags = {}) {
+    validate_context_lookup_cli_options(options, lookup_flags);
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
