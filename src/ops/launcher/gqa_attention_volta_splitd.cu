@@ -1,10 +1,10 @@
 // ninfer::ops::detail - Volta (sm_70) FP32-accumulating flash-attention prefill route.
 //
-// Drives the vendored 1CatAI "Split-D N32" D256 kernel (third_party/sm70_flash_d256): 64 query
-// rows per CTA, FP16 tensor-core operands, and FP32 accumulators for both Q.K^T and P.V. The
-// llama.cpp MMA kernel used by the `flash` route keeps its P.V accumulators in FP16 on Volta
-// (register budget of its D256 tile), so their rounding grows with the number of keys a row
-// attends to; this route has no such term.
+// Drives the vendored "Split-D N32" D256 kernel of 1Cat-vLLM, as adapted by sm70-attn
+// (third_party/sm70_flash_d256): 64 query rows per CTA, FP16 tensor-core operands, and FP32
+// accumulators for both Q.K^T and P.V. The llama.cpp MMA kernel used by the `flash` route keeps
+// its P.V accumulators in FP16 on Volta (register budget of its D256 tile), so their rounding grows
+// with the number of keys a row attends to; this route has no such term.
 //
 // Staging mirrors the flash route: the width's K/V are appended to the paged cache and the
 // visible key range is gathered once per layer into contiguous FP16 (dequantized for INT8). Each
