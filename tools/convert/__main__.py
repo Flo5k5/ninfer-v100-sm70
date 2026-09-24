@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
+from .provenance import file_record, local_name
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -32,7 +33,7 @@ class SourceInputs(Mapping):
                     f"selected recipe requires source {name!r}; provide --source {name}=PATH"
                 )
             self._sources[name] = self._stack.enter_context(
-                SafetensorsSource(self._paths[name])
+                SafetensorsSource(self._paths[name], label=name)
             )
         return self._sources[name]
 
@@ -44,7 +45,8 @@ class SourceInputs(Mapping):
 
     def provenance(self):
         return {
-            name: {"path": str(source.path)} for name, source in self._sources.items()
+            name: {"name": local_name(source.path)}
+            for name, source in self._sources.items()
         }
 
 
@@ -58,13 +60,30 @@ def _pairs(values, label):
     return result
 
 
-def _function(value: str):
-    if value in RECIPES:
-        return RECIPES[value]
+def _recipe_file(value: str) -> tuple[Path, str]:
     filename, separator, function = value.rpartition(":")
     if not separator:
         filename, function = value, "configure"
-    path = Path(filename).resolve()
+    return Path(filename), function
+
+
+def _recorded(key: str, value: str) -> dict:
+    """Provenance of a --recipe or --override value: an official name as given, or a Python
+    file as ``name:function`` plus its name and SHA-256 digest, never its local path."""
+    if value in RECIPES:
+        return {key: value}
+    filename, function = _recipe_file(value)
+    return {
+        key: f"{local_name(filename)}:{function}",
+        key + "_file": file_record(filename),
+    }
+
+
+def _function(value: str):
+    if value in RECIPES:
+        return RECIPES[value]
+    filename, function = _recipe_file(value)
+    path = filename.resolve()
     spec = importlib.util.spec_from_file_location("ninfer_user_recipe", path)
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot load recipe file {path}")
@@ -138,7 +157,7 @@ def main(argv=None):
         raise ValueError("select the base source with --model")
     overrides = _pairs(args.resource, "resource")
     with ExitStack() as stack:
-        base = stack.enter_context(SafetensorsSource(args.model))
+        base = stack.enter_context(SafetensorsSource(args.model, label="base"))
         sources = SourceInputs(base, paths, stack)
         companions = {
             key: sources[key] for key in ("dflash", "dflash2") if key in components
@@ -167,13 +186,13 @@ def main(argv=None):
 
         provenance = {
             "converter": "ninfer-v3",
-            "recipe": args.recipe,
+            **_recorded("recipe", args.recipe),
             "sources": sources.provenance(),
         }
         if args.override:
-            provenance["override"] = args.override
+            provenance.update(_recorded("override", args.override))
         if args.proposal:
-            provenance["ranking"] = str(args.ranking)
+            provenance["ranking"] = file_record(args.ranking)
         report = convert(
             model,
             recipe,

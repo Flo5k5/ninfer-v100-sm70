@@ -13,6 +13,7 @@ import struct
 import torch
 
 from tools.artifact.file_io import discard_cached_pages
+from ..provenance import local_name
 from .logical import LogicalSource
 
 _DTYPES = {
@@ -38,10 +39,15 @@ class TensorInfo:
 
 
 class SafetensorsSource:
-    """Read bounded flat regions; retain only a small set of file descriptors."""
+    """Read bounded flat regions; retain only a small set of file descriptors.
 
-    def __init__(self, path: str | Path) -> None:
+    ``label`` names the checkpoint in source labels, which the conversion report records; it
+    defaults to the checkpoint's file or directory name, never its path.
+    """
+
+    def __init__(self, path: str | Path, *, label: str | None = None) -> None:
         self.path = Path(path)
+        self.label = local_name(self.path) if label is None else label
         self.root = self.path if self.path.is_dir() else self.path.parent
         config_path = self.root / "config.json"
         self.config = (
@@ -185,5 +191,5 @@ def tensor_source(
         return store.read_flat(name, offset + begin, offset + end)
 
     return LogicalSource(
-        shape, f"{store.path}:{name}[{offset}:{offset+prod(shape)}]", read
+        shape, f"{store.label}:{name}[{offset}:{offset+prod(shape)}]", read
     )

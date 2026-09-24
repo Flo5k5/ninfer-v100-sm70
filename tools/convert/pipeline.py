@@ -15,12 +15,14 @@ from tools.artifact.tensor_output import TensorOutput
 from tools.artifact.writer import ArtifactWriter, DEFAULT_MAX_FILE_BYTES
 
 from .model import Model
+from .provenance import local_name
 from .recipe import Recipe, WeightJob
 
 
 def _json_default(value):
+    # The report travels without the machine that wrote it: a path is recorded by its name.
     if isinstance(value, Path):
-        return str(value)
+        return local_name(value)
     raise TypeError(f"conversion report cannot serialize {type(value).__name__}")
 
 
@@ -61,7 +63,7 @@ def convert(
     report = {
         "components": model.components,
         "name": name,
-        "output": str(path),
+        "output": local_name(path),
         "device": str(chosen_device),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
@@ -114,7 +116,7 @@ def convert(
         report["artifact_id"] = writer.artifact_id.hex()
         report["files"] = [
             {
-                "path": str(path if i == 0 else path.parent / file.path),
+                "name": local_name(path) if i == 0 else file.path,
                 "payload_bytes": file.payload_bytes,
             }
             for i, file in enumerate(writer.directory.files)
