@@ -6,7 +6,6 @@ from bisect import bisect_left, bisect_right
 from copy import deepcopy
 from pathlib import Path
 import os
-import tempfile
 from typing import Iterable, Sequence
 from uuid import uuid4
 
@@ -160,11 +159,12 @@ class ArtifactWriter:
             for index, (target, file) in enumerate(
                 zip(self._destinations, self.directory.files)
             ):
-                fd, temporary = tempfile.mkstemp(
-                    prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
-                )
+                temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+                # finish() links this inode into place, so create it like any new file
+                # (0666 masked by the umask), not with mkstemp's owner-only 0600.
+                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
                 self._fds.append(fd)
-                self._temporary.append(Path(temporary))
+                self._temporary.append(temporary)
                 start = self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
                 os.ftruncate(fd, integer(start + file.payload_bytes, "file bytes"))
                 header = HEADER.pack(
