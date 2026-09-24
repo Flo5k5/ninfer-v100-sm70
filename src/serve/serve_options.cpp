@@ -79,7 +79,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--no-response-store] [--no-structured-output] "
+           "[--no-response-store] [--no-structured-output] [--constrain-all-tools] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--lookup-policy off|fixed|adaptive] [--lookup-min-suffix N] "
            "[--lookup-max-proposal N] "
@@ -110,6 +110,8 @@ std::string serve_usage_text(const char* argv0) {
            "and previous_response_id are rejected, and stored-Response lookups return 404\n"
            "       --no-structured-output builds no grammar compiler and rejects constrained "
            "requests\n"
+           "       --constrain-all-tools enforces every tool's parameter schema, not only strict "
+           "tools'\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --text-residual fp32 keeps the residual stream in FP32 (Volta, "
@@ -301,6 +303,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_response_store = false;
         } else if (arg == "--no-structured-output") {
             options.enable_structured_output = false;
+        } else if (arg == "--constrain-all-tools") {
+            options.constrain_all_tool_arguments = true;
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {

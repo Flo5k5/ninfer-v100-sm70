@@ -87,6 +87,19 @@ bool starts_with_at(std::string_view text, std::size_t pos, std::string_view pre
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
 }
 
+// A call starts at a <tool_call> that format whitespace and <function= follow. Any other
+// <tool_call> is text, whatever the tool choice: a grammar triggers calls only on
+// "<tool_call>\n<function=", and a stray marker never becomes a call.
+std::size_t find_call(std::string_view text, std::size_t from) {
+    for (std::size_t at = text.find(kToolOpen, from); at != std::string_view::npos;
+         at = text.find(kToolOpen, at + 1)) {
+        std::size_t pos = at + kToolOpen.size();
+        skip_format_whitespace(text, pos);
+        if (starts_with_at(text, pos, kFunctionOpen)) { return at; }
+    }
+    return std::string_view::npos;
+}
+
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     if (name.empty() || name.size() > max_name_length) { return false; }
     return std::all_of(name.begin(), name.end(), [](char byte) {
@@ -413,32 +426,7 @@ public:
                          const Contract& contract)
         : text_(text), max_name_length_(max_name_length), contract_(contract) {}
 
-    FallbackReason parse(std::vector<RawToolCall>& calls) const {
-        std::size_t pos = 0;
-        for (;;) {
-            skip_format_whitespace(text_, pos);
-            if (pos == text_.size()) {
-                return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
-            }
-            if (!starts_with_at(text_, pos, kToolOpen)) {
-                return calls.empty() ? FallbackReason::MalformedStructure
-                                     : FallbackReason::TrailingContent;
-            }
-
-            RawToolCall call;
-            const FallbackReason failure = parse_tool_call(pos, call);
-            if (failure != FallbackReason::None) { return failure; }
-            calls.push_back(std::move(call));
-        }
-    }
-
-private:
-    bool consume(std::size_t& pos, std::string_view token) const {
-        if (!starts_with_at(text_, pos, token)) { return false; }
-        pos += token.size();
-        return true;
-    }
-
+    // Parses the call that starts at `pos` and moves `pos` past its </tool_call>.
     FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) const {
         if (!consume(pos, kToolOpen)) { return FallbackReason::MalformedStructure; }
         skip_format_whitespace(text_, pos);
@@ -446,6 +434,13 @@ private:
         if (failure != FallbackReason::None) { return failure; }
         skip_format_whitespace(text_, pos);
         return consume(pos, kToolClose) ? FallbackReason::None : FallbackReason::MalformedStructure;
+    }
+
+private:
+    bool consume(std::size_t& pos, std::string_view token) const {
+        if (!starts_with_at(text_, pos, token)) { return false; }
+        pos += token.size();
+        return true;
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) const {
@@ -598,20 +593,35 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
                                                  const ToolCallOutputContract& contract) {
-    const std::size_t first = text.find(kToolOpen);
-    if (first == std::string::npos) { return fallback(text); }
+    ToolCallParseDiagnostics diagnostics;
+    diagnostics.marker_seen = text.find(kToolOpen) != std::string::npos;
+    const std::size_t first = find_call(text, 0);
+    if (first == std::string::npos) { return fallback(text, diagnostics); }
 
+    // Calls keep their structure; the text around them, stray markers included, is content.
     ParsedToolCallOutput out;
-    out.content                 = rtrim_format_whitespace(std::string_view(text).substr(0, first));
-    out.diagnostics.marker_seen = true;
-
+    out.diagnostics = diagnostics;
+    out.content     = rtrim_format_whitespace(std::string_view(text).substr(0, first));
+    const QwenToolRegionParser parser(text, max_tool_name_length, contract);
     std::vector<RawToolCall> raw_calls;
-    const std::string_view tool_region = std::string_view(text).substr(first);
-    const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
-    const FallbackReason failure = parser.parse(raw_calls);
-    if (failure != FallbackReason::None) {
-        out.diagnostics.fallback_reason = failure;
-        return fallback(text, out.diagnostics);
+    std::size_t pos = first;
+    for (;;) {
+        RawToolCall call;
+        const FallbackReason failure = parser.parse_tool_call(pos, call);
+        if (failure != FallbackReason::None) {
+            out.diagnostics.fallback_reason = failure;
+            return fallback(text, out.diagnostics);
+        }
+        raw_calls.push_back(std::move(call));
+        const std::size_t next = find_call(text, pos);
+        const std::string_view between = trim_format_whitespace(std::string_view(text).substr(
+            pos, (next == std::string::npos ? text.size() : next) - pos));
+        if (!between.empty()) {
+            if (!out.content.empty()) { out.content.append("\n\n"); }
+            out.content.append(between);
+        }
+        if (next == std::string::npos) { break; }
+        pos = next;
     }
 
     out.tool_calls.reserve(raw_calls.size());
@@ -639,38 +649,69 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
 
     std::string visible;
     for (std::size_t index = 0; index < text.size(); ++index) {
-        const char byte = text[index];
-        if (marker_prefix_bytes_ != 0) {
-            if (byte == kToolOpen[marker_prefix_bytes_]) {
-                ++marker_prefix_bytes_;
-                if (marker_prefix_bytes_ == kToolOpen.size()) {
-                    tool_region_ = std::move(trailing_whitespace_);
-                    trailing_whitespace_.clear();
-                    tool_region_.append(kToolOpen);
-                    tool_region_.append(text.substr(index + 1));
-                    marker_prefix_bytes_ = 0;
-                    saw_tool_marker_     = true;
-                    break;
-                }
-                continue;
-            }
-            visible.append(trailing_whitespace_);
-            trailing_whitespace_.clear();
-            visible.append(kToolOpen.substr(0, marker_prefix_bytes_));
-            marker_prefix_bytes_ = 0;
-        }
-
-        if (byte == kToolOpen.front()) {
-            marker_prefix_bytes_ = 1;
-        } else if (is_format_whitespace(byte)) {
-            trailing_whitespace_.push_back(byte);
-        } else {
-            visible.append(trailing_whitespace_);
-            trailing_whitespace_.clear();
-            visible.push_back(byte);
-        }
+        if (hold(text[index], visible)) { continue; }
+        // The call is confirmed: everything from its marker on waits for the terminal parse.
+        tool_region_ = std::move(held_);
+        held_.clear();
+        tool_region_.append(text.substr(index + 1));
+        saw_tool_marker_ = true;
+        break;
     }
     return visible;
+}
+
+bool ToolCallOutputDecoder::hold(char byte, std::string& visible) {
+    for (;;) {
+        switch (phase_) {
+        case MarkerPhase::Text:
+            if (is_format_whitespace(byte)) {
+                held_.push_back(byte);
+            } else if (byte == kToolOpen.front()) {
+                held_.push_back(byte);
+                phase_   = MarkerPhase::ToolOpen;
+                matched_ = 1;
+            } else {
+                visible.append(held_);
+                held_.clear();
+                visible.push_back(byte);
+            }
+            return true;
+        case MarkerPhase::ToolOpen:
+            if (byte == kToolOpen[matched_]) {
+                held_.push_back(byte);
+                if (++matched_ == kToolOpen.size()) { phase_ = MarkerPhase::BeforeFunction; }
+                return true;
+            }
+            break;
+        case MarkerPhase::BeforeFunction:
+            if (is_format_whitespace(byte)) {
+                held_.push_back(byte);
+                return true;
+            }
+            if (byte == kFunctionOpen.front()) {
+                held_.push_back(byte);
+                phase_   = MarkerPhase::FunctionOpen;
+                matched_ = 1;
+                return true;
+            }
+            break;
+        case MarkerPhase::FunctionOpen:
+            if (byte == kFunctionOpen[matched_]) {
+                held_.push_back(byte);
+                if (++matched_ == kFunctionOpen.size()) {
+                    phase_ = MarkerPhase::Text;
+                    return false;
+                }
+                return true;
+            }
+            break;
+        }
+        // The byte cannot extend the marker: what was held is text, and the byte is read again as
+        // the possible start of another marker.
+        visible.append(held_);
+        held_.clear();
+        phase_ = MarkerPhase::Text;
+    }
 }
 
 ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
@@ -681,17 +722,15 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
     ParsedToolCallOutput parsed =
         parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
     if (saw_tool_marker_ && parsed.is_tool_call_response) {
-        trailing_whitespace_.clear();
         tool_region_.clear();
-        marker_prefix_bytes_ = 0;
-        return Terminal{.content     = {},
+        return Terminal{.content     = std::move(parsed.content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }
 
-    std::string tail = std::move(trailing_whitespace_);
-    tail.append(kToolOpen.substr(0, marker_prefix_bytes_));
-    marker_prefix_bytes_ = 0;
+    std::string tail = std::move(held_);
+    held_.clear();
+    phase_ = MarkerPhase::Text;
     tail += tool_region_;
     tool_region_.clear();
     return Terminal{

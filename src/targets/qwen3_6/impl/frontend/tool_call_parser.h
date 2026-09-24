@@ -66,9 +66,11 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
                             const ToolCallOutputContract& contract);
 
-// Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
-// suffix. At terminal time, valid calls are retained structurally; malformed output is restored
-// verbatim.
+// Incrementally publishes the text before the first Qwen tool call. A <tool_call> is held until
+// <function= confirms a call (format whitespace may separate them) and published as text as soon
+// as a byte cannot extend it into one; from a confirmed call on, output waits for the terminal
+// parse. At terminal time, valid calls are retained structurally with the text around them as
+// content; malformed output is restored verbatim.
 class ToolCallOutputDecoder {
 public:
     struct Terminal {
@@ -84,10 +86,24 @@ public:
     [[nodiscard]] Terminal finish();
 
 private:
+    // Progress through a possible call marker: format whitespace, <tool_call>, format whitespace,
+    // <function=.
+    enum class MarkerPhase : std::uint8_t {
+        Text,
+        ToolOpen,
+        BeforeFunction,
+        FunctionOpen,
+    };
+
+    // Holds `byte` while it can belong to a call marker, or publishes it with what was held.
+    // Returns false when the byte completes a marker.
+    [[nodiscard]] bool hold(char byte, std::string& visible);
+
     std::shared_ptr<const ToolCallOutputContract> contract_;
-    std::string trailing_whitespace_;
+    std::string held_;
     std::string tool_region_;
-    std::size_t marker_prefix_bytes_  = 0;
+    MarkerPhase phase_                = MarkerPhase::Text;
+    std::size_t matched_              = 0;
     std::size_t max_tool_name_length_ = 0;
     bool saw_tool_marker_             = false;
     bool finished_                    = false;

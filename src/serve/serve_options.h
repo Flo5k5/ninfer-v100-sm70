@@ -52,6 +52,9 @@ struct ServeOptions {
     // --no-structured-output: build no grammar compiler and reject constrained requests
     // (response_format json_object/json_schema and their Responses and Anthropic forms).
     bool enable_structured_output            = true;
+    // --constrain-all-tools: enforce every tool's parameter schema on its calls, as if each tool
+    // were strict, instead of only the tools a request marks strict.
+    bool constrain_all_tool_arguments = false;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;

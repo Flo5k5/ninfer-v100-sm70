@@ -328,7 +328,17 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.response_format                  = request.response_format;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);
     input.options.tool_jsons.reserve(tools.size());
+    ninfer::ToolCallOptions& calls = input.options.tool_calls;
+    calls.parallel_calls           = request.parallel_tool_calls;
+    if (request.tool_choice.mode == ToolChoiceMode::Required) {
+        calls.mode = ninfer::ToolChoiceMode::Required;
+    } else if (request.tool_choice.mode == ToolChoiceMode::Named) {
+        calls.mode       = ninfer::ToolChoiceMode::Named;
+        calls.named_tool = request.tool_choice.name;
+    }
+    calls.strict.reserve(tools.size());
     for (std::size_t index = 0; index < tools.size(); ++index) {
+        calls.strict.push_back(tools[index]->strict);
         input.options.tool_jsons.push_back(render_tool_definition(*tools[index]));
         if (tools[index]->cache_boundary_after) {
             input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
