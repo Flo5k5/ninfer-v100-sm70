@@ -620,9 +620,11 @@ int run_fp8() {
     failures += run_fp8_fp16_equivalence(parent, 5, 1, {}, 1901U);
     failures += run_fp8_fp16_equivalence(parent, 5, 1, {3}, 1903U);
     failures += run_fp8_fp16_equivalence(parent, 4, 8, {4, 3, 2, 1, 4, 3, 2, 1}, 1905U);
-    // Past one QPN pass (32 aggregate columns) the A16 projection takes the CUTLASS route, whose
-    // weight staging the record plan must reserve: MTP lookup verification of 16 columns at three
-    // rows, the first batch past the pass, and at eight rows.
+    // Past one QPN pass (32 aggregate columns) the A16 projection runs a pass per 32 columns
+    // through the activation staging the record plan reserves: 33 columns (a one-column second
+    // pass), MTP lookup verification of 16 columns at three rows, the first batch past one pass,
+    // and at eight rows, the widest record (four passes).
+    failures += run_fp8_oracle_case(parent, 11, 3, {11, 6, 11}, ops::LinearPolicy::A16Only, 1915U);
     failures += run_fp8_oracle_case(parent, 16, 3, {16, 9, 1}, ops::LinearPolicy::A16Only, 1911U);
     failures += run_fp8_oracle_case(parent, 16, 8, {16, 13, 11, 7, 5, 3, 2, 1},
                                     ops::LinearPolicy::A16Only, 1913U);

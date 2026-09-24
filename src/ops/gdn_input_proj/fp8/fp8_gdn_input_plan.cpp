@@ -14,7 +14,18 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr std::int32_t kVoltaCutlassMinT = 33;
+#ifdef NINFER_VOLTA_BUILD
+// Volta A16 width frontier. One QPN pass streams the 80 MiB of FP8 codes once for up to 32
+// columns, and wider calls run one pass per 32 columns through a single FP16 activation staging
+// buffer. The CUTLASS route stages the whole weight in FP16 on every call instead: NCU counts
+// about 500 MiB of DRAM traffic per call (its dequant kernel alone takes as long as its GEMM) and
+// it needs over 160 MiB of workspace. Measured on a V100-PCIE (cold L2): a pass costs 115 us at
+// one column and 255 us at 32, the CUTLASS route 1.12-1.15 ms up to 128 columns and 1.25-1.27 ms
+// from 129, where its GEMM takes a second 128-row tile. Five passes (1.26 ms at 160 columns) still
+// match it and cover every record width (at most eight rows of 16 columns); a sixth does not.
+constexpr std::int32_t kVoltaQpnMaxPasses = 5;
+constexpr std::int32_t kVoltaCutlassMinT  = kVoltaQpnMaxPasses * kFp8VoltaQpnMaxTokens + 1;
+#endif
 
 enum class Fp8GdnInputRoute : std::uint8_t {
     A16,
@@ -58,21 +69,21 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
 #ifdef NINFER_VOLTA_BUILD
+    const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
+    if (x.dtype == DType::FP16) {
+        // The fp16 activation domain: x is already the staged copy (callers admit it only up to
+        // one QPN pass). Checked before the width frontier: the CUTLASS route reads x as BF16.
+        if (!qpn || x.ne[1] > kFp8VoltaQpnMaxTokens) {
+            throw std::logic_error("fp8 GDN input: FP16 x needs a single QPN pass");
+        }
+        launch_fp8_gdn_input_volta_qpn(x, weight, qkv, z, x.data, stream);
+        return;
+    }
     if (x.ne[1] >= kVoltaCutlassMinT) {
         if (workspace == nullptr) {
             throw std::invalid_argument("fp8 Volta GDN prefill requires caller workspace");
         }
         fp8_gdn_input_cutlass_sm70_launch(x, weight, qkv, z, *workspace, stream);
-        return;
-    }
-    const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
-    if (x.dtype == DType::FP16) {
-        // The fp16 activation domain: x is already the staged copy (callers admit it only up to
-        // one QPN pass).
-        if (!qpn || x.ne[1] > kFp8VoltaQpnMaxTokens) {
-            throw std::logic_error("fp8 GDN input: FP16 x needs a single QPN pass");
-        }
-        launch_fp8_gdn_input_volta_qpn(x, weight, qkv, z, x.data, stream);
         return;
     }
     const std::int32_t kChunk =
