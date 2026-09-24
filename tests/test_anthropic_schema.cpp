@@ -143,9 +143,29 @@ int test_envelope_and_field_policy() {
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
                       "Engine top_k range was not enforced");
     body                  = base_request();
+    body["output_config"] =
+        Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
+    const ninfer::ResponseFormat format = parse(body).generation.response_format;
+    failures += check(format.kind == ninfer::ResponseFormatKind::JsonSchema &&
+                          format.schema_json == R"({"type":"object"})" &&
+                          format.schema_location == "output_config.format.schema",
+                      "output_config.format was not parsed");
+    body                  = base_request();
+    body["output_format"] = Json{{"type", "json_schema"}, {"schema", Json{{"type", "array"}}}};
+    failures += check(parse(body).generation.response_format.schema_json == R"({"type":"array"})",
+                      "the beta output_format was not parsed");
+    body["output_config"] =
+        Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
+    failures += check(api_param([&] { (void)parse(body); }) == "output_format",
+                      "two output formats were accepted");
+    body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
-                      "structured output was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.format",
+                      "an output format without a schema was accepted");
+    body["output_config"] = Json{
+        {"format", Json{{"type", "json_schema"}, {"schema", Json::object()}, {"strict", true}}}};
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.format",
+                      "an unknown output format member was ignored");
     body              = base_request();
     body["container"] = "container_1";
     failures += check(api_code([&] { (void)parse(body); }) == "container_not_supported",
@@ -496,7 +516,8 @@ int test_thinking_and_count_tokens() {
 
     body["max_tokens"]                        = 0;
     body["temperature"]                       = "ignored for counting";
-    body["output_config"]                     = Json{{"format", Json{{"type", "json_schema"}}}};
+    body["output_config"] =
+        Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
     const AnthropicCountTokensRequest counted = parse_anthropic_count_tokens_request(body);
     failures += check(counted.generation.enable_thinking == true,
                       "Count Tokens did not share prompt-affecting Thinking parsing");

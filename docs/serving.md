@@ -108,7 +108,8 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
-- `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
+- `n:1`, text-only `modalities`, and `response_format` of type `text`, `json_object` or
+  `json_schema` (see [Structured output](#structured-output));
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
@@ -122,7 +123,7 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
+behavior. This includes nonzero `logit_bias`, requested log probabilities,
 audio/file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
@@ -416,7 +417,7 @@ wire response contains typed `output` Items.
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
-| `text.format` | omitted or `{"type":"text"}` only |
+| `text.format` | `{"type":"text"}`, `{"type":"json_object"}`, or `json_schema` with `name`, `description`, `schema` and `strict`; see [Structured output](#structured-output) |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
 | `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
@@ -516,7 +517,7 @@ undeclared model output remains ordinary text. `allowed_tools` with mode `auto` 
 without changing declaration order, while `tool_choice:"none"` disables structured tool output even
 when the history contains earlier calls.
 
-NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
+NInfer does not execute functions, and tool calls are not constrained by a grammar, so
 `strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
 tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
 invocation are also rejected because their semantics cannot be honored.
@@ -656,8 +657,8 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
-files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
+moderation, non-empty `include`, background execution, compaction, files/audio, and
+OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
 accepted placeholders.
 
 ## Anthropic Messages
@@ -705,7 +706,9 @@ remains usable across serve restarts.
 `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
 closed-turn Qwen reasoning history. `output_config.effort` is checked against the loaded template's
-declared effort capability.
+declared effort capability. `output_config.format` of type `json_schema` constrains the answer to
+its `schema` (see [Structured output](#structured-output)); the top-level `output_format` of the
+structured-outputs beta is accepted as the same field, and setting both is rejected.
 
 User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
 `input_examples`. `tool_choice:auto` and `none` are executable. Forced or named choice,
@@ -732,8 +735,8 @@ emits `message_start` after Engine admission commits the prefix selection and be
 transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
 usage matches the aggregate response.
 
-Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
-other execution-dependent blocks are rejected with the missing capability identified. Metadata,
+Documents, Search Results, Files, server-tool results, container uploads, and other
+execution-dependent blocks are rejected with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local
 proxy label and is echoed in the response; it does not select the resident artifact.
@@ -755,6 +758,95 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## Structured output
+
+`response_format` (Chat Completions), `text.format` (Responses) and `output_config.format`
+(Anthropic Messages) constrain the answer to one JSON value. The Engine enforces the constraint while
+it generates: before every sampled token it masks the tokens that would leave the grammar of the
+answer, so the answer is valid by construction rather than repaired afterwards.
+
+| Format | Answer |
+|---|---|
+| `json_object` | any JSON object |
+| `json_schema` | a JSON value of the schema |
+
+- The answer is compact JSON: `", "` and `": "` separators and no other whitespace. Object
+  properties follow the order in which the schema declares them. In the OpenAI formats, `strict` is
+  accepted and changes nothing: the schema is always enforced. A format member the API does not
+  define, such as a `schema` next to `json_object`, is rejected rather than ignored.
+- With thinking enabled, the reasoning part stays free text; the grammar requires it to end with
+  `</think>` and a blank line before the value, which is also what the thinking budget control
+  injects.
+- A format applies to a new assistant turn. Continuing a final assistant message with a format is
+  rejected, and so is a format combined with callable tools (`tool_choice:"none"` makes tools not
+  callable).
+- The answer ends at the model's stop token once the value is complete. An output limit can still
+  cut it (`length`, `max_tokens`), and a stop string that matches inside the value ends it there.
+  A stop string that matches inside the reasoning part ends the output before the value, with an
+  empty answer.
+
+The Engine accepts the part of JSON Schema it can enforce exactly and rejects the rest with a 400,
+never with a weaker constraint. The message names the keyword and its JSON pointer; the few
+schemas rejected only while compiling are named by their field:
+
+- `type` (one name or an array of names), `enum` and `const` (with a `type` only if every value
+  has it), `anyOf`, `oneOf` whose alternatives cannot overlap, `allOf`, and a local `$ref` that
+  names a schema of the document, such as one in `$defs` or `definitions`, spelled `#` or `#/`
+  followed by non-empty keys without `~` or `%` escapes;
+- objects: `properties`, `required` (names of declared properties), `additionalProperties`,
+  `unevaluatedProperties`; `propertyNames` on objects that declare no properties and allow other
+  keys, or `patternProperties` with a single pattern and no additional properties on objects that
+  declare none; `minProperties` and `maxProperties` on objects that declare their properties (at
+  most 64) and allow no other keys. An object that allows other keys cannot declare a property
+  name holding a quote, a backslash or a control character;
+- arrays: `items`, `prefixItems`, `minItems`, `maxItems`, `unevaluatedItems`;
+- numbers: `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`;
+- strings: one of a `format` (`date`, `date-time`, `duration`, `email` with a dot-atom local part,
+  `hostname`, `ipv4`, `ipv6`, `time`, `uri`, `uuid`), a `pattern`, or `minLength`/`maxLength`
+  bounds. A pattern is printable ASCII (write other characters as `\uXXXX` escapes) and repeats
+  nothing more than 128 times;
+- annotations such as `title`, `description`, `default` and `examples` are ignored.
+
+`not`, `if`/`then`/`else`, dependent schemas, `uniqueItems`, `contains`, remote references,
+keywords next to a `$ref` or a combinator, unknown formats, and a `pattern` next to length bounds
+are rejected, and so is a `pattern` whose strings need a character a JSON string must escape (a
+quote, a backslash, a control character). A schema that no finite value satisfies, such as one
+that refers to itself or requires a property that only leads back to it, is rejected too.
+
+A compilation cannot be interrupted once started, so its limits are checked before it starts: at
+most 256 KiB of schema, arrays and objects nested 128 levels deep, schemas nested 32 levels deep,
+10,000 schema nodes and enum values, 128 distinct `$ref` targets per schema, 1,024 bytes and
+16,384 unrolled characters and classes per regex pattern, and 512 compile units. A unit is roughly
+8 ms of compilation:
+
+- a pair of string length bounds costs its largest bound, at most 256, once per schema however
+  many strings share it;
+- a regex costs one unit per character class, dot or class escape for every copy its bounded
+  repetitions unroll, and one unit per 1,024 unrolled literal characters;
+- optional properties cost the sum, over objects, of their count squared, divided by 11,000;
+- a schema that a `$ref` names outside `$defs` and `definitions` is compiled once more for the
+  reference, and costs again.
+
+Length bounds dominate in practice: a bound of 256 takes about two seconds on eight threads.
+
+Grammars compile during request preparation, off the decode loop, on two workers of eight threads
+each, and compiled grammars are cached in 256 MiB of host memory, so a repeated schema compiles
+once. A request waiting for its grammar keeps its preparation deadline and can be cancelled. The
+compiler's view of the vocabulary is built once at startup; `--no-structured-output` skips it.
+
+| Status | `code` | Cause |
+|---|---|---|
+| 400 | `invalid_output_constraint` | invalid or unsupported schema, limit exceeded, or a request that cannot carry a format |
+| 400 | `structured_outputs_unavailable` | the server runs with `--no-structured-output`, `--spec dflash` or `--spec dflash2` |
+| 500 | `output_constraint_violated` | the grammar refused a generated token: the request stops rather than continue unconstrained |
+
+DFlash and DFlash2 draft and verify inside one CUDA Graph, where no mask can reach the drafted
+positions, so servers started with them reject constrained requests. With MTP, a constrained
+request verifies no drafts for now: it decodes one token per round while the other requests of its
+batch keep their drafts, and a batch that holds a constrained request skips context lookup.
+
+Schemas and grammars never reach the logs: request records keep the error code, never its message.
 
 ## Authentication and CORS
 
@@ -796,6 +888,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--no-response-store` | retain no Responses; see [Zero data retention](#zero-data-retention) | store on |
+| `--no-structured-output` | build no grammar compiler and reject constrained requests; see [Structured output](#structured-output) | on |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--text-residual bf16\|fp32` | text residual stream storage; `fp32` on Volta for Qwen3.8-27B NVFP4 without DFlash | `bf16` |
 | `--prefill-attention auto\|splitd\|flash\|reference` | Volta wide prefill attention kernel | `auto` |
@@ -1096,8 +1189,8 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+responses. NInfer does not execute tools, and tool arguments are not constrained by their JSON
+Schema; answer formats are (see [Structured output](#structured-output)).
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

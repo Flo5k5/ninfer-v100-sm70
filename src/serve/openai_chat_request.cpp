@@ -131,19 +131,6 @@ void validate_standard_output_controls(const Json& body) {
         }
     }
 
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& format = body.at("response_format");
-        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
-            bad_request("response_format must contain a string type", "response_format");
-        }
-        if (format.at("type").get<std::string>() != "text") {
-            bad_request(
-                "this response_format requires constrained output, which NInfer cannot guarantee; "
-                "only {\"type\":\"text\"} is available",
-                "response_format", "response_format_not_supported");
-        }
-    }
-
     if (body.contains("modalities") && !body.at("modalities").is_null()) {
         const Json& modalities = body.at("modalities");
         if (!modalities.is_array() || modalities.empty()) {
@@ -574,6 +561,38 @@ ChatTurn parse_message(const Json& item, std::size_t index) {
     return parse_regular_message(item, index, role);
 }
 
+// response_format is {"type":"text"}, {"type":"json_object"}, or {"type":"json_schema",
+// "json_schema":{"name","description","schema","strict"}}. The schema is enforced whatever
+// strict says: the Engine rejects a schema it cannot enforce rather than relax it.
+void parse_response_format(const Json& body, GenerationRequest& output) {
+    if (!body.contains("response_format") || body.at("response_format").is_null()) { return; }
+    const Json& format = body.at("response_format");
+    if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+        bad_request("response_format must contain a string type", "response_format");
+    }
+    const std::string type = format.at("type").get<std::string>();
+    // A member these formats do not define, such as a schema next to json_object, is rejected
+    // rather than dropped.
+    if (type == "text" || type == "json_object") {
+        reject_unknown_members(format, {"type"}, "response_format", "response_format");
+        if (type == "json_object") {
+            output.response_format.kind = ninfer::ResponseFormatKind::JsonObject;
+        }
+        return;
+    }
+    if (type != "json_schema") {
+        bad_request("response_format type must be 'text', 'json_object', or 'json_schema'",
+                    "response_format");
+    }
+    reject_unknown_members(format, {"type", "json_schema"}, "response_format", "response_format");
+    if (!format.contains("json_schema") || !format.at("json_schema").is_object()) {
+        bad_request("response_format of type 'json_schema' requires a json_schema object",
+                    "response_format");
+    }
+    output.response_format = openai_json_schema_format(
+        format.at("json_schema"), {}, "response_format.json_schema", "response_format");
+}
+
 void parse_messages(const Json& body, GenerationRequest& output) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
@@ -909,6 +928,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_response_observations(body, output);
     parse_output_limit(body, limits, output);
     parse_reasoning_effort(body, output.generation);
+    parse_response_format(body, output.generation);
     const TemplateOptions template_options = parse_template_options(body);
     output.generation.enable_thinking      = template_options.enable_thinking;
     output.generation.preserve_thinking    = template_options.preserve_thinking;

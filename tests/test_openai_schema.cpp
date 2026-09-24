@@ -134,6 +134,75 @@ int test_request_envelope_and_sampling() {
     return failures;
 }
 
+int test_response_format() {
+    int failures = 0;
+
+    Json body               = base_request();
+    body["response_format"] = Json{{"type", "json_object"}};
+    failures +=
+        check(parse(body).generation.response_format.kind == ninfer::ResponseFormatKind::JsonObject,
+              "json_object response format parsed");
+
+    body = base_request();
+    body["response_format"] =
+        Json{{"type", "json_schema"},
+             {"json_schema",
+              Json{{"name", "answer"},
+                   {"strict", true},
+                   {"schema", Json{{"type", "object"},
+                                   {"properties", Json{{"b", Json{{"type", "integer"}}},
+                                                       {"a", Json{{"type", "string"}}}}}}}}}};
+    const GenerationRequest request = parse(body).generation;
+    failures +=
+        check(request.response_format.kind == ninfer::ResponseFormatKind::JsonSchema &&
+                  request.response_format.schema_json ==
+                      R"({"type":"object","properties":{"b":{"type":"integer"},)"
+                      R"("a":{"type":"string"}}})" &&
+                  request.response_format.schema_location == "response_format.json_schema.schema",
+              "json_schema response format keeps the schema text and its key order");
+    failures += check(prompt(request).options.response_format.schema_json ==
+                          request.response_format.schema_json,
+                      "response format reaches the prompt input");
+
+    const auto rejected = [&](Json format, const std::string& label) {
+        Json malformed               = base_request();
+        malformed["response_format"] = std::move(format);
+        const ApiError error         = api_error([&] { (void)parse(malformed); });
+        failures += check(error.status == 400 && error.param == "response_format", label);
+    };
+    rejected(Json{{"type", "json_schema"}}, "json_schema without its definition rejected");
+    rejected(Json{{"type", "json_schema"}, {"json_schema", Json{{"name", "x"}}}},
+             "json_schema without a schema rejected");
+    rejected(Json{{"type", "json_schema"}, {"json_schema", Json{{"schema", true}}}},
+             "a schema that is not an object rejected");
+    rejected(Json{{"type", "json_schema"},
+                  {"json_schema", Json{{"schema", Json::object()}, {"strict", "yes"}}}},
+             "a non-boolean strict rejected");
+    rejected(Json{{"type", "grammar"}}, "an unknown response format type rejected");
+    // llama.cpp's server reads a schema next to json_object; dropping it would answer with any
+    // object instead.
+    rejected(Json{{"type", "json_object"}, {"schema", Json{{"type", "object"}}}},
+             "a schema next to json_object rejected rather than dropped");
+    rejected(Json{{"type", "text"}, {"strict", true}}, "an unknown text format member rejected");
+    rejected(Json{{"type", "json_schema"},
+                  {"json_schema", Json{{"schema", Json::object()}}},
+                  {"schema", Json::object()}},
+             "a schema beside the json_schema definition rejected");
+    rejected(Json{{"type", "json_schema"},
+                  {"json_schema", Json{{"schema", Json::object()}, {"additional", true}}}},
+             "an unknown json_schema member rejected");
+    Json unknown               = base_request();
+    unknown["response_format"] = Json{{"type", "json_object"}, {"schema", Json::object()}};
+    failures += check(api_error([&] { (void)parse(unknown); }).code == "parameter_not_supported",
+                      "an unknown response format member has its own code");
+    Json null_member               = base_request();
+    null_member["response_format"] = Json{{"type", "json_object"}, {"schema", nullptr}};
+    failures += check(parse(null_member).generation.response_format.kind ==
+                          ninfer::ResponseFormatKind::JsonObject,
+                      "a null response format member is ignored");
+    return failures;
+}
+
 int test_standard_field_policy() {
     int failures  = 0;
     auto rejected = [&](const char* key, Json value, const char* code) {
@@ -148,7 +217,6 @@ int test_standard_field_policy() {
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
     rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "logprobs_not_supported");
-    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -784,6 +852,7 @@ int main() {
     int failures = 0;
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
+    failures += test_response_format();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
     failures += test_messages_and_media();

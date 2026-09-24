@@ -894,15 +894,37 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
     }
 }
 
-void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
+// A JSON output format is {"type":"json_schema","schema":{...}}; the Engine enforces the schema or
+// rejects it.
+void parse_output_format(const Json& format, const std::string& location,
+                         GenerationRequest& request) {
+    if (!format.is_object() || !format.contains("type") || !format.at("type").is_string() ||
+        format.at("type").get<std::string>() != "json_schema") {
+        bad_request(location + " must be an object of type 'json_schema'", location);
+    }
+    for (auto iterator = format.begin(); iterator != format.end(); ++iterator) {
+        if (iterator.key() != "type" && iterator.key() != "schema" && !iterator.value().is_null()) {
+            bad_request(location + "." + iterator.key() + " is not supported", location);
+        }
+    }
+    request.response_format =
+        json_schema_response_format(format, "schema", location + ".schema", location.c_str());
+}
+
+// output_config carries the output format and the effort. The top-level output_format of the
+// structured-outputs beta is still accepted as the same format.
+void parse_output_config(const Json& body, GenerationRequest& request) {
+    const bool beta_format = body.contains("output_format") && !body.at("output_format").is_null();
+    if (beta_format) { parse_output_format(body.at("output_format"), "output_format", request); }
     if (!body.contains("output_config") || body.at("output_config").is_null()) { return; }
     const Json& config = body.at("output_config");
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
-    if (purpose == ParsePurpose::Messages && config.contains("format") &&
-        !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+    if (config.contains("format") && !config.at("format").is_null()) {
+        if (beta_format) {
+            bad_request("output_format and output_config.format cannot both be set",
+                        "output_format");
+        }
+        parse_output_format(config.at("format"), "output_config.format", request);
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -1022,7 +1044,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
     parse_system(body, request);
     parse_messages(body, request);
     parse_thinking(body, request, purpose, effective_max_tokens, omitted_thinking_as_summarized);
-    parse_effort(body, request, purpose);
+    parse_output_config(body, request);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
         bad_request("container requires an external execution environment that NInfer does not "
