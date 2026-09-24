@@ -488,6 +488,28 @@ struct ResponseFormat {
     std::string schema_location;
 };
 
+enum class ToolChoiceMode : std::uint8_t {
+    // The answer may call tools.
+    Auto,
+    // The answer starts with at least one call, right after the reasoning part.
+    Required,
+    // The answer is one call of ToolCallOptions::named_tool.
+    Named,
+};
+
+// How the answer calls the tools of PromptOptions::tool_jsons. A grammar enforces it, like a
+// response format, as soon as a tool is strict, a call is required or named, or parallel calls are
+// off; otherwise tool calls stay unconstrained. The Engine rejects what it cannot enforce with
+// RequestErrorKind::InvalidOutputConstraint.
+struct ToolCallOptions {
+    ToolChoiceMode mode = ToolChoiceMode::Auto;
+    std::string named_tool;
+    // Empty, or one flag per tool_jsons entry: the arguments of a strict tool satisfy its
+    // parameter schema. Tools that are not strict take any arguments.
+    std::vector<bool> strict;
+    bool parallel_calls = true;
+};
+
 struct PromptOptions {
     PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
     bool enable_thinking                = true;
@@ -495,6 +517,7 @@ struct PromptOptions {
     bool preserve_thinking = false;
     bool add_vision_id     = false;
     std::vector<std::string> tool_jsons;
+    ToolCallOptions tool_calls;
     ResponseFormat response_format;
 };
 

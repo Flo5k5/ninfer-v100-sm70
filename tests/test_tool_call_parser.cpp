@@ -552,9 +552,10 @@ int test_strict_structure_and_active_tool_set() {
                        "missing structural tags were accepted");
 
     const std::string suffix = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
-    failures +=
-        check_rejected(suffix, contract, ninfer::ToolCallParseFallbackReason::TrailingContent,
-                       "non-whitespace suffix was accepted");
+    const auto with_suffix   = fi::parse_qwen_tool_call_output(suffix, 64, contract);
+    failures += check(with_suffix.is_tool_call_response && with_suffix.tool_calls.size() == 1 &&
+                          with_suffix.content == "extra answer",
+                      "text after a call did not become content next to the call");
 
     const std::string missing_parameter_close =
         "<tool_call>\n<function=configure>\n<parameter=value>\nx\n"
@@ -642,6 +643,47 @@ int test_all_or_nothing_structural_commit() {
                           "partially valid tool-call region was partially committed");
 }
 
+// A <tool_call> is a call only when <function= follows it; any other one is text, before or after
+// a call alike.
+int test_stray_markers_are_text() {
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string call = tool_call("configure", {{"value", "x"}});
+    int failures           = 0;
+
+    const auto alone = fi::parse_qwen_tool_call_output("<tool_call>hello", 64, contract);
+    failures += check(!alone.is_tool_call_response && alone.content == "<tool_call>hello" &&
+                          alone.diagnostics.marker_seen &&
+                          alone.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "a stray marker was not plain text");
+
+    const auto before =
+        fi::parse_qwen_tool_call_output("Mind the <tool_call> tag.\n" + call, 64, contract);
+    failures += check(before.is_tool_call_response && before.tool_calls.size() == 1 &&
+                          before.content == "Mind the <tool_call> tag.",
+                      "a stray marker before a call hid the call");
+
+    const auto after =
+        fi::parse_qwen_tool_call_output(call + "\n<tool_call>not a call", 64, contract);
+    failures += check(after.is_tool_call_response && after.tool_calls.size() == 1 &&
+                          after.content == "<tool_call>not a call",
+                      "a stray marker after a call did not become content");
+
+    const auto spaced = fi::parse_qwen_tool_call_output(
+        "<tool_call>\n\n<function=configure>\n<parameter=value>\nx\n</parameter>\n"
+        "</function>\n</tool_call>",
+        64, contract);
+    failures += check(spaced.is_tool_call_response && spaced.tool_calls.size() == 1,
+                      "whitespace between the call tags hid the call");
+
+    const auto around = fi::parse_qwen_tool_call_output(
+        "Checking.\n" + call + "\nNow the second.\n" + call + "\n", 64, contract);
+    failures += check(around.is_tool_call_response && around.tool_calls.size() == 2 &&
+                          around.content == "Checking.\n\nNow the second.",
+                      "text around calls was not joined into content");
+    return failures;
+}
+
 int test_incremental_valid_and_boolean() {
     fi::ToolCallOutputDecoder legacy(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string visible;
@@ -707,6 +749,34 @@ int test_incremental_fallback_preserves_bytes() {
     return failures;
 }
 
+// Streaming holds a marker only while it can still become a call, and publishes it as text at the
+// first byte that rules the call out.
+int test_incremental_stray_marker() {
+    const auto contract = output_contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures        = 0;
+
+    fi::ToolCallOutputDecoder open(contract, 64);
+    const std::string held = open.feed("Use <tool_call>");
+    const std::string released = open.feed("x");
+    failures += check(held == "Use" && released == " <tool_call>x" && open.finish().content.empty(),
+                      "a marker without <function= was not released at the next byte");
+
+    fi::ToolCallOutputDecoder unclosed(contract, 64);
+    std::string visible = unclosed.feed("Use <tool_call");
+    visible += unclosed.feed(" tags.");
+    failures += check(visible == "Use <tool_call tags." && unclosed.finish().content.empty(),
+                      "a broken marker was not released as text");
+
+    fi::ToolCallOutputDecoder after(contract, 64);
+    std::string streamed = after.feed(tool_call("configure", {{"value", "x"}}));
+    streamed += after.feed("\n<tool_call>hi");
+    const auto terminal = after.finish();
+    failures += check(streamed.empty() && terminal.tool_calls.size() == 1 &&
+                          terminal.content == "<tool_call>hi",
+                      "a stray marker after a call was not content of the terminal parse");
+    return failures;
+}
+
 int test_incremental_embedded_parameter_markup() {
     auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
     const std::string command = "pattern='<parameter=inner>value</parameter>'\n"
@@ -756,6 +826,8 @@ int main() {
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
+    failures += test_stray_markers_are_text();
+    failures += test_incremental_stray_marker();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -88,6 +88,8 @@ struct ToolDefinition {
     std::string input_schema_json;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
+    // The call's arguments must satisfy input_schema_json; the Engine enforces it with a grammar.
+    bool strict = false;
 };
 
 struct ToolCall {
@@ -99,10 +101,15 @@ struct ToolCall {
 enum class ToolChoiceMode {
     Auto,
     None,
+    // At least one call, right after the reasoning.
+    Required,
+    // One call of ToolChoice::name.
+    Named,
 };
 
 struct ToolChoice {
     ToolChoiceMode mode = ToolChoiceMode::Auto;
+    std::string name;
 };
 
 struct ChatTurn {
@@ -191,6 +198,8 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
+    // false: at most one tool call, enforced by the Engine's grammar.
+    bool parallel_tool_calls = true;
     SamplingParams sampling;
     // Constrains the answer to one JSON value; enforced by the Engine's grammar or rejected.
     ninfer::ResponseFormat response_format;

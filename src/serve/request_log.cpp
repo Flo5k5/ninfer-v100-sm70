@@ -94,12 +94,17 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                  ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
 }
 
+// The mode only: a named tool's name is request content.
 std::string tool_choice_name(const ToolChoice& choice) {
     switch (choice.mode) {
     case ToolChoiceMode::Auto:
         return "auto";
     case ToolChoiceMode::None:
         return "none";
+    case ToolChoiceMode::Required:
+        return "required";
+    case ToolChoiceMode::Named:
+        return "named";
     }
     return "unknown";
 }

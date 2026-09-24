@@ -784,23 +784,30 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         return tool.definition.name == selection.name;
     };
 
-    if (selection.kind == ToolSelectionKind::Named) {
-        if (std::none_of(definitions.begin(), definitions.end(), named)) {
-            bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
-        }
-        bad_request("tool_choice.type='tool' requires that exact tool to be called, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+    if (selection.kind == ToolSelectionKind::Named &&
+        std::none_of(definitions.begin(), definitions.end(), named)) {
+        bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
     }
-    if (selection.kind == ToolSelectionKind::Any) {
-        if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
-        bad_request("tool_choice.type='any' requires at least one tool call, which NInfer cannot "
-                    "guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+    if (selection.kind == ToolSelectionKind::Any && definitions.empty()) {
+        bad_request("tool_choice requires tools", "tool_choice");
     }
 
-    request.tool_choice.mode =
-        selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None : ToolChoiceMode::Auto;
+    switch (selection.kind) {
+    case ToolSelectionKind::Auto:
+        request.tool_choice.mode = ToolChoiceMode::Auto;
+        break;
+    case ToolSelectionKind::None:
+        request.tool_choice.mode = ToolChoiceMode::None;
+        break;
+    case ToolSelectionKind::Any:
+        request.tool_choice.mode = ToolChoiceMode::Required;
+        break;
+    case ToolSelectionKind::Named:
+        request.tool_choice.mode = ToolChoiceMode::Named;
+        request.tool_choice.name = selection.name;
+        break;
+    }
+    request.parallel_tool_calls = !selection.disable_parallel;
     if (selection.kind == ToolSelectionKind::None) {
         for (ParsedTool& tool : definitions) {
             if (tool.source == ToolSource::UserDefined) {
@@ -821,11 +828,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.strict) {
-            bad_request("strict=true requires generated tool input to satisfy the declared JSON "
-                        "Schema, which NInfer cannot guarantee",
-                        "tools", "strict_tools_not_supported");
-        }
+        tool.definition.strict = tool.strict;
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -839,11 +842,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                         "tools", "tool_caller_not_supported");
         }
         request.tools.push_back(std::move(tool.definition));
-    }
-    if (selection.disable_parallel && !request.tools.empty()) {
-        bad_request("disable_parallel_tool_use=true requires at most one tool call, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "parallel_tool_use_not_supported");
     }
 }
 

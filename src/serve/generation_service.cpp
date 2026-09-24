@@ -357,6 +357,9 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         input.context_cache.allow_engine_automatic_shared_prefixes =
             input.context_cache.allow_engine_automatic_shared_prefixes &&
             protocol_allows_engine_automatic;
+        if (options_.constrain_all_tool_arguments) {
+            input.options.tool_calls.strict.assign(input.options.tool_jsons.size(), true);
+        }
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);

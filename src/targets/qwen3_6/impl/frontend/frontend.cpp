@@ -930,53 +930,157 @@ make_grammar_service(const fi::Tokenizer& tokenizer, const std::vector<TokenId>&
                                        .cache_bytes     = options.cache_bytes});
 }
 
-// A grammar to compile for an output, with the request field it enforces: errors found while
-// compiling name that field.
+// A grammar to compile for an output, with the request fields it enforces: errors found while
+// compiling name them.
 struct OutputRecipe {
     grammar::GrammarRecipe recipe;
     std::string field;
 };
 
-// The grammar of a constrained answer, or nothing for free text. Throws
-// RequestError(InvalidOutputConstraint) when the format cannot be enforced as requested.
-std::optional<OutputRecipe> response_format_recipe(const PromptOptions& options) {
+// Qwen's tool calls as the chat template renders them. A call without arguments closes right after
+// the function line, so the tag begins without the newline that precedes each parameter.
+constexpr std::string_view kToolCallTrigger = "<tool_call>\n<function=";
+constexpr std::string_view kToolCallEnd     = "\n</function>\n</tool_call>";
+
+// Whether the answer must follow a grammar: a response format, or tool calls that are required,
+// named, strict or limited to one.
+bool constrains_output(const PromptOptions& options) {
+    const ToolCallOptions& tools = options.tool_calls;
+    const bool tool_grammar =
+        !options.tool_jsons.empty() &&
+        (tools.mode != ToolChoiceMode::Auto || !tools.parallel_calls ||
+         std::find(tools.strict.begin(), tools.strict.end(), true) != tools.strict.end());
+    return options.response_format.kind != ResponseFormatKind::Text || tool_grammar;
+}
+
+[[noreturn]] void reject_constraint(const std::string& message) {
+    throw RequestError(RequestErrorKind::InvalidOutputConstraint, message);
+}
+
+std::string admit_schema(grammar::SchemaAdmission& admission, std::string_view schema,
+                         std::string_view location) {
+    try {
+        return admission.admit(schema, location);
+    } catch (const grammar::GrammarError& error) { reject_constraint(error.what()); }
+}
+
+// The call tag of one tool: its parameters in Qwen's XML form, bound by the admitted schema of a
+// strict tool, any arguments otherwise.
+nlohmann::ordered_json tool_call_tag(const std::string& name, std::string_view parameters) {
+    nlohmann::ordered_json content = nlohmann::ordered_json::object();
+    content["type"]                = "json_schema";
+    content["json_schema"]         = nlohmann::ordered_json::parse(parameters);
+    content["style"]               = "qwen_xml";
+    content["max_whitespace_cnt"]  = 1;
+    nlohmann::ordered_json tag     = nlohmann::ordered_json::object();
+    tag["type"]                    = "tag";
+    tag["begin"]                   = std::string(kToolCallTrigger) + name + ">";
+    tag["content"]                 = std::move(content);
+    tag["end"]                     = std::string(kToolCallEnd);
+    return tag;
+}
+
+// The tool calls the answer may or must make. Next to a response format, the calls are the
+// alternative to the JSON value, with no text around them.
+grammar::GrammarRecipe tool_call_recipe(const PromptOptions& options,
+                                        grammar::SchemaAdmission& admission,
+                                        bool alongside_answer) {
+    const ToolCallOptions& choice = options.tool_calls;
+    if (!choice.strict.empty() && choice.strict.size() != options.tool_jsons.size()) {
+        throw std::invalid_argument("ToolCallOptions::strict must hold one flag per tool");
+    }
+    nlohmann::ordered_json tags = nlohmann::ordered_json::array();
+    std::optional<nlohmann::ordered_json> named;
+    for (std::size_t index = 0; index < options.tool_jsons.size(); ++index) {
+        const auto definition = nlohmann::ordered_json::parse(options.tool_jsons[index]);
+        const auto& function  = definition.at("function");
+        const std::string name = function.at("name").get<std::string>();
+        const bool strict      = !choice.strict.empty() && choice.strict[index];
+        const std::string parameters =
+            strict ? admit_schema(admission,
+                                  function.contains("parameters")
+                                      ? function.at("parameters").dump()
+                                      : std::string(kAnyJsonObjectSchema),
+                                  "tool '" + name + "' parameters")
+                   : std::string(kAnyJsonObjectSchema);
+        nlohmann::ordered_json tag = tool_call_tag(name, parameters);
+        if (choice.mode == ToolChoiceMode::Named && name == choice.named_tool) { named = tag; }
+        tags.push_back(std::move(tag));
+    }
+
+    nlohmann::ordered_json format = nlohmann::ordered_json::object();
+    if (choice.mode == ToolChoiceMode::Named) {
+        if (!named) { reject_constraint("the named tool '" + choice.named_tool + "' is not callable"); }
+        format = std::move(*named);
+    } else if (alongside_answer) {
+        format["type"]             = "tags_with_separator";
+        format["tags"]             = std::move(tags);
+        format["separator"]        = "\n";
+        format["at_least_one"]     = true;
+        format["stop_after_first"] = !choice.parallel_calls;
+    } else {
+        format["type"]             = "triggered_tags";
+        format["triggers"]         = nlohmann::ordered_json::array({std::string(kToolCallTrigger)});
+        format["tags"]             = std::move(tags);
+        format["excludes"]         = nlohmann::ordered_json::array({"<think>", "</think>"});
+        format["at_least_one"]     = choice.mode == ToolChoiceMode::Required;
+        format["stop_after_first"] = !choice.parallel_calls;
+    }
+    return grammar::GrammarRecipe::structural_tag(format.dump());
+}
+
+// The grammar of a constrained answer (constrains_output), reasoning part included. Throws
+// RequestError(InvalidOutputConstraint) when it cannot be enforced as requested.
+OutputRecipe output_recipe(const PromptOptions& options) {
     const ResponseFormat& format = options.response_format;
     switch (format.kind) {
     case ResponseFormatKind::Text:
-        return std::nullopt;
     case ResponseFormatKind::JsonObject:
     case ResponseFormatKind::JsonSchema:
         break;
     default:
         throw std::invalid_argument("PromptOptions contains an invalid response format kind");
     }
+    const ToolChoiceMode mode = options.tool_calls.mode;
+    if (mode != ToolChoiceMode::Auto && mode != ToolChoiceMode::Required &&
+        mode != ToolChoiceMode::Named) {
+        throw std::invalid_argument("PromptOptions contains an invalid tool choice mode");
+    }
     if (options.continuation != PromptContinuationMode::NewAssistantTurn) {
-        throw RequestError(RequestErrorKind::InvalidOutputConstraint,
-                           "a response format applies to a new assistant turn and cannot "
-                           "continue a final assistant message");
+        reject_constraint("a constrained answer applies to a new assistant turn and cannot "
+                          "continue a final assistant message");
     }
-    if (!options.tool_jsons.empty()) {
-        throw RequestError(RequestErrorKind::InvalidOutputConstraint,
-                           "a response format cannot yet be combined with callable tools");
+    if (mode != ToolChoiceMode::Auto && options.tool_jsons.empty()) {
+        reject_constraint("a required or named tool call needs callable tools");
     }
-    grammar::GrammarRecipe answer =
-        grammar::GrammarRecipe::json_schema(std::string(kAnyJsonObjectSchema));
-    std::string field = "response_format";
-    if (format.kind == ResponseFormatKind::JsonSchema) {
-        field = format.schema_location.empty() ? std::string("schema") : format.schema_location;
-        try {
-            grammar::SchemaAdmission admission{grammar::GrammarLimits{}};
-            answer =
-                grammar::GrammarRecipe::json_schema(admission.admit(format.schema_json, field));
-        } catch (const grammar::GrammarError& error) {
-            throw RequestError(RequestErrorKind::InvalidOutputConstraint, error.what());
-        }
+    grammar::SchemaAdmission admission{grammar::GrammarLimits{}};
+    std::optional<grammar::GrammarRecipe> answer;
+    std::string field;
+    // A required or named call is the whole answer: the response format applies to a later turn.
+    if (format.kind != ResponseFormatKind::Text && mode == ToolChoiceMode::Auto) {
+        field = format.kind == ResponseFormatKind::JsonSchema
+                    ? (format.schema_location.empty() ? std::string("schema")
+                                                      : format.schema_location)
+                    : std::string("response_format");
+        answer = grammar::GrammarRecipe::json_schema(
+            format.kind == ResponseFormatKind::JsonSchema
+                ? admit_schema(admission, format.schema_json, field)
+                : std::string(kAnyJsonObjectSchema));
     }
-    if (!options.enable_thinking) { return OutputRecipe{std::move(answer), std::move(field)}; }
-    return OutputRecipe{grammar::GrammarRecipe::sequence({grammar::GrammarRecipe::structural_tag(
-                                                              std::string(kReasoningPrefixFormat)),
-                                                          std::move(answer)}),
-                        std::move(field)};
+    if (!options.tool_jsons.empty()) { field = field.empty() ? "tools" : field + " and tools"; }
+    grammar::GrammarRecipe body = [&] {
+        if (options.tool_jsons.empty()) { return *answer; }
+        grammar::GrammarRecipe calls =
+            tool_call_recipe(options, admission, /*alongside_answer=*/answer.has_value());
+        if (!answer) { return calls; }
+        return grammar::GrammarRecipe::choice({std::move(*answer), std::move(calls)});
+    }();
+    if (!options.enable_thinking) { return OutputRecipe{std::move(body), std::move(field)}; }
+    return OutputRecipe{
+        grammar::GrammarRecipe::sequence(
+            {grammar::GrammarRecipe::structural_tag(std::string(kReasoningPrefixFormat)),
+             std::move(body)}),
+        std::move(field)};
 }
 
 // The grammar state of one constrained output, advanced by its committed model and control
@@ -1583,10 +1687,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     const PromptOptions options = input.options;
     // A constrained answer is admitted before the prompt is rendered and compiled once the prompt
     // fits, so that a request the Engine cannot serve fails before any compilation.
-    std::optional<OutputRecipe> output_recipe;
-    if (options.response_format.kind != ResponseFormatKind::Text) {
+    std::optional<OutputRecipe> constrained;
+    if (constrains_output(options)) {
         impl_->require_structured_output();
-        output_recipe = response_format_recipe(options);
+        constrained = output_recipe(options);
     }
     ContextCacheHints cache_hints = std::move(input.context_cache);
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
@@ -1690,8 +1794,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         checked_token_count(result.token_ids.size()));
     result.starts_in_reasoning =
         options.continuation == PromptContinuationMode::NewAssistantTurn && options.enable_thinking;
-    if (output_recipe) {
-        result.output_grammar = impl_->compile_output_grammar(*output_recipe, control);
+    if (constrained) {
+        result.output_grammar = impl_->compile_output_grammar(*constrained, control);
     }
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
