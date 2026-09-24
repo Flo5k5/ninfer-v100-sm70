@@ -302,6 +302,7 @@ capacities remain fixed for the process lifetime.
 - [HTTP serving](docs/serving.md)
 - [V100 qualification and performance](docs/v100.md)
 - [Perplexity evaluation](docs/perplexity.md)
+- [Weight conversion](docs/weight-conversion.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)
 - [CLI examples](examples/cli/)

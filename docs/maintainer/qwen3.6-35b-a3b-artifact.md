@@ -8,6 +8,13 @@ resources, and source-to-object transforms. Common framing is defined in
 [`storage-layouts.md`](storage-layouts.md), and model mathematics in
 [`qwen3.6-35b-a3b-model.md`](qwen3.6-35b-a3b-model.md).
 
+The v3 conversion pipeline writes this artifact with the official recipe `qwen3_6_35b_a3b`; see
+the [weight conversion guide](../weight-conversion.md). The object names, counts, and identities
+below describe the version-2 layout, which the Volta binder still addresses: its v2-to-v3 shim
+(`src/artifact/typed_binding.cpp`) resolves each name to the v3 object that its logical bindings
+cover, and derives the identity from the v3 metadata name and recipe. The source transforms and
+payload encodings below remain the contract of this artifact.
+
 ## 1. Artifact identity and contents
 
 The registered hierarchical artifact identity is:
