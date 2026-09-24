@@ -405,10 +405,10 @@ wire response contains typed `output` Items.
 | `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
-| `previous_response_id` | optional ID of a retained local Response |
+| `previous_response_id` | optional ID of a retained local Response; `previous_response_not_supported` with `--no-response-store` |
 | `max_output_tokens` | non-negative integer; omission executes with `--default-max-tokens` but remains `null` in the Response object |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
-| `store` | boolean, default `true`; controls local retrieval and continuation state |
+| `store` | boolean, default `true`; controls local retrieval and continuation state; with `--no-response-store` it defaults to `false` and `true` fails with `store_not_supported` |
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
@@ -618,11 +618,30 @@ explicit deletion also make an ID unavailable. A single Response larger than the
 capacity fails with `response_store_capacity_exceeded` rather than silently pretending it was
 stored.
 
+`--no-response-store` starts the server without a Responses store, so no Response object, input
+Item, or continuation context outlives its request:
+
+- `store` defaults to `false`, and JSON bodies and stream events report `"store": false`;
+- an explicit `store: true` fails before generation with HTTP 400 `store_not_supported`;
+- `previous_response_id` fails with HTTP 400 `previous_response_not_supported` on Create and on
+  input-token counting, so clients resend the complete conversation as `input`;
+- `GET`, `DELETE`, `input_items`, and `cancel` on `/v1/responses/{id}` return 404
+  `response_not_found`;
+- no Engine session key is derived from a response ID; compatible-prefix reuse is unaffected.
+
+OpenAI treats `store` as `false` for Zero Data Retention organizations. NInfer rejects an explicit
+`store: true` instead, matching its Chat Completions contract: the client asked for retrievable
+state that this server will not keep, and failing before generation is clearer than a later 404. A
+gateway that wants OpenAI's behavior can rewrite `store` to `false` before forwarding. The option
+cannot be combined with `--response-store-max-records` or `--response-store-max-mib`. See
+[Zero data retention](#zero-data-retention) for the complete retention contract.
+
 ### Responses input token count
 
 `POST /v1/responses/input_tokens` uses the same prompt path as Create and does not run generation.
-It accepts `model`, `input`, `instructions`, `previous_response_id`, reasoning, function tools and
-tool choice, supported text/truncation values, and the `preserve_thinking` extension. Parent lookup,
+It accepts `model`, `input`, `instructions`, `previous_response_id` (rejected with
+`--no-response-store`), reasoning, function tools and tool choice, supported text/truncation
+values, and the `preserve_thinking` extension. Parent lookup,
 call-ID normalization, template rendering, and media expansion are therefore identical to the
 corresponding Create request:
 
@@ -776,6 +795,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
+| `--no-response-store` | retain no Responses; see [Zero data retention](#zero-data-retention) | store on |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
@@ -830,8 +850,11 @@ readiness, request lifecycle, fixed-interval throughput, and shutdown; `--log-le
 internal startup and resource-planning detail. A terminal may use one transient line during startup,
 but Serve throughput is always a persistent record. Redirected stderr contains no terminal control
 sequences. Pretty values use readable units and rounded rates; use the independent request JSONL for
-complete fields and full precision. Operational records never contain prompts, generated text,
-request bodies, credentials, or arbitrary client error messages.
+complete fields and full precision. At every `--log-level`, operational records never contain
+prompts, generated text, tool names or arguments, request bodies, credentials, or error messages;
+failures are reported by phase, HTTP status, error code, and, for an unexpected exception, the
+content-free cause described under [Structured request log](#structured-request-log). `debug` and
+`trace` add only startup and resource-planning detail.
 If a tool marker is returned to text because its structure or tool identity cannot be represented,
 Serve emits one warning with only the failure classification, never the generated markup.
 
@@ -842,7 +865,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v20 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -852,15 +875,29 @@ they do not infer request behavior from process-global counter deltas.
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
-| `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
+| `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the HTTP status/type/code/parameter/cause of a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
-| `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
+| `request_error` | the resolved request configuration and the failure `phase` (`generation`, `response_render`, or `transport`) with its HTTP status/type/code/parameter/cause |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 
 `requested_reasoning_effort` is the client value or `null` when omitted.
 `resolved_reasoning_effort` is `none`, a native effort tier, or `null` when thinking is enabled but
 the template has no tiered default. A preparation rejection always leaves the resolved field
 `null`.
+
+`request.model` is the served public model ID. `request.requested_model` is the client's `model`
+value when it has at most 128 characters, all from `[A-Za-z0-9._:@/-]`, and `other` otherwise.
+OpenAI endpoints accept only the served ID, so `requested_model` repeats it there, or is `other`
+when an operator's `--model-id` falls outside that shape. Anthropic clients may send any string:
+text with spaces or other characters, or a longer value, is written as `other`, but a value of that
+shape is written as sent, so clients should not put secrets or user text in `model`.
+
+`error.cause` is `null` unless an unexpected exception caused the failure. It then names the
+exception type, never its message: `out_of_memory`, `json_error_<id>` with the JSON library's
+exception id (for example `json_error_316` for invalid UTF-8), `system_error_<code>`,
+`invalid_argument`, `out_of_range`, `length_error`, `logic_error`, `api_error`, `runtime_error`,
+`exception`, or `unknown` for a non-standard exception. A response-rendering failure reports the
+exception that rendering raised.
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
@@ -894,11 +931,13 @@ round count; `units` reports its prefill/control unit counts. In a compact batch
 request is delayed by the full round, so these values explain request latency but **must not be
 summed across concurrent requests**.
 
-The JSONL file contains no generated response text and never records an API-key value; `argv`
-replaces that value with `<redacted>`. Operational stderr summaries are rounded and are not the
-aggregation source. OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a
-request ID when they enter synchronous preparation. Successful preparation produces
-`request_start`; a preparation failure produces `request_rejected` without a matching start. Each
+The JSONL file contains no prompt or generated text, tool definitions or arguments, media locations,
+error messages, or client model values outside the alias shape above, and never records an API-key
+value; `argv` replaces that value with `<redacted>`. Error messages can quote client input or model output, so they reach only
+the HTTP client. Operational stderr summaries are rounded and are not the aggregation source.
+OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a request ID when they
+enter synchronous preparation. Successful preparation produces `request_start`; a preparation
+failure produces `request_rejected` without a matching start. Each
 started generation transaction then has exactly one machine terminal: `request_done` when Engine
 returns its outcome, or `request_error` when generation fails before an outcome exists. Later
 response rendering, Responses storage, or terminal transport failures are operational response
@@ -934,6 +973,45 @@ complete measurement analysis.
 Intervals with context materialization or retention activity are retained even when they contain no
 token execution; only fully idle intervals are omitted. Downstream measurement should prefer the
 raw counters and seconds over rounded stderr rates.
+
+## Zero data retention
+
+Zero data retention (ZDR) here has the industry-standard meaning used by hosted APIs such as
+OpenAI's and Anthropic's: request and response content is never written to disk or to a log, and no
+response is stored for later retrieval, while volatile caches in GPU and Host memory may keep recent
+conversations until eviction or restart. Start the server with `--no-response-store` for this mode.
+Logging needs no option: no log carries request content at any `--log-level`.
+
+| Surface | What it keeps with `--no-response-store` |
+|---|---|
+| Responses store | nothing; see [Local response state and resources](#local-response-state-and-resources) |
+| Chat Completions and Anthropic Messages | nothing; Chat Completions rejects `store: true` |
+| Operational stderr log, every `--log-level` | request IDs, protocol, message/tool/media counts, token counts, timings, HTTP status, error codes, and content-free failure causes |
+| `--request-log-jsonl FILE` | the same classes of fields at full precision, the redacted `argv`, the served model ID, and the client's model alias only when it is identifier-shaped |
+| Engine context cache (prefix reuse) | token IDs, KV, and recurrent state of recent conversations, in GPU and pinned Host memory: prompts and the replies generated for them, since a finished request keeps a checkpoint at the end of its output. Token IDs decode back to the exact text, including system prompts, tool definitions, earlier turns, and generated reasoning. Entries stay until resource pressure evicts them or the process exits, and are never written to disk or to a log |
+| Media cache, with `--vision` | prepared tensors of recent images and videos, keyed by a content digest, in Host memory up to `--media-cache-mib`. Entries stay until least-recently-used eviction or process exit, and are never written to disk or to a log |
+
+These caches are what keep agent sessions fast: a follow-up turn reuses its cached prefix and
+prefills only the new suffix.
+
+For a strict mode that retains nothing from one request to the next, disable both caches as well:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --no-response-store --no-prefix-reuse --media-cache-mib 0
+```
+
+`--no-prefix-reuse` retains no checkpoint after a request, and `--media-cache-mib 0` retains no
+prepared media. The cost is prefill: every turn of an agent conversation re-prefills its whole
+context. On one V100, Qwen3.8-27B NVFP4 spends about 27 s re-prefilling a 26k-token context on every
+turn, where prefix reuse would compute only the new tokens.
+
+In both modes, the memory of a finished request is released for reuse, not scrubbed, so it can hold
+that request's data until it is overwritten. Error messages can quote client input or model output,
+so they are returned only in the HTTP response and never logged. The server writes no dumps,
+traces, or crash reports of its own, but process memory can still reach disk through the host:
+disable core dumps (for example `ulimit -c 0`, or `--ulimit core=0` for a container) and use no swap
+or encrypted swap.
 
 ## Execution behavior
 

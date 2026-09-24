@@ -156,7 +156,7 @@ Run the serving contract manually after starting a resident server in another te
 
 ```bash
 ./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
-  --host 127.0.0.1 --port 18080
+  --host 127.0.0.1 --port 18080 --vision
 ```
 
 ```bash
@@ -166,7 +166,11 @@ python3 -m tools.smoke.serve_contract \
 
 This smoke check is intentionally not a CTest: it needs the real artifact, a supported GPU, and a
 server process that remains alive while the client exercises OpenAI Responses/Chat, Anthropic,
-state, streaming, and multimodal requests.
+state, streaming, and multimodal requests. For a server started with `--no-response-store`, add
+`--no-response-store` to the client: Create must then echo `"store": false` when `store` is omitted
+or false, reject `store: true` and `previous_response_id` with HTTP 400, and answer `GET`, `DELETE`,
+`input_items`, and `cancel` for the returned IDs with 404. Add `--no-vision` when the server runs
+without `--vision`, and export `NINFER_API_KEY` when it requires a key.
 
 The thinking-preservation fixture starts and stops its own server, submits a fixed two-step tool
 history, compares restored and cold greedy output, compares stripped and preserved closed-turn

@@ -1,8 +1,34 @@
 #include "serve/request_events.h"
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <new>
+#include <stdexcept>
+#include <system_error>
 #include <utility>
 
 namespace ninfer::serve {
+namespace {
+
+constexpr std::size_t kMaximumModelAliasBytes = 128;
+
+bool is_model_identifier_character(char value) noexcept {
+    return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+           (value >= '0' && value <= '9') || value == '.' || value == '_' || value == ':' ||
+           value == '@' || value == '/' || value == '-';
+}
+
+} // namespace
+
+std::string log_safe_model_alias(std::string_view requested_model) {
+    if (requested_model.empty() || requested_model.size() > kMaximumModelAliasBytes ||
+        !std::all_of(requested_model.begin(), requested_model.end(),
+                     is_model_identifier_character)) {
+        return "other";
+    }
+    return std::string(requested_model);
+}
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
@@ -11,7 +37,8 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     RequestLogContext context;
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
-    context.model                              = metadata.model;
+    context.model                              = std::string(metadata.served_model);
+    context.requested_model                    = log_safe_model_alias(metadata.requested_model);
     context.stream                             = metadata.stream;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
@@ -40,7 +67,8 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     RequestRejectionLogContext context;
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
-    context.model                              = metadata.model;
+    context.model                              = std::string(metadata.served_model);
+    context.requested_model                    = log_safe_model_alias(metadata.requested_model);
     context.stream                             = metadata.stream;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
@@ -52,6 +80,42 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     context.requested_reasoning_effort         = request.reasoning_effort;
     context.error                              = std::move(error);
     return context;
+}
+
+RequestRejectionLogContext make_request_rejection_log_context(
+    std::uint64_t id, std::string protocol, const GenerationRequest& request,
+    const RequestLogMetadata& metadata, ApiError error, const std::exception& cause) {
+    RequestRejectionLogContext context = make_request_rejection_log_context(
+        id, std::move(protocol), request, metadata, std::move(error));
+    context.cause = internal_failure_cause(cause);
+    return context;
+}
+
+std::string internal_failure_cause(const std::exception& exception) {
+    if (const auto* wrapper = dynamic_cast<const std::nested_exception*>(&exception);
+        wrapper != nullptr && wrapper->nested_ptr() != nullptr) {
+        try {
+            wrapper->rethrow_nested();
+        } catch (const std::exception& nested) {
+            return internal_failure_cause(nested);
+        } catch (...) { return "unknown"; }
+    }
+    if (dynamic_cast<const std::bad_alloc*>(&exception) != nullptr) { return "out_of_memory"; }
+    if (const auto* json = dynamic_cast<const nlohmann::json::exception*>(&exception)) {
+        return "json_error_" + std::to_string(json->id);
+    }
+    if (const auto* system = dynamic_cast<const std::system_error*>(&exception)) {
+        return "system_error_" + std::to_string(system->code().value());
+    }
+    if (dynamic_cast<const std::invalid_argument*>(&exception) != nullptr) {
+        return "invalid_argument";
+    }
+    if (dynamic_cast<const std::out_of_range*>(&exception) != nullptr) { return "out_of_range"; }
+    if (dynamic_cast<const std::length_error*>(&exception) != nullptr) { return "length_error"; }
+    if (dynamic_cast<const std::logic_error*>(&exception) != nullptr) { return "logic_error"; }
+    if (dynamic_cast<const ApiException*>(&exception) != nullptr) { return "api_error"; }
+    if (dynamic_cast<const std::runtime_error*>(&exception) != nullptr) { return "runtime_error"; }
+    return "exception";
 }
 
 RequestFailure make_request_failure(RequestFailurePhase phase, const ApiError& error) {
@@ -71,13 +135,12 @@ RequestFailure make_request_failure(RequestFailurePhase phase, const ApiError& e
         classification = RequestFailureClass::ClientInput;
     }
     return RequestFailure{
-        .phase           = phase,
-        .classification  = classification,
-        .http_status     = error.status,
-        .error_type      = error.type,
-        .error_code      = error.code,
-        .param           = error.param,
-        .machine_message = error.message,
+        .phase          = phase,
+        .classification = classification,
+        .http_status    = error.status,
+        .error_type     = error.type,
+        .error_code     = error.code,
+        .param          = error.param,
     };
 }
 
@@ -90,24 +153,33 @@ RequestFailure make_generation_request_failure(const ApiError& error) {
 }
 
 RequestFailure make_internal_request_failure(RequestFailurePhase phase,
-                                             std::string machine_message) {
+                                             const std::exception& exception) {
     return RequestFailure{
-        .phase           = phase,
-        .classification  = RequestFailureClass::Internal,
-        .http_status     = 500,
-        .error_type      = "internal_error",
-        .machine_message = std::move(machine_message),
+        .phase          = phase,
+        .classification = RequestFailureClass::Internal,
+        .http_status    = 500,
+        .error_type     = "internal_error",
+        .cause          = internal_failure_cause(exception),
+    };
+}
+
+RequestFailure make_unknown_internal_request_failure(RequestFailurePhase phase) {
+    return RequestFailure{
+        .phase          = phase,
+        .classification = RequestFailureClass::Internal,
+        .http_status    = 500,
+        .error_type     = "internal_error",
+        .cause          = "unknown",
     };
 }
 
 RequestFailure make_client_disconnected_failure(RequestFailurePhase phase) {
     return RequestFailure{
-        .phase           = phase,
-        .classification  = RequestFailureClass::ClientDisconnected,
-        .http_status     = 499,
-        .error_type      = "request_cancelled",
-        .error_code      = "client_disconnected",
-        .machine_message = "client disconnected",
+        .phase          = phase,
+        .classification = RequestFailureClass::ClientDisconnected,
+        .http_status    = 499,
+        .error_type     = "request_cancelled",
+        .error_code     = "client_disconnected",
     };
 }
 

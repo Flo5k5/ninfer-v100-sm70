@@ -22,7 +22,10 @@ public:
     [[nodiscard]] const char* what() const noexcept override { return "client disconnected"; }
 };
 
-class ResponseRenderFailure final : public std::runtime_error {
+// Wraps an exception raised while rendering or writing a response. It is constructed while that
+// exception is being handled, so std::nested_exception keeps it and internal_failure_cause() can
+// report the original exception type instead of this wrapper.
+class ResponseRenderFailure final : public std::runtime_error, public std::nested_exception {
 public:
     explicit ResponseRenderFailure(const std::string& message) : std::runtime_error(message) {}
 };

@@ -1,9 +1,14 @@
-"""Exercise the implemented NInfer HTTP product contract with the standard library."""
+"""Exercise the implemented NInfer HTTP product contract with the standard library.
+
+When the server requires an API key, export it as NINFER_API_KEY before running this client: it
+sends the key as a Bearer token and deliberately has no command-line option for it.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -30,9 +35,13 @@ class Response:
     body: bytes
 
 
-def request(base_url: str, method: str, path: str, payload: Any | None = None) -> Response:
+def send(base_url: str, method: str, path: str, payload: Any | None = None) -> Response:
+    """Send one request and return its response, including an HTTP error response."""
     body = None
     headers = {"Accept": "application/json"}
+    api_key = os.environ.get("NINFER_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -45,8 +54,46 @@ def request(base_url: str, method: str, path: str, payload: Any | None = None) -
                 body=response.read(),
             )
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise ContractError(f"{method} {path} returned HTTP {error.code}: {detail}") from error
+        return Response(
+            status=error.code,
+            content_type=error.headers.get_content_type(),
+            body=error.read(),
+        )
+
+
+def request(base_url: str, method: str, path: str, payload: Any | None = None) -> Response:
+    response = send(base_url, method, path, payload)
+    if response.status >= 400:
+        detail = response.body.decode("utf-8", errors="replace")
+        raise ContractError(f"{method} {path} returned HTTP {response.status}: {detail}")
+    return response
+
+
+def expect_openai_error(
+    base_url: str,
+    method: str,
+    path: str,
+    payload: Any | None = None,
+    *,
+    status: int,
+    code: str,
+    param: str,
+) -> None:
+    """Require one request to fail with the given OpenAI error status, code, and parameter."""
+    response = send(base_url, method, path, payload)
+    try:
+        error = json.loads(response.body).get("error")
+    except (json.JSONDecodeError, AttributeError):
+        error = None
+    if (
+        response.status != status
+        or not isinstance(error, dict)
+        or (error.get("code"), error.get("param")) != (code, param)
+    ):
+        raise ContractError(
+            f"{method} {path} returned HTTP {response.status} with error {error!r}; "
+            f"expected HTTP {status} code={code!r} param={param!r}"
+        )
 
 
 def json_response(
@@ -241,16 +288,19 @@ def responses_nonstream(
     model: str,
     input_value: Any,
     *,
-    store: bool,
+    store: bool | None,
+    echoed_store: bool | None = None,
     previous_response_id: str | None = None,
 ) -> dict[str, Any]:
+    """Create a Response; `store=None` omits the field, which must then echo `echoed_store`."""
     payload: dict[str, Any] = {
         "model": model,
         "input": input_value,
         "max_output_tokens": 16,
         "temperature": 0,
-        "store": store,
     }
+    if store is not None:
+        payload["store"] = store
     if previous_response_id is not None:
         payload["previous_response_id"] = previous_response_id
     response = json_response(base_url, "POST", "/v1/responses", payload)
@@ -261,7 +311,8 @@ def responses_nonstream(
         raise ContractError("Responses non-streaming envelope has the wrong shape")
     if not isinstance(response.get("id"), str) or not response["id"].startswith("resp_"):
         raise ContractError("Responses non-streaming envelope has an invalid id")
-    if response.get("model") != model or response.get("store") is not store:
+    expected_store = store if store is not None else echoed_store
+    if response.get("model") != model or response.get("store") is not expected_store:
         raise ContractError("Responses non-streaming request fields were not echoed")
     require_responses_usage(response.get("usage"))
     response_text(response)
@@ -323,7 +374,97 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     return terminal_content, terminal_reasoning, terminal
 
 
-def exercise(base_url: str, model: str) -> dict[str, Any]:
+def exercise_stored_responses(base_url: str, model: str) -> None:
+    """Store, retrieve, list, continue, and delete Responses on a server with a store."""
+    stored_response = responses_nonstream(
+        base_url, model, "Remember the code word ORCHID. Reply briefly.", store=True
+    )
+    stored_id = stored_response.get("id")
+    if not isinstance(stored_id, str) or not stored_id.startswith("resp_"):
+        raise ContractError("stored Response has an invalid id")
+    retrieved = json_response(base_url, "GET", f"/v1/responses/{stored_id}")
+    if retrieved != stored_response:
+        raise ContractError("retrieved Response differs from the created Response")
+    input_items = json_response(
+        base_url, "GET", f"/v1/responses/{stored_id}/input_items?order=asc"
+    )
+    if input_items.get("object") != "list" or len(input_items.get("data", [])) != 1:
+        raise ContractError("Responses input_items list has the wrong shape")
+    continuation_input = "What code word was given? Reply with only that word."
+    continuation = responses_nonstream(
+        base_url,
+        model,
+        continuation_input,
+        store=True,
+        previous_response_id=stored_id,
+    )
+    standalone_continuation_count = json_response(
+        base_url,
+        "POST",
+        "/v1/responses/input_tokens",
+        {"model": model, "input": continuation_input},
+    )["input_tokens"]
+    continuation_prompt_tokens, _ = require_responses_usage(continuation.get("usage"))
+    if continuation.get("previous_response_id") != stored_id or (
+        continuation_prompt_tokens <= standalone_continuation_count
+    ):
+        raise ContractError("previous_response_id did not reconstruct stored context")
+    continuation_id = continuation.get("id")
+    for response_id in (continuation_id, stored_id):
+        deleted = json_response(base_url, "DELETE", f"/v1/responses/{response_id}")
+        if deleted != {"id": response_id, "object": "response.deleted", "deleted": True}:
+            raise ContractError("Responses delete returned the wrong object")
+
+
+def exercise_storeless_responses(base_url: str, model: str) -> None:
+    """Check a --no-response-store server: Responses are served but never stored or retrievable."""
+    prompt = "Remember the code word ORCHID. Reply briefly."
+    omitted = responses_nonstream(base_url, model, prompt, store=None, echoed_store=False)
+    explicit_false = responses_nonstream(base_url, model, prompt, store=False)
+    expect_openai_error(
+        base_url,
+        "POST",
+        "/v1/responses",
+        {"model": model, "input": prompt, "store": True},
+        status=400,
+        code="store_not_supported",
+        param="store",
+    )
+    continuation = {
+        "model": model,
+        "input": "What code word was given? Reply with only that word.",
+        "previous_response_id": omitted["id"],
+    }
+    for path in ("/v1/responses", "/v1/responses/input_tokens"):
+        expect_openai_error(
+            base_url,
+            "POST",
+            path,
+            continuation,
+            status=400,
+            code="previous_response_not_supported",
+            param="previous_response_id",
+        )
+    for response_id in (omitted["id"], explicit_false["id"]):
+        for method, path in (
+            ("GET", f"/v1/responses/{response_id}"),
+            ("GET", f"/v1/responses/{response_id}/input_items"),
+            ("POST", f"/v1/responses/{response_id}/cancel"),
+            ("DELETE", f"/v1/responses/{response_id}"),
+        ):
+            expect_openai_error(
+                base_url,
+                method,
+                path,
+                status=404,
+                code="response_not_found",
+                param="response_id",
+            )
+
+
+def exercise(
+    base_url: str, model: str, *, response_store: bool = True, vision: bool = True
+) -> dict[str, Any]:
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
     if models.get("object") != "list" or not isinstance(entries, list) or len(entries) != 1:
@@ -405,9 +546,11 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "input": responses_input,
         "max_output_tokens": 16,
         "temperature": 0,
-        "store": False,
         "stream": True,
     }
+    # A server without a store must resolve the omitted field to false by itself.
+    if response_store:
+        response_stream_payload["store"] = False
     response_stream = request(
         base_url, "POST", "/v1/responses", response_stream_payload
     )
@@ -422,45 +565,13 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     _, streamed_output_tokens = require_responses_usage(response_stream_terminal.get("usage"))
     if streamed_output_tokens != response_output_tokens:
         raise ContractError("Responses streaming output-token usage differs")
+    if response_stream_terminal.get("store") is not False:
+        raise ContractError("Responses stream did not report store=false")
 
-    stored_response = responses_nonstream(
-        base_url, model, "Remember the code word ORCHID. Reply briefly.", store=True
-    )
-    stored_id = stored_response.get("id")
-    if not isinstance(stored_id, str) or not stored_id.startswith("resp_"):
-        raise ContractError("stored Response has an invalid id")
-    retrieved = json_response(base_url, "GET", f"/v1/responses/{stored_id}")
-    if retrieved != stored_response:
-        raise ContractError("retrieved Response differs from the created Response")
-    input_items = json_response(
-        base_url, "GET", f"/v1/responses/{stored_id}/input_items?order=asc"
-    )
-    if input_items.get("object") != "list" or len(input_items.get("data", [])) != 1:
-        raise ContractError("Responses input_items list has the wrong shape")
-    continuation_input = "What code word was given? Reply with only that word."
-    continuation = responses_nonstream(
-        base_url,
-        model,
-        continuation_input,
-        store=True,
-        previous_response_id=stored_id,
-    )
-    standalone_continuation_count = json_response(
-        base_url,
-        "POST",
-        "/v1/responses/input_tokens",
-        {"model": model, "input": continuation_input},
-    )["input_tokens"]
-    continuation_prompt_tokens, _ = require_responses_usage(continuation.get("usage"))
-    if continuation.get("previous_response_id") != stored_id or (
-        continuation_prompt_tokens <= standalone_continuation_count
-    ):
-        raise ContractError("previous_response_id did not reconstruct stored context")
-    continuation_id = continuation.get("id")
-    for response_id in (continuation_id, stored_id):
-        deleted = json_response(base_url, "DELETE", f"/v1/responses/{response_id}")
-        if deleted != {"id": response_id, "object": "response.deleted", "deleted": True}:
-            raise ContractError("Responses delete returned the wrong object")
+    if response_store:
+        exercise_stored_responses(base_url, model)
+    else:
+        exercise_storeless_responses(base_url, model)
 
     image_messages = [
         {
@@ -471,12 +582,26 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
             ],
         }
     ]
-    image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
-    image_prompt_tokens, _ = require_usage(
-        image_response.get("usage"), "prompt_tokens", "completion_tokens"
-    )
-    if image_prompt_tokens <= input_tokens:
-        raise ContractError("image request did not expand the prompt through the Vision frontend")
+    image_prompt_tokens: int | None = None
+    if vision:
+        image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
+        image_prompt_tokens, _ = require_usage(
+            image_response.get("usage"), "prompt_tokens", "completion_tokens"
+        )
+        if image_prompt_tokens <= input_tokens:
+            raise ContractError(
+                "image request did not expand the prompt through the Vision frontend"
+            )
+    else:
+        expect_openai_error(
+            base_url,
+            "POST",
+            "/v1/chat/completions",
+            {"model": model, "messages": image_messages, "max_completion_tokens": 2},
+            status=400,
+            code="vision_disabled",
+            param="messages",
+        )
 
     anthropic = json_response(base_url, "POST", "/v1/messages", anthropic_prompt)
     if anthropic.get("type") != "message" or anthropic.get("role") != "assistant":
@@ -493,8 +618,10 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         raise ContractError("Anthropic usage input_tokens differs from count_tokens")
 
     return {
-        "format": "ninfer_serve_contract_v2",
+        "format": "ninfer_serve_contract_v3",
         "model": model,
+        "response_store": response_store,
+        "vision": vision,
         "count_tokens": input_tokens,
         "openai_finish_reason": stream_finish,
         "openai_completion_tokens": stream_usage["completion_tokens"],
@@ -510,11 +637,29 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:18080")
     parser.add_argument("--model", required=True)
     parser.add_argument("--health-timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--no-response-store",
+        action="store_true",
+        help="the server runs with --no-response-store: require that Responses are served but "
+        "never stored, continued, or retrievable",
+    )
+    parser.add_argument(
+        "--no-vision",
+        action="store_true",
+        help="the server runs without --vision: require that media requests fail with "
+        "vision_disabled",
+    )
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     wait_for_health(base_url, args.health_timeout)
-    print(json.dumps(exercise(base_url, args.model), ensure_ascii=False, indent=2))
+    result = exercise(
+        base_url,
+        args.model,
+        response_store=not args.no_response_store,
+        vision=not args.no_vision,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

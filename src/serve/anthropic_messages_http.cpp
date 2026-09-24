@@ -28,7 +28,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     } catch (const std::exception& exception) {
         operational_log_.http_failure(
             "anthropic_count_tokens",
-            make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
+            make_internal_request_failure(RequestFailurePhase::Http, exception), request_id);
         ApiError error;
         error.status  = 500;
         error.message = exception.what();
@@ -52,7 +52,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     } catch (const std::exception& exception) {
         operational_log_.http_failure(
             "anthropic_messages",
-            make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
+            make_internal_request_failure(RequestFailurePhase::Http, exception), request_id);
         ApiError error;
         error.status  = 500;
         error.message = exception.what();
@@ -61,7 +61,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     const std::uint64_t req_id = ++request_seq_;
-    const RequestLogMetadata metadata{.model                  = request.model,
+    const RequestLogMetadata metadata{.served_model           = public_model_id_,
+                                      .requested_model        = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
@@ -82,7 +83,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         error.type    = "internal_error";
         error.message = exception.what();
         record_request_rejected(make_request_rejection_log_context(
-            req_id, "anthropic_messages", request.generation, metadata, error));
+            req_id, "anthropic_messages", request.generation, metadata, error, exception));
         write_anthropic_error(res, error, request_id);
         return;
     }
@@ -105,7 +106,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             return;
         } catch (const std::exception& exception) {
             lifecycle->failure(
-                make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+                make_internal_request_failure(RequestFailurePhase::Generation, exception));
             ApiError error;
             error.status  = 500;
             error.message = exception.what();
@@ -122,8 +123,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 make_request_failure(RequestFailurePhase::ResponseRender, error));
             write_anthropic_error(res, error, request_id);
         } catch (const std::exception& exception) {
-            lifecycle->response_failure(make_internal_request_failure(
-                RequestFailurePhase::ResponseRender, exception.what()));
+            lifecycle->response_failure(
+                make_internal_request_failure(RequestFailurePhase::ResponseRender, exception));
             ApiError error;
             error.status  = 500;
             error.message = exception.what();
@@ -159,7 +160,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                         return false;
                     } catch (const ResponseRenderFailure& exception) {
                         lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
+                            RequestFailurePhase::ResponseRender, exception));
                         return false;
                     }
                 };
@@ -185,7 +186,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     return false;
                 } catch (const ResponseRenderFailure& exception) {
                     lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
+                        RequestFailurePhase::ResponseRender, exception));
                     ApiError error;
                     error.status  = 500;
                     error.message = exception.what();
@@ -195,8 +196,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     lifecycle->failure(make_generation_request_failure(error));
                     return send_error(error);
                 } catch (const std::exception& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
+                    lifecycle->failure(
+                        make_internal_request_failure(RequestFailurePhase::Generation, exception));
                     ApiError error;
                     error.status  = 500;
                     error.message = exception.what();
@@ -209,7 +210,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     terminal = encoder->finish(outcome);
                 } catch (const std::exception& exception) {
                     lifecycle->response_failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
+                        RequestFailurePhase::ResponseRender, exception));
                     ApiError error;
                     error.status  = 500;
                     error.message = exception.what();
@@ -234,7 +235,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             });
     } catch (const std::exception& exception) {
         lifecycle->failure(
-            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
+            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception));
         ApiError error;
         error.status  = 500;
         error.message = exception.what();

@@ -43,6 +43,12 @@ struct ServeOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    // --no-response-store: keep no Responses objects, input Items, or continuation contexts, and
+    // reject the requests that need them. The two limits below then have no effect. The volatile
+    // Engine prefix cache and media cache still hold recent prompts, generated replies, and media
+    // in memory; they have their own switches (see the zero data retention section of
+    // docs/serving.md).
+    bool enable_response_store             = true;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;

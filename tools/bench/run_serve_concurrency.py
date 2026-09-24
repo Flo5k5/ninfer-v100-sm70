@@ -684,8 +684,9 @@ def analyze_point(
 ) -> dict[str, Any]:
     errors = [event for event in events if event.get("event") == "request_error"]
     if errors:
-        message = errors[0].get("error", {}).get("message", "unknown request error")
-        raise corpus.CampaignError(f"serving request failed: {message}")
+        raise corpus.CampaignError(
+            f"serving request failed: {corpus.describe_request_error(errors[0])}"
+        )
     request_done = [event for event in events if event.get("event") == "request_done"]
     throughput = [event for event in events if event.get("event") == "throughput"]
     if len(request_done) != len(results):

@@ -45,6 +45,14 @@ class OpenAIResponsesStore {
 public:
     OpenAIResponsesStore(std::size_t max_records, std::size_t max_bytes);
 
+    // A disabled store retains nothing: get() never finds a Response, erase() never removes one,
+    // and put() is a logic error because request validation must already have rejected store=true.
+    // Serve uses it for --no-response-store, so no Response object, input Item, or continuation
+    // context outlives its request.
+    [[nodiscard]] static OpenAIResponsesStore disabled();
+
+    [[nodiscard]] bool enabled() const noexcept { return max_records_ != 0; }
+
     // get() refreshes LRU recency. Returned immutable records remain valid if
     // another request evicts or deletes their public store entry.
     std::shared_ptr<const StoredOpenAIResponse> get(const std::string& id);
@@ -60,6 +68,8 @@ private:
         std::list<std::string>::iterator lru;
         std::size_t envelope_bytes = 0;
     };
+
+    OpenAIResponsesStore() = default;
 
     void retain_context_locked(const OpenAIResponseContext& context);
     void release_context_locked(const OpenAIResponseContext& context);

@@ -213,9 +213,14 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     return authorization.substr(position, end - position) == api_key;
 }
 
+OpenAIResponsesStore make_openai_responses_store(const ServeOptions& options) {
+    if (!options.enable_response_store) { return OpenAIResponsesStore::disabled(); }
+    return OpenAIResponsesStore(options.response_store_max_records,
+                                options.response_store_max_bytes);
+}
+
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger)
-    : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
-                                                            options_.response_store_max_bytes),
+    : options_(std::move(options)), openai_responses_store_(make_openai_responses_store(options_)),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
     const std::size_t queued_requests =
@@ -273,7 +278,7 @@ void HttpServer::record_request_done(const RequestLogContext& context,
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
-    request_jsonl_.write_request_error(context, failure.machine_message);
+    request_jsonl_.write_request_error(context, failure);
     operational_log_.request_failure(context, failure);
 }
 
@@ -398,7 +403,7 @@ void HttpServer::register_routes() {
             } catch (const std::exception& e) {
                 operational_log_.http_failure(
                     endpoint_name(req.path),
-                    make_internal_request_failure(RequestFailurePhase::Http, e.what()),
+                    make_internal_request_failure(RequestFailurePhase::Http, e),
                     response_request_id(res));
                 if (req.path.rfind("/v1/messages", 0) == 0) {
                     ApiError error;
@@ -411,7 +416,7 @@ void HttpServer::register_routes() {
             } catch (...) {
                 operational_log_.http_failure(
                     endpoint_name(req.path),
-                    make_internal_request_failure(RequestFailurePhase::Http, "unknown error"),
+                    make_unknown_internal_request_failure(RequestFailurePhase::Http),
                     response_request_id(res));
                 ApiError error;
                 error.status  = 500;

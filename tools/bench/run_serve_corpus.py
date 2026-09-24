@@ -84,7 +84,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 6
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 20
+SERVER_LOG_SCHEMA_VERSION = 21
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -260,8 +260,7 @@ class RunningServer:
             if event.get("server_instance_id") != server_instance_id:
                 return False
             if event.get("event") == "request_error":
-                message = event.get("error", {}).get("message", "unknown generation error")
-                raise CampaignError(f"serving request failed: {message}")
+                raise CampaignError(f"serving request failed: {describe_request_error(event)}")
             return event.get("event") == "request_done"
 
         return self.tail.wait_for(matches, "request_done event")
@@ -454,6 +453,17 @@ def receive_json(connection: http.client.HTTPConnection) -> dict[str, Any]:
 def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> dict[str, Any]:
     send_json(connection, payload)
     return receive_json(connection)
+
+
+def describe_request_error(event: dict[str, Any]) -> str:
+    """Summarize a request_error record, which carries no free-text message by design."""
+    error = event.get("error")
+    if not isinstance(error, dict):
+        return "unclassified request error"
+    reason = error.get("code") or error.get("type") or "unclassified error"
+    if error.get("cause"):
+        reason = f"{reason} ({error['cause']})"
+    return f"HTTP {error.get('status', '?')} {reason} during {error.get('phase', 'unknown phase')}"
 
 
 def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:
