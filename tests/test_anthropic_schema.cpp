@@ -413,8 +413,12 @@ int test_tools() {
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
 
     body["tools"] = Json::array({ordinary_tool(true)});
-    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported",
-                      "active strict tool was accepted without constrained decoding");
+    {
+        const ninfer::PromptInput strict = prompt(parse(body).generation);
+        failures += check(strict.options.tool_calls.strict.size() == 1 &&
+                              strict.options.tool_calls.strict[0],
+                          "a strict tool is accepted and marked for constrained arguments");
+    }
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
     body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
@@ -425,14 +429,18 @@ int test_tools() {
     body                = base_request();
     body["tools"]       = Json::array({ordinary_tool()});
     body["tool_choice"] = Json{{"type", "any"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "forced any-tool choice was silently downgraded");
+    failures += check(api_code([&] { (void)parse(body); }).empty() &&
+                          prompt(parse(body).generation).options.tool_calls.mode == ninfer::ToolChoiceMode::Required,
+                      "forced any-tool choice maps to the constrained required mode");
     body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "named tool choice was silently downgraded");
+    failures += check(api_code([&] { (void)parse(body); }).empty() &&
+                          prompt(parse(body).generation).options.tool_calls.mode == ninfer::ToolChoiceMode::Named &&
+                          prompt(parse(body).generation).options.tool_calls.named_tool == "weather",
+                      "named tool choice maps to the constrained named call");
     body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", true}};
-    failures += check(api_code([&] { (void)parse(body); }) == "parallel_tool_use_not_supported",
-                      "active single-tool-call guarantee was silently downgraded");
+    failures += check(api_code([&] { (void)parse(body); }).empty() &&
+                          !prompt(parse(body).generation).options.tool_calls.parallel_calls,
+                      "disable_parallel_tool_use forbids a second call in the answer");
 
     body          = base_request();
     body["tools"] = Json::array({Json{{"type", "web_search_20250305"}, {"name", "web_search"}}});

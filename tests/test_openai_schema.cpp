@@ -320,11 +320,19 @@ int test_tools() {
               "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
 
     body["tool_choice"] = "required";
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "required tool choice rejected");
+    const GenerationRequest required = parse(body).generation;
+    failures += check(
+        prompt(required).options.tool_calls.mode == ninfer::ToolChoiceMode::Required,
+        "required tool choice maps to the constrained required mode");
     body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "named tool choice rejected");
+    const GenerationRequest named = parse(body).generation;
+    failures += check(
+        prompt(named).options.tool_calls.mode == ninfer::ToolChoiceMode::Named &&
+            prompt(named).options.tool_calls.named_tool == "weather",
+        "named tool choice maps to the constrained named call");
+    body["tool_choice"]["function"]["name"] = "missing";
+    failures += check(api_error([&] { (void)parse(body); }).param == "tool_choice",
+                      "named tool choice rejects a name absent from tools");
 
     body          = base_request();
     body["tools"] = Json::array({function_tool(), function_tool("search")});
@@ -345,21 +353,22 @@ int test_tools() {
     const GenerationRequest direct_allowed = parse(body).generation;
     failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
                       "direct allowed_tools compatibility shape is accepted");
-    body["tool_choice"]["mode"]     = "required";
-    const ApiError required_allowed = api_error([&] { (void)parse(body); });
+    body["tool_choice"]["mode"] = "required";
+    const GenerationRequest required_allowed = parse(body).generation;
     failures +=
-        check(required_allowed.code == "tool_choice_not_supported" &&
-                  required_allowed.message.find("at least one tool call") != std::string::npos,
-              "required allowed_tools reports the unenforceable guarantee");
+        check(prompt(required_allowed).options.tool_calls.mode == ninfer::ToolChoiceMode::Required,
+              "required allowed_tools enforces at least one narrowed call");
     body["tool_choice"]["mode"]             = "auto";
     body["tool_choice"]["tools"][0]["name"] = "missing";
     failures += check(api_error([&] { (void)parse(body); }).param == "tool_choice",
                       "allowed_tools rejects names absent from the declared tool set");
 
     body          = base_request();
-    body["tools"] = Json::array({function_tool("weather", true)});
-    failures += check(api_error([&] { (void)parse(body); }).code == "strict_tools_not_supported",
-                      "strict tools rejected");
+    body["tools"]    = Json::array({function_tool("weather", true)});
+    const GenerationRequest strict = parse(body).generation;
+    failures += check(prompt(strict).options.tool_calls.strict.size() == 1 &&
+                          prompt(strict).options.tool_calls.strict[0],
+                      "strict tools are accepted and marked for constrained arguments");
     body["tools"] = Json::array({Json{{"type", "custom"}, {"name", "shell"}}});
     failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
                       "custom tools rejected");
@@ -367,9 +376,9 @@ int test_tools() {
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
-    failures +=
-        check(api_error([&] { (void)parse(body); }).code == "parallel_tool_calls_not_supported",
-              "parallel_tool_calls=false rejected when tools exist");
+    const GenerationRequest single = parse(body).generation;
+    failures += check(!prompt(single).options.tool_calls.parallel_calls,
+                      "parallel_tool_calls=false forbids a second call in the same answer");
     body.erase("tools");
     failures += check(parse(body).generation.tools.empty(),
                       "parallel_tool_calls=false is neutral without tools");
