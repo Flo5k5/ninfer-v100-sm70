@@ -71,6 +71,17 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
     std::vector<std::uint16_t> activation(
         checked_elements(profile.input_rows, tokens, "activation size"), 0);
 
+    if (profile.fp8_checkpoint_like) {
+        // Dense Gaussian activations inside the normal FP16 range, like a normalized hidden state.
+        std::uint64_t state = static_cast<std::uint64_t>(profile.seed) << 16;
+        for (std::uint16_t& bits : activation) {
+            const double sample = quantized_weight::detail::standard_normal(state);
+            bits                = test::f32_to_bf16(static_cast<float>(
+                std::copysign(std::clamp(std::fabs(sample), 0x1p-6, 4.0), sample)));
+        }
+        return activation;
+    }
+
     // Token zero is dense, so every logical K contributes to every production implementation.
     // Later tokens use exact zeros plus a rotating set of nonzeros. This keeps a full-output,
     // full-formula oracle practical at large registered T boundaries without adopting any
@@ -242,6 +253,9 @@ void validate_profile(const Profile& profile) {
         (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
+    if (profile.fp8_checkpoint_like && !fp8) {
+        throw std::invalid_argument("linear_swiglu test: checkpoint-like weights are FP8 only");
+    }
 }
 
 } // namespace
@@ -274,8 +288,13 @@ int run_profile(std::string_view label, const Profile& profile,
             profile.weight_scale_divisor != 0.0F ? profile.weight_scale_divisor : 0.125F;
         weight_options.input_scale_divisor  = 3.5F;
     }
-    quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
-        profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);
+    quantized_weight::PackedWeight host_weight =
+        profile.fp8_checkpoint_like
+            ? quantized_weight::make_checkpoint_like_fp8_weight(
+                  profile.gate_up_rows, profile.input_rows, profile.seed)
+            : quantized_weight::make_patterned_weight(profile.qtype, profile.gate_up_rows,
+                                                      profile.input_rows, profile.seed,
+                                                      weight_options);
     const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
     const std::vector<double> reference =
         linear_swiglu_oracle_fp64(profile, host_weight, host_activation, maximum_tokens);

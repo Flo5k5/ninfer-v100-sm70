@@ -1,11 +1,11 @@
 #pragma once
 
 // Volta (sm_70) tensor-core path for the FP8 MLP gate/up GEMM, via NVIDIA CUTLASS's Sm70
-// (FP16 mma.sync.m8n8k4) template GEMM. Two-phase: dequantize the row-scaled E4M3 weights
-// (code byte * per-output-row BF16 scale) to a scratch FP16 buffer, cast bf16 activations to
-// FP16, then run CUTLASS's stock Gemm with a direct bf16 epilogue output. Mirrors
-// q4_linear_swiglu_cutlass_sm70.cu exactly -- see docs/v100.md for why groupwise's
-// dequant-once-then-CUTLASS route beats every fused-dequant kernel at wide T.
+// (FP16 mma.sync.m8n8k4) template GEMM. Two-phase: stage the E4M3 code bytes unscaled in a scratch
+// FP16 buffer and the bf16 activations in FP16, then run the row-scaled GEMM of
+// fp8_row_scale_gemm_sm70.cuh, whose epilogue multiplies the FP32 accumulator by the per-row BF16
+// scale and rounds once to bf16. Mirrors q4_linear_swiglu_cutlass_sm70.cu -- see docs/v100.md for
+// why groupwise's dequant-once-then-CUTLASS route beats every fused-dequant kernel at wide T.
 
 #include "core/arena.h"
 #include "core/tensor.h"
