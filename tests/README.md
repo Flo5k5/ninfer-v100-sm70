@@ -32,6 +32,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
   geometry, and official-recipe identity behavior against self-contained C++ fixtures;
 - `test_artifact_v2_rejection.cpp` — rejection of a v2 entry with guidance to the published v3
   artifacts, distinct from other entry versions;
+- `test_artifact_json.cpp` — directory JSON parsing: rejection of a member name repeated in any
+  object, labeled parse errors, values identical to nlohmann's with the same number types, and a
+  cost linear in sibling objects, within a small factor of nlohmann's plain parse;
 - `test_openai_schema.cpp`, `test_openai_responses.cpp`,
   `test_openai_responses_store.cpp`, `test_anthropic_schema.cpp`, and
   `test_tool_call_parser.cpp` — current protocol translation, Responses Item/state/SSE behavior,

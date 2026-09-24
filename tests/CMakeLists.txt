@@ -60,6 +60,9 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_v2_rejection_test
   SOURCES test_artifact_v2_rejection.cpp
   LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_artifact_json_test
+  SOURCES test_artifact_json.cpp
+  LIBRARIES ninfer_artifact)
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
