@@ -949,6 +949,11 @@ int run_fp8() {
 #endif
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::A16Only, 11);
     failures += run_fp8_case(parent, 11, ops::LinearPolicy::A16Only, 12);
+#ifdef NINFER_VOLTA_BUILD
+    // Past one QPN pass (32 columns) the A16 projection takes the CUTLASS route, whose weight
+    // staging the snapshot plan must reserve beside its projected tile.
+    failures += run_fp8_case(parent, 40, ops::LinearPolicy::A16Only, 41);
+#endif
 #ifndef NINFER_VOLTA_BUILD
     failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1);
 
