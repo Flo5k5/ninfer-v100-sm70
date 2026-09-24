@@ -119,6 +119,7 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
     double cumulative        = 0.0;
     int support              = 0;
     for (int rank = 0; rank < cap; ++rank) {
+        if (!(weights[static_cast<std::size_t>(rank)] > 0.0)) { break; }
         if (use_min_p && weights[static_cast<std::size_t>(rank)] < min_weight) { break; }
         cumulative += weights[static_cast<std::size_t>(rank)];
         support = rank + 1;
@@ -591,6 +592,158 @@ int workspace_route_boundary_contract() {
     return failures;
 }
 
+// A token mask leaves minus infinity outside each row's allowed set. Masked candidates carry no
+// weight, so unfiltered sampling (the full top-20 cap, top_p = 1, min_p = 0) never returns one,
+// even when fewer than twenty tokens are allowed; greedy rows take the best allowed token. Both
+// hold on the single-tile route, the multi-block route (at most sixteen rows) and the single-block
+// route of wider launches. A row with every logit masked returns the lowest token id in both modes.
+int masked_candidates_contract() {
+    struct Route {
+        const char* label;
+        int physical_rows;
+        int token_domain;
+        int batch;
+    };
+
+    const Route routes[] = {
+        {"single-tile", 64, 64, 4},
+        {"multi-block", 248320, 248077, 8},
+        {"single-block wide", 248320, 248077, 17},
+    };
+    const int allowed_per_row[] = {1, 3, 19, 0};
+    int failures                = 0;
+    for (const Route& route : routes) {
+        std::vector<float> logits(static_cast<std::size_t>(route.physical_rows) * route.batch,
+                                  -INFINITY);
+        std::vector<std::vector<int>> allowed(static_cast<std::size_t>(route.batch));
+        std::vector<int> best(static_cast<std::size_t>(route.batch), 0);
+        for (int row = 0; row < route.batch; ++row) {
+            const std::size_t base = static_cast<std::size_t>(row) * route.physical_rows;
+            const int count        = allowed_per_row[row % 4];
+            for (int i = 0; i < count; ++i) {
+                const int token = (7 + 13 * i + 5 * row) % route.token_domain;
+                allowed[static_cast<std::size_t>(row)].push_back(token);
+                logits[base + static_cast<std::size_t>(token)] = 0.25f * static_cast<float>(i % 4);
+            }
+            if (count > 0) {
+                const auto& set = allowed[static_cast<std::size_t>(row)];
+                best[static_cast<std::size_t>(row)] =
+                    *std::min_element(set.begin(), set.end(), [&](int a, int b) {
+                        const float va = logits[base + static_cast<std::size_t>(a)];
+                        const float vb = logits[base + static_cast<std::size_t>(b)];
+                        return va > vb || (va == vb && a < b);
+                    });
+            }
+            for (int padding = route.token_domain; padding < route.physical_rows; ++padding) {
+                logits[base + static_cast<std::size_t>(padding)] = 100.0f;
+            }
+        }
+
+        for (const float temperature : {0.0f, 0.8f}) {
+            ops::SamplingConfig config;
+            config.temperature = temperature;
+            config.top_k       = 20;
+            config.seed        = 5150;
+            const int draws    = temperature > 0.0f ? 48 : 1;
+            for (int draw = 0; draw < draws; ++draw) {
+                std::vector<int> positions(static_cast<std::size_t>(route.batch));
+                for (int row = 0; row < route.batch; ++row) {
+                    positions[static_cast<std::size_t>(row)] = 3000 + draw * route.batch + row;
+                }
+                const RunResult result = run_batch(
+                    logits, route.physical_rows, route.token_domain,
+                    std::vector<ops::SamplingConfig>(static_cast<std::size_t>(route.batch), config),
+                    positions, ops::kSamplePurposeDecode);
+                failures += result.integrity_failures;
+                for (int row = 0; row < route.batch; ++row) {
+                    const int token = result.tokens[static_cast<std::size_t>(row)];
+                    const auto& set = allowed[static_cast<std::size_t>(row)];
+                    const bool ok   = set.empty() ? token == 0
+                                      : temperature > 0.0f
+                                          ? std::find(set.begin(), set.end(), token) != set.end()
+                                          : token == best[static_cast<std::size_t>(row)];
+                    if (!ok) {
+                        std::cerr << "sample masked " << route.label << " T=" << temperature
+                                  << " row " << row << " returned token " << token << '\n';
+                        return failures + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // The distribution over three allowed tokens is the renormalized oracle distribution.
+    std::vector<float> column(64, -INFINITY);
+    column[5]  = 1.0f;
+    column[9]  = 0.5f;
+    column[40] = 0.0f;
+    ops::SamplingConfig config;
+    config.temperature        = 1.0f;
+    config.top_k              = 20;
+    config.seed               = 8080;
+    const Distribution oracle = distribution_oracle(column, 64, config);
+    const RunResult result =
+        run_repeated(column, 64, 8192, 8, config, 7000, ops::kSamplePurposeDecode);
+    failures += result.integrity_failures;
+    failures += verify_distribution("sample masked support", result.tokens, oracle);
+    return failures;
+}
+
+// The regression the zero-weight rule closes. Nineteen equal logits and masked candidates fill
+// the top-20 cap. The float32 sum of nineteen copies of 1/19 is 1 - 3 * 2^-24, so three of the
+// 2^24 uniform values of a draw land past the accumulated mass and take the inverse-CDF fallback,
+// which returned the twentieth, masked candidate when the support still held it. 2^26 draws
+// expect twelve such fallbacks; the chance of meeting none is below 1e-5.
+// Tokens 3..21 hold logit 0 and the others `excluded`: minus infinity as a token mask writes it,
+// or a finite logit low enough that its weight rounds to zero. Either way those tokens have no
+// probability, and 2^26 draws, including those that round past the accumulated mass, must never
+// return one.
+int masked_fallback_contract(float excluded, const char* label) {
+    constexpr int token_domain = 24;
+    constexpr int batch        = 8192;
+    constexpr int launches     = 8192;
+    std::vector<float> column(token_domain, excluded);
+    for (int token = 3; token < 22; ++token) { column[static_cast<std::size_t>(token)] = 0.0f; }
+    const std::vector<std::uint16_t> input_bits = bf16_bits(repeat_column(column, batch));
+
+    ops::SamplingConfig config;
+    config.temperature          = 1.0f;
+    config.top_k                = 20;
+    config.seed                 = 20260924;
+    DeviceBuffer device_logits  = to_device(input_bits);
+    DeviceBuffer device_configs = to_device(std::vector<ops::SamplingConfig>(batch, config));
+    DeviceBuffer device_positions(batch * sizeof(std::int32_t));
+    DeviceBuffer device_out(batch * sizeof(std::int32_t));
+    Tensor logits(device_logits.p, DType::BF16, {token_domain, batch});
+    Tensor positions(device_positions.p, DType::I32, {batch});
+    Tensor out(device_out.p, DType::I32, {batch});
+    WorkspaceArena workspace(std::max<std::size_t>(
+        256, ops::sampling_workspace_capacity_bytes(token_domain, batch, batch)));
+
+    std::vector<std::int32_t> draw_positions(batch);
+    for (int launch = 0; launch < launches; ++launch) {
+        for (int row = 0; row < batch; ++row) {
+            draw_positions[static_cast<std::size_t>(row)] = 1 + launch * batch + row;
+        }
+        device_positions.copy_from_host(draw_positions.data(), batch * sizeof(std::int32_t));
+        ops::sample(logits, out, token_domain,
+                    static_cast<const ops::SamplingConfig*>(device_configs.p), positions,
+                    ops::kSamplePurposeDecode, workspace, nullptr);
+        cuda_synchronize();
+        const std::vector<int> tokens = from_device<int>(device_out, batch);
+        for (int row = 0; row < batch; ++row) {
+            const int token = tokens[static_cast<std::size_t>(row)];
+            if (token < 3 || token >= 22) {
+                std::cerr << label << " returned excluded token " << token << " at position "
+                          << draw_positions[static_cast<std::size_t>(row)] << '\n';
+                return 1;
+            }
+        }
+    }
+    std::cout << "    " << label << ": 2^26 draws, no excluded token\n";
+    return 0;
+}
+
 int increment_counts_contract() {
     const std::vector<std::int32_t> ids{1, 3, 1, 7};
     const std::vector<std::int32_t> initial{0, 2, 0, 4, 0, 0, 0, 1};
@@ -641,6 +794,9 @@ int main() {
     failures += real_shape_distribution_contract();
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
+    failures += masked_candidates_contract();
+    failures += masked_fallback_contract(-INFINITY, "sample fallback past masked logits");
+    failures += masked_fallback_contract(-100.0f, "sample fallback past finite -100 logits");
     failures += increment_counts_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
