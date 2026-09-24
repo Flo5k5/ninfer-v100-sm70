@@ -7,6 +7,7 @@
 #include <ninfer/targets/qwen3_6_27b/package.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -396,9 +397,7 @@ int verify_vision_workspace_planning() {
     return 0;
 }
 
-} // namespace
-
-int main() {
+int run() {
     const std::filesystem::path groupwise =
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
     const std::filesystem::path nvfp4 =
@@ -426,32 +425,39 @@ int main() {
         result != 0) {
         return result;
     }
-    const std::array dflash2_artifacts{qwen38_groupwise, qwen38_nvfp4, qwen38_groupwise_dflash2,
-                                       qwen38_nvfp4_dflash2};
-    if (!std::ranges::all_of(dflash2_artifacts, [](const auto& path) {
-            return std::filesystem::is_regular_file(path);
-        })) {
-        std::cerr << "skip DFlash2 binding matrix: old and new Qwen3.8 artifacts are required\n";
-        return 0;
-    }
-    if (const int result = verify_legacy_dflash2_compatibility(qwen38_groupwise,
-                                                               WeightsProfile::Qwen38GroupwiseInt);
-        result != 0) {
-        return result;
-    }
-    if (const int result =
-            verify_legacy_dflash2_compatibility(qwen38_nvfp4, WeightsProfile::Qwen38Nvfp4);
-        result != 0) {
-        return result;
-    }
-    if (const int result =
-            verify_dflash2_bundle(qwen38_groupwise_dflash2, WeightsProfile::Qwen38GroupwiseInt);
-        result != 0) {
-        return result;
-    }
-    if (const int result = verify_dflash2_bundle(qwen38_nvfp4_dflash2, WeightsProfile::Qwen38Nvfp4);
-        result != 0) {
-        return result;
+    // Each Qwen3.8 artifact present is checked on its own. The published v3 form carries the
+    // DFlash2 bundle. The legacy form is a v3 conversion without the dflash2 component; a v2 file
+    // no longer opens, and main reports the Reader's error.
+    struct Qwen38Artifact {
+        std::filesystem::path path;
+        WeightsProfile profile;
+        bool dflash2;
+    };
+    const std::array qwen38_artifacts{
+        Qwen38Artifact{qwen38_groupwise, WeightsProfile::Qwen38GroupwiseInt, false},
+        Qwen38Artifact{qwen38_nvfp4, WeightsProfile::Qwen38Nvfp4, false},
+        Qwen38Artifact{qwen38_groupwise_dflash2, WeightsProfile::Qwen38GroupwiseInt, true},
+        Qwen38Artifact{qwen38_nvfp4_dflash2, WeightsProfile::Qwen38Nvfp4, true},
+    };
+    for (const auto& [path, profile, dflash2] : qwen38_artifacts) {
+        if (!std::filesystem::is_regular_file(path)) {
+            std::cerr << "skip Qwen3.8 DFlash2 binding check: " << path << " is absent\n";
+            continue;
+        }
+        const int result = dflash2 ? verify_dflash2_bundle(path, profile)
+                                   : verify_legacy_dflash2_compatibility(path, profile);
+        if (result != 0) { return result; }
     }
     return 0;
+}
+
+} // namespace
+
+int main() {
+    try {
+        return run();
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
 }
