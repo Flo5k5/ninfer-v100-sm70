@@ -1,26 +1,35 @@
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+// SPDX-FileCopyrightText: Copyright (c) 2026, 1CatAI.
+// SPDX-FileCopyrightText: Copyright (c) 2023-2026 The ggml authors
 // ============================================================================
 // fattn-sm70-d256-kernel.cuh
 //
 // SM70 (Volta) D256 FlashAttention "Split-D N32" kernel.
 //
-// ORIGIN: adapted verbatim from the 1CatAI D256 Split-D kernel
-//   repo    : 1CatAI/1Cat-vLLM  (tag v1.3.0, commit 6ada86ed64)
-//   path    : csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
-//   carried : cmake/patches/sm70_flash_attn_d256_pipeline.patch
-//   build   : zhinianqin/flash-attention-v100 @ c2eda5e6 + NVIDIA cutlass @ 62750a2b
+// Original work (Apache-2.0, Copyright (c) 2026, 1CatAI.):
+//   repo  : https://github.com/1CatAI/1Cat-vLLM, tag v1.3.0,
+//           commit 6ada86ed64af6d1a7b3cb0f34df237fd86f06d48
+//   path  : csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu, created by
+//           cmake/patches/sm70_flash_attn_d256_pipeline.patch and extended by
+//           cmake/patches/sm70_flash_attn_d256_splitkv3.patch
 //
-// This file contains ONLY the device-side kernel + traits + helpers
-// (lines 22-828 of the upstream source). The upstream torch host wrappers
-// (sm70_d256_splitd_*_fwd) are NOT included -- the NInfer launcher in
+// Direct source (MIT, Copyright (c) 2023-2026 The ggml authors):
+//   repo  : https://github.com/fishlikeX/sm70-attn,
+//           commit 707cf247c1beb5e7c701f47fe6f828c5b84b729d
+//   path  : ggml/src/ggml-cuda/fattn-sm70-d256-kernel.cuh
+//   sm70-attn keeps the device code of the original file and changes it: the
+//   torch host wrappers are dropped, the causal offset becomes the kv_offset
+//   argument, the output element type becomes a template parameter (FP32 output
+//   staging), the three-way KV split of the splitkv3 patch is ported with an
+//   empty-segment guard and a finite row-maximum initialization, and an opt-in
+//   q4_0 direct-load path is added.
+//
+// Modified in NInfer: this header, and the CuTe/CUTLASS and FlashAttention
+// include paths below. The NInfer launcher in
 // src/ops/launcher/gqa_attention_volta_splitd.cu drives the kernel directly.
 //
-// The verified core is UNMODIFIED: SmemLayout (pitch-68 K / TT swizzled V),
-// HMMA.884 QK+PV atoms, K/V double-buffered pipeline, online softmax with
-// row_scale_exchange, causal Mask, and the __launch_bounds__(256,1) smem
-// budget (kSmemBytes==45568 -> 2 CTA/SM) are all byte-identical to upstream.
-//
-// (c) 2026 1CatAI.  See LICENSE and NOTICE in this directory (BSD-3).
+// The FlashAttention base layer under flash/ is BSD-3-Clause. See NOTICE and
+// README.md in this directory for every origin, license text and change.
 // ============================================================================
 #pragma once
 
