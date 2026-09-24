@@ -1003,6 +1003,18 @@ cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_sele
 ./build/bench/ninfer_argmax_bench --shape shortlist --cols 120
 ```
 
+The token-mask benchmark calls public `apply_token_bitmask` on the same logits geometry, 248320
+physical rows and a 248077-token domain, at verification widths `W=1,5,16` and `B=1,8`. A captured
+decode graph launches it every round, so `free`, with no constrained row, is the cost every request
+pays. `excluding` allows one token in 1,024, as a JSON grammar mostly excludes the vocabulary;
+`mixed` allows every other token, the most work per token; `one` constrains one row of `B`:
+
+```bash
+cmake --build build --parallel --target ninfer_token_bitmask_bench
+./build/bench/ninfer_token_bitmask_bench
+./build/bench/ninfer_token_bitmask_bench --mode one --width 16 --batch 8
+```
+
 The G2/G3/G4 benchmark uses physical rows 248320 and valid token domain 248077. G2 covers optional
 occurrence counts and batched sampling at `B=1,2,4,8`; G3 covers one-hot MTP windows `K=1..5`.
 With no arguments it runs the G2/G3 greedy/stochastic matrix. G4 covers DFlash2 sparse-q acceptance
