@@ -14,7 +14,7 @@ Run the commands below from the repository root.
 
 ## Start with an official recipe
 
-Source-weight conversion requires a Python 3.11 environment with PyTorch and NumPy. It uses CUDA
+Source-weight conversion requires Python 3.10 or later, with PyTorch and NumPy. It uses CUDA
 by default; `--device cpu` selects CPU conversion. The input paths below are placeholders for your
 local checkpoint directories.
 

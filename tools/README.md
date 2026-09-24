@@ -5,8 +5,8 @@ orchestration, and serving smoke checks. These tools are not part of the public 
 path; normal users should start with the [project README](../README.md). To build your own weights,
 use the [weight conversion guide](../docs/weight-conversion.md).
 
-Run commands from the repository root with a Python 3.11 environment containing the dependencies
-for the selected tool.
+Run commands from the repository root with Python 3.10 or later and the dependencies of the
+selected tool.
 
 ## Task index
 
