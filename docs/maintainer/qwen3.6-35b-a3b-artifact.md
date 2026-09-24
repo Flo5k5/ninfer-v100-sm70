@@ -14,9 +14,11 @@ below describe the version-2 layout, which the Volta binder still addresses thro
 shim (`src/artifact/typed_binding.cpp`). The source transforms and payload encodings below remain
 the contract of this artifact.
 
-No v3 artifact of this model loads on this port yet. `Reader::identity` resolves its identity from
-the metadata name and the recipe, but the shim cannot resolve the MoE expert names that the binder
-addresses (`moe/routed_gate_up`, `moe/routed_down`, and their peers) to the v3 per-expert bindings.
+The shim resolves each MoE object below to the v3 logical parameters that cover it in the row order
+of Section 9: `moe/router`, then `moe/shared_score`; `moe/experts/{e}/gate`, then
+`moe/experts/{e}/up`, expert by expert; `moe/experts/{e}/down`; `moe/shared/gate`, then
+`moe/shared/up`; and `moe/shared/down`. An artifact whose parameters do not cover an object in this
+order fails to bind.
 
 ## 1. Artifact identity and contents
 
