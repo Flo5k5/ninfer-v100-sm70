@@ -760,8 +760,9 @@ invalid method output before or while writing; the
 [weight conversion guide](../weight-conversion.md) describes the pipeline.
 
 Native qualification additionally validates both real 27B artifacts through their exact C++
-load plans. The NVFP4 plan consumes 1307 objects, retains six frontend resources, places 1054
-tensors on device when Text, Vision, MTP, and the optimized proposal head are enabled, and leaves
-exactly 247 `d_x` scalars validation-only. Public Engine smoke covers Text, MTP, Vision, prefix
+load plans. When Text, Vision, MTP, and the optimized proposal head are enabled, each plan places
+every weight parent on device once. It retains on the Host the six frontend resources, the
+validated proposal token IDs, and, for NVFP4, the activation input divisor of every NVFP4 Use; no
+divisor receives a device allocation. Public Engine smoke covers Text, MTP, Vision, prefix
 reuse, and CUDA Graph decode for both `weights_id` values. CUDA Graph capture records the route
 already selected for each exact call shape; it does not add an A16/A4 graph dimension.
