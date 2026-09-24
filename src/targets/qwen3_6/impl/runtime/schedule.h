@@ -39,6 +39,7 @@ struct ExecutionCore {
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
     TextNumerics numerics;
+    TokenMaskBuffers token_masks;
 };
 
 struct PrefillContext {
@@ -55,6 +56,8 @@ struct PrefillContext {
     std::int32_t state_destination_slot                     = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    // The prompt's last position samples under the grammar mask of row 0 of token_masks.
+    bool constrained_sample = false;
 };
 
 struct OrdinaryBatchContext {

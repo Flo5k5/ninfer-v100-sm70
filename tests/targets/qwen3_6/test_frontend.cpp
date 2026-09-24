@@ -1,5 +1,6 @@
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
@@ -25,8 +26,10 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1089,9 +1092,12 @@ int test_official_resource_guards() {
     nlohmann::json mismatched_config   = nlohmann::json::parse(mismatched.tokenizer_config_json);
     mismatched_config["chat_template"] = reasoning_effort_template_source();
     mismatched.tokenizer_config_json   = mismatched_config.dump();
-    failures +=
-        check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(mismatched); }),
-              "different standalone and tokenizer-config chat templates were accepted");
+    // v3 artifacts ship an NInfer-modified chat_template.jinja while tokenizer_config.json
+    // keeps the stock template as the fallback source: a mismatch is legitimate (the standalone
+    // resource wins at compile time), so the old equal-templates guard is gone by design.
+    failures += check(
+        !throws_invalid_argument([&] { (void)FrontendFactory::create_component(mismatched); }),
+        "a different tokenizer-config chat template was rejected");
 
     FrontendResources unknown = resources("{{ messages }}");
     failures +=
@@ -1755,6 +1761,213 @@ ninfer::targets::qwen3_6::PreparedPrompt thinking_prompt(const Frontend& fronten
     return frontend.prepare(std::move(input));
 }
 
+ninfer::targets::qwen3_6::PreparedPrompt
+constrained_prompt(const Frontend& frontend, ninfer::ResponseFormat format, bool thinking) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = thinking;
+    input.options.response_format = std::move(format);
+    return frontend.prepare(std::move(input));
+}
+
+ninfer::ResponseFormat json_schema_format(std::string schema) {
+    return ninfer::ResponseFormat{.kind            = ninfer::ResponseFormatKind::JsonSchema,
+                                  .schema_json     = std::move(schema),
+                                  .schema_location = "response_format.json_schema.schema"};
+}
+
+std::vector<ninfer::TokenId> byte_tokens(std::string_view text) {
+    std::vector<ninfer::TokenId> tokens;
+    for (const char byte : text) {
+        tokens.push_back(fixture_byte_token(static_cast<std::uint8_t>(byte)));
+    }
+    return tokens;
+}
+
+std::vector<std::int32_t> committed_mask(ninfer::runtime::TokenConstraint& constraint) {
+    std::vector<std::int32_t> mask(static_cast<std::size_t>(constraint.mask_words()));
+    (void)constraint.fill_masks({}, mask.data(), mask.size());
+    return mask;
+}
+
+bool allows(const std::vector<std::int32_t>& mask, ninfer::TokenId token) {
+    const auto word = static_cast<std::uint32_t>(mask[static_cast<std::size_t>(token) / 32U]);
+    return ((word >> (static_cast<std::uint32_t>(token) % 32U)) & 1U) != 0;
+}
+
+template <class Callable>
+std::optional<ninfer::RequestError> request_error(Callable&& callable) {
+    try {
+        callable();
+    } catch (const ninfer::RequestError& error) { return error; }
+    return std::nullopt;
+}
+
+int test_structured_output(const Frontend& frontend) {
+    constexpr ninfer::TokenId kEos = 6;
+    const std::string schema =
+        R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})";
+    int failures = 0;
+
+    const auto unconstrained = thinking_prompt(frontend);
+    auto free_session        = frontend.make_output_session(unconstrained, {});
+    failures += check(free_session.token_constraint() == nullptr,
+                      "an unconstrained output exposed a token constraint");
+
+    const auto prompt = constrained_prompt(frontend, json_schema_format(schema), false);
+    failures += check(static_cast<bool>(FrontendFactory::inspect(prompt).output_grammar),
+                      "a JSON schema response format did not compile its grammar");
+    auto session                                 = frontend.make_output_session(prompt, {});
+    ninfer::runtime::TokenConstraint* constraint = session.token_constraint();
+    failures += check(constraint != nullptr && constraint->mask_words() == 7753,
+                      "a constrained output did not expose a mask over the token domain");
+    if (constraint == nullptr) { return failures; }
+    const std::vector<std::int32_t> initial = committed_mask(*constraint);
+    failures += check(allows(initial, fixture_byte_token('{')) && !allows(initial, 0) &&
+                          !allows(initial, kEos) && !allows(initial, fixture_byte_token(' ')),
+                      "the first mask did not force a compact JSON object");
+    failures += check(!allows(initial, 248045) && !allows(initial, 248046) &&
+                          !allows(initial, 248068) && !allows(initial, 248069),
+                      "the first mask allowed a special or reasoning token");
+
+    std::vector<ninfer::TokenId> answer = byte_tokens(R"({"a": 1})");
+    answer.push_back(kEos);
+    const auto accepted = session.preview_model(answer, 64, ninfer::FinishReason::OutputLimit);
+    failures += check(accepted.accepted_tokens == answer.size() &&
+                          accepted.finish_reason == ninfer::FinishReason::StopToken &&
+                          !accepted.constraint_violation,
+                      "a valid constrained answer was not accepted to its stop token");
+    failures += check(channel_text(session.commit_preview(), ninfer::OutputChannel::Content) ==
+                          R"({"a": 1})",
+                      "a valid constrained answer was not published");
+
+    auto refused_session                 = frontend.make_output_session(prompt, {});
+    std::vector<ninfer::TokenId> invalid = byte_tokens("{x");
+    const auto refused =
+        refused_session.preview_model(invalid, 64, ninfer::FinishReason::OutputLimit);
+    failures += check(refused.constraint_violation && refused.accepted_tokens == 0 &&
+                          refused.finish_reason == ninfer::FinishReason::Cancelled,
+                      "a refused token did not report a constraint violation");
+    (void)refused_session.commit_preview();
+    failures += check(committed_mask(*refused_session.token_constraint()) == initial,
+                      "a refused round left the grammar past the committed output");
+
+    ninfer::StopPolicy without_defaults;
+    without_defaults.include_model_defaults = false;
+    failures += check(throws_invalid_argument(
+                          [&] { (void)frontend.make_output_session(prompt, without_defaults); }),
+                      "a constrained output accepted a stop policy without the model stops");
+
+    const auto thinking = constrained_prompt(
+        frontend, ninfer::ResponseFormat{.kind = ninfer::ResponseFormatKind::JsonObject}, true);
+    auto controlled =
+        frontend.make_output_session(thinking, {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    const auto boundary = controlled.preview_model(std::array<ninfer::TokenId, 2>{0, 0}, 64,
+                                                   ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "the constrained reasoning part did not reach its thinking budget");
+    (void)controlled.commit_preview();
+    const std::span<const ninfer::TokenId> pending = controlled.pending_control_tokens();
+    const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+    const auto control_decision = controlled.preview_control(control, 62);
+    failures += check(control_decision.accepted_tokens == control.size(),
+                      "the grammar refused the thinking control suffix");
+    (void)controlled.commit_preview();
+    std::vector<ninfer::TokenId> object = byte_tokens("{}");
+    object.push_back(kEos);
+    const auto closed = controlled.preview_model(object, 40, ninfer::FinishReason::OutputLimit);
+    failures += check(closed.finish_reason == ninfer::FinishReason::StopToken &&
+                          !closed.constraint_violation,
+                      "the answer after the thinking control was not accepted");
+
+    auto natural                              = frontend.make_output_session(thinking, {});
+    const std::vector<std::int32_t> reasoning = committed_mask(*natural.token_constraint());
+    failures +=
+        check(allows(reasoning, 248069) && !allows(reasoning, 248068) && !allows(reasoning, 248045),
+              "the reasoning mask did not allow </think> alone among the reasoning and "
+              "special tokens");
+    std::vector<ninfer::TokenId> reasoned{3};
+    for (const ninfer::TokenId token : byte_tokens("nk>\n\n{}")) { reasoned.push_back(token); }
+    reasoned.push_back(kEos);
+    const auto reasoned_decision =
+        natural.preview_model(reasoned, 64, ninfer::FinishReason::OutputLimit);
+    failures += check(reasoned_decision.finish_reason == ninfer::FinishReason::StopToken &&
+                          !reasoned_decision.constraint_violation,
+                      "a reasoning part closed across tokens was not accepted");
+    auto prose                = frontend.make_output_session(thinking, {});
+    const auto prose_decision = prose.preview_model(std::array<ninfer::TokenId, 2>{3, 4}, 64,
+                                                    ninfer::FinishReason::OutputLimit);
+    failures += check(prose_decision.constraint_violation,
+                      "an answer that is not JSON was accepted after the reasoning part");
+
+    const auto invalid_schema = request_error([&] {
+        (void)constrained_prompt(
+            frontend,
+            json_schema_format(
+                R"({"type":"object","properties":{"a":{"type":"array","uniqueItems":true}}})"),
+            false);
+    });
+    failures +=
+        check(invalid_schema &&
+                  invalid_schema->kind() == ninfer::RequestErrorKind::InvalidOutputConstraint &&
+                  std::string_view(invalid_schema->what())
+                      .starts_with("response_format.json_schema.schema at #/properties/a: "),
+              "an unsupported schema keyword was not rejected with its location");
+    // A pattern whose only strings need a quote, which xgrammar rejects when it compiles.
+    const auto uncompilable = request_error([&] {
+        (void)constrained_prompt(
+            frontend, json_schema_format(R"({"type":"string","pattern":"^\"$"})"), false);
+    });
+    failures += check(
+        uncompilable && uncompilable->kind() == ninfer::RequestErrorKind::InvalidOutputConstraint &&
+            std::string_view(uncompilable->what())
+                .starts_with("response_format.json_schema.schema: "),
+        "a schema rejected while compiling did not name its field");
+
+    ninfer::PromptInput with_tools;
+    with_tools.messages.push_back(
+        ninfer::ChatMessage{.role  = ninfer::ChatRole::User,
+                            .parts = {ninfer::MessagePart{
+                                .kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}}}});
+    with_tools.options.response_format.kind = ninfer::ResponseFormatKind::JsonObject;
+    with_tools.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"f","parameters":{"type":"object"}}})");
+    const auto tools_error = request_error([&] { (void)frontend.prepare(with_tools); });
+    failures += check(tools_error &&
+                          tools_error->kind() == ninfer::RequestErrorKind::InvalidOutputConstraint,
+                      "a response format was combined with callable tools");
+
+    ninfer::PromptInput continued = with_tools;
+    continued.options.tool_jsons.clear();
+    continued.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+    const auto continued_error     = request_error([&] { (void)frontend.prepare(continued); });
+    failures += check(continued_error && continued_error->kind() ==
+                                             ninfer::RequestErrorKind::InvalidOutputConstraint,
+                      "a response format continued a final assistant message");
+
+    ninfer::targets::qwen3_6::FrontendOptions disabled_options;
+    disabled_options.vision_enabled            = false;
+    disabled_options.structured_output.enabled = false;
+    const Frontend disabled = FrontendFactory::create_component(resources(), disabled_options);
+    ninfer::targets::qwen3_6::FrontendOptions dflash_options;
+    dflash_options.vision_enabled              = false;
+    dflash_options.structured_output_supported = false;
+    const Frontend dflash = FrontendFactory::create_component(resources(), dflash_options);
+    for (const Frontend* unavailable : {&disabled, &dflash}) {
+        const auto error = request_error(
+            [&] { (void)constrained_prompt(*unavailable, json_schema_format(schema), false); });
+        failures +=
+            check(error && error->kind() == ninfer::RequestErrorKind::OutputConstraintUnavailable,
+                  "an Engine that cannot constrain output accepted a response format");
+    }
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -2254,6 +2467,7 @@ int main() {
     failures += test_structured_tool_output();
     failures += test_reasoning_split(frontend);
     failures += test_thinking_budget_control(frontend);
+    failures += test_structured_output(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();

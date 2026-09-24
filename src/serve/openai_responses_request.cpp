@@ -658,6 +658,7 @@ struct ParsedPromptFields {
     OpenAIResponsesPromptRequest prompt;
     Json wire_tools          = Json::array();
     Json wire_tool_choice    = "auto";
+    Json wire_text           = Json{{"format", Json{{"type", "text"}}}};
     bool parallel_tool_calls = true;
     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> tool_identities;
 };
@@ -941,7 +942,10 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     out.generation.reasoning_effort = *effort;
 }
 
-void parse_text(const Json& body) {
+// text.format is {"type":"text"}, {"type":"json_object"}, or {"type":"json_schema","name",
+// "description","schema","strict"}. The schema is enforced whatever strict says: the Engine rejects
+// a schema it cannot enforce rather than relax it. `wire_text` receives what Response objects echo.
+void parse_text(const Json& body, GenerationRequest& generation, Json& wire_text) {
     if (!body.contains("text") || body.at("text").is_null()) { return; }
     const Json& text = body.at("text");
     if (!text.is_object()) { bad_request("text must be an object", "text"); }
@@ -952,11 +956,19 @@ void parse_text(const Json& body) {
         if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
             bad_request("text.format must be a typed object", "text");
         }
-        if (format.at("type").get<std::string>() != "text" || format.size() != 1) {
-            bad_request("structured text output requires constrained decoding, which the Engine "
-                        "does not provide",
-                        "text", "structured_outputs_not_supported");
+        const std::string type = format.at("type").get<std::string>();
+        if (type == "text" || type == "json_object") {
+            reject_unknown_members(format, {"type"}, "text.format", "text");
+            if (type == "json_object") {
+                generation.response_format.kind = ninfer::ResponseFormatKind::JsonObject;
+            }
+        } else if (type == "json_schema") {
+            generation.response_format =
+                openai_json_schema_format(format, {"type"}, "text.format", "text");
+        } else {
+            bad_request("text.format type must be 'text', 'json_object', or 'json_schema'", "text");
         }
+        wire_text["format"] = format;
     }
     if (text.contains("verbosity") && !text.at("verbosity").is_null()) {
         if (!text.at("verbosity").is_string()) {
@@ -967,6 +979,7 @@ void parse_text(const Json& body) {
             bad_request("text.verbosity '" + verbosity + "' cannot be enforced by the Engine",
                         "text", "verbosity_not_supported");
         }
+        wire_text["verbosity"] = verbosity;
     }
 }
 
@@ -1049,7 +1062,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
                     "parallel_tool_calls", "parallel_tool_calls_not_supported");
     }
     parse_reasoning(body, out.prompt);
-    parse_text(body);
+    parse_text(body, out.prompt.generation, out.wire_text);
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
     out.prompt.generation.max_tokens = limits.default_max_tokens;
@@ -1170,6 +1183,7 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     out.prompt              = std::move(parsed.prompt);
     out.tools               = std::move(parsed.wire_tools);
     out.tool_choice         = std::move(parsed.wire_tool_choice);
+    out.text                = std::move(parsed.wire_text);
     out.tool_identities     = std::move(parsed.tool_identities);
     out.parallel_tool_calls = parsed.parallel_tool_calls;
     out.store               = optional_bool(body, "store", limits.response_store_enabled);

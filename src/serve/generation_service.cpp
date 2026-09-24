@@ -84,6 +84,23 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.type   = "server_error";
         error.code   = "service_unavailable";
         break;
+    case ninfer::RequestErrorKind::InvalidOutputConstraint:
+        // The message names the offending field and, for a schema, the JSON pointer inside it.
+        error.param.clear();
+        error.status = 400;
+        error.code   = "invalid_output_constraint";
+        break;
+    case ninfer::RequestErrorKind::OutputConstraintUnavailable:
+        error.param.clear();
+        error.status = 400;
+        error.code   = "structured_outputs_unavailable";
+        break;
+    case ninfer::RequestErrorKind::OutputConstraintViolated:
+        error.param.clear();
+        error.status = 500;
+        error.type   = "server_error";
+        error.code   = "output_constraint_violated";
+        break;
     }
     return error;
 }
@@ -253,6 +270,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
+    // Disabled, the Engine builds no grammar vocabulary and rejects constrained requests.
+    engine_options.structured_output.enabled = options_.enable_structured_output;
+
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
     validate_reasoning_effort_policy(options_, prompt_capabilities_);

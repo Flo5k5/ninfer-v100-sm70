@@ -24,6 +24,15 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
+// Grammar masks of the rows an execution samples (ops::apply_token_bitmask), planned when
+// constrained requests are served.
+struct TokenMaskBuffers {
+    // I32 [words, columns, max_concurrency]: the masks of row b start at column b * columns.
+    const Tensor* bitmask = nullptr;
+    // I32 [1] holding one: the masked-column count of a one-row prompt sample.
+    const Tensor* single_column = nullptr;
+};
+
 // Target-private compatibility vocabulary for the mechanically preserved fixed schedule. It is
 // data-only: TextContext is constructed on the stack for one schedule recording/execution and owns
 // neither weights nor device state.
@@ -188,6 +197,13 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // Grammar masks applied to the target logits of every position this context samples, right
+    // after the output head (ops::apply_token_bitmask). Unset, logits are sampled unmasked.
+    void set_token_masks(const Tensor* bitmask, const Tensor* mask_columns) noexcept {
+        token_mask_bitmask_ = bitmask;
+        token_mask_columns_ = mask_columns;
+    }
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
@@ -283,6 +299,8 @@ private:
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
+    // Masks BF16 target logits [rows, width, batch] when grammar masks are set.
+    void apply_token_masks(Tensor& logits, cudaStream_t stream) const;
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;
@@ -332,6 +350,8 @@ private:
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
+    const Tensor* token_mask_bitmask_         = nullptr;
+    const Tensor* token_mask_columns_         = nullptr;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

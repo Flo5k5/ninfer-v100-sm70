@@ -181,8 +181,35 @@ struct OutputDecision {
     // reconstruction gains an execution split. Frontend owns detection; Engine only transports
     // this relative position.
     std::optional<std::uint32_t> prefix_execution_split_after;
+    // The output constraint refused a token of the round. Nothing of the round is accepted and the
+    // request fails; the finish reason is Cancelled so that the row releases like a cancellation.
+    bool constraint_violation = false;
 
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
+};
+
+// Grammar state of one constrained output. The target frontend owns it and advances it with
+// committed tokens only; a Program asks it for the token masks of the positions it samples.
+class TokenConstraint {
+public:
+    virtual ~TokenConstraint() = default;
+
+    // I32 words of one mask: token t is allowed when bit t % 32 of word t / 32 is set.
+    [[nodiscard]] virtual std::int32_t mask_words() const noexcept = 0;
+
+    // Writes the tokens allowed after the committed output to rows[0], then walks the drafts in
+    // order: draft i is walked when rows[i] allows it and it does not end the output, and
+    // rows[i + 1] then holds the tokens allowed after it. The walk stops at the first draft it
+    // cannot take. Consecutive rows are row_stride_words apart and rows past the walk are left
+    // untouched. Returns the number of drafts walked; the committed state is unchanged.
+    [[nodiscard]] virtual std::uint32_t fill_masks(std::span<const TokenId> drafts,
+                                                   std::int32_t* rows,
+                                                   std::size_t row_stride_words) = 0;
+
+protected:
+    TokenConstraint()                                  = default;
+    TokenConstraint(const TokenConstraint&)            = default;
+    TokenConstraint& operator=(const TokenConstraint&) = default;
 };
 
 struct LaneId {

@@ -36,6 +36,21 @@ struct StartupFeatures {
     }
 };
 
+// Whether the host can mask every position a backend samples. MTP drafts are known before the
+// round that verifies them; DFlash and DFlash2 draft and verify inside one graph.
+[[nodiscard]] constexpr bool supports_token_masks(SpeculativeBackend backend) noexcept {
+    return !is_masked_draft_backend(backend);
+}
+
+// Structured output of an Engine built with these options. Causal-scoring Engines never generate
+// and build neither the grammar compiler nor the token masks.
+[[nodiscard]] inline StructuredOutputOptions
+structured_output_options(const EngineOptions& options) noexcept {
+    StructuredOutputOptions out = options.structured_output;
+    if (options.purpose != EnginePurpose::Generation) { out.enabled = false; }
+    return out;
+}
+
 [[nodiscard]] inline StartupFeatures startup_features(const EngineOptions& options) noexcept {
     return StartupFeatures{
         .vision        = options.enable_vision,

@@ -198,6 +198,20 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+// Grammar-constrained output (PromptOptions::response_format). The compiler's view of the model
+// vocabulary is built once at startup when enabled. Engines started with a DFlash or DFlash2
+// speculative backend cannot constrain their drafted positions and reject constrained requests
+// whatever this says.
+struct StructuredOutputOptions {
+    bool enabled = true;
+    // Grammars compiled at once, each on compile_threads threads. Compilation runs off the Engine
+    // thread; further requests wait for a worker.
+    std::uint32_t compile_workers = 2;
+    std::uint32_t compile_threads = 8;
+    // Compiled grammars kept for reuse by later requests, by approximate host memory.
+    std::size_t cache_bytes = 256ULL << 20;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
@@ -220,6 +234,7 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
+    StructuredOutputOptions structured_output;
     StartupObserver startup_observer;
 };
 
@@ -453,6 +468,26 @@ enum class PromptContinuationMode : std::uint8_t {
     ContinueFinalAssistant,
 };
 
+enum class ResponseFormatKind : std::uint8_t {
+    Text,
+    JsonObject,
+    JsonSchema,
+};
+
+// Constrains the answer of a new assistant turn to one JSON value in compact form: ", " and ": "
+// separators and no other whitespace. With thinking enabled, the reasoning part stays free text
+// and must end with </think> and a blank line before the value. The grammar is compiled when the
+// prompt is prepared; an unsupported schema, or one beyond the compile limits, is rejected with
+// RequestErrorKind::InvalidOutputConstraint, never answered without the constraint.
+struct ResponseFormat {
+    ResponseFormatKind kind = ResponseFormatKind::Text;
+    // JsonSchema only: the JSON Schema as JSON text. Object properties are generated in their
+    // declared order. JsonObject accepts any JSON object.
+    std::string schema_json;
+    // Names the schema in error messages, for example "response_format.json_schema.schema".
+    std::string schema_location;
+};
+
 struct PromptOptions {
     PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
     bool enable_thinking                = true;
@@ -460,6 +495,7 @@ struct PromptOptions {
     bool preserve_thinking = false;
     bool add_vision_id     = false;
     std::vector<std::string> tool_jsons;
+    ResponseFormat response_format;
 };
 
 enum class CacheRetentionHint : std::uint8_t {
@@ -549,6 +585,15 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    // The requested output constraint cannot be enforced: an invalid or unsupported schema, a
+    // grammar beyond the compile limits, or a request shape that cannot carry a constraint.
+    InvalidOutputConstraint,
+    // This Engine cannot constrain output: structured output is disabled or its speculative
+    // backend drafts positions the grammar cannot mask.
+    OutputConstraintUnavailable,
+    // The output constraint refused a generated token that its mask should have excluded. The
+    // request stopped instead of continuing unconstrained; this is a server fault.
+    OutputConstraintViolated,
 };
 
 class RequestError final : public std::invalid_argument {

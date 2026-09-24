@@ -718,6 +718,50 @@ int test_namespace_tools() {
     return failures;
 }
 
+int test_text_format() {
+    const Json base = {{"model", "m"}, {"input", "hello"}};
+    int failures    = 0;
+
+    Json value    = base;
+    value["text"] = Json{{"format", Json{{"type", "json_object"}}}};
+    failures += check(parse_openai_responses_create_request(value, limits())
+                              .prompt.generation.response_format.kind ==
+                          ninfer::ResponseFormatKind::JsonObject,
+                      "json_object text format parsed");
+
+    value         = base;
+    value["text"] = Json{{"format", Json{{"type", "json_schema"},
+                                         {"name", "answer"},
+                                         {"strict", true},
+                                         {"schema", Json{{"type", "array"}}}}}};
+    const ninfer::ResponseFormat format =
+        parse_openai_responses_create_request(value, limits()).prompt.generation.response_format;
+    failures += check(format.kind == ninfer::ResponseFormatKind::JsonSchema &&
+                          format.schema_json == R"({"type":"array"})" &&
+                          format.schema_location == "text.format.schema",
+                      "json_schema text format parsed");
+
+    // Response objects report the format the request enforced.
+    GenerationOutcome outcome;
+    outcome.text          = "[]";
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    const Json echoed =
+        make_openai_response_object(
+            "resp_format", 1, parse_openai_responses_create_request(value, limits()), {}, outcome)
+            .body.at("text");
+    failures += check(echoed.at("format").at("type") == "json_schema" &&
+                          echoed.at("format").at("name") == "answer" &&
+                          echoed.at("format").at("schema") == Json{{"type", "array"}},
+                      "a Response echoes the requested json_schema text format");
+    const Json plain =
+        make_openai_response_object(
+            "resp_plain", 1, parse_openai_responses_create_request(base, limits()), {}, outcome)
+            .body.at("text");
+    failures += check(plain == Json{{"format", Json{{"type", "text"}}}},
+                      "a Response without a text format reports plain text");
+    return failures;
+}
+
 int test_explicit_rejections() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
@@ -730,11 +774,27 @@ int test_explicit_rejections() {
                       "strict function schema is rejected explicitly");
 
     value         = base;
-    value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
+    value["text"] = Json{{"format", Json{{"type", "json_schema"}, {"name", "answer"}}}};
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }).param == "text",
+                      "a json_schema text format without a schema is rejected");
+
+    value = base;
+    value["text"] =
+        Json{{"format",
+              Json{{"type", "json_schema"}, {"schema", Json::object()}, {"additional", true}}}};
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }).param == "text",
+                      "an unknown json_schema text format member is rejected");
+
+    value         = base;
+    value["text"] = Json{{"format", Json{{"type", "json_object"}, {"schema", Json::object()}}}};
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
-                      "structured output is rejected explicitly");
+                      }) == "parameter_not_supported",
+                      "a schema next to a json_object text format is rejected");
 
     value               = base;
     value["background"] = true;
@@ -1071,6 +1131,7 @@ int main() {
     failures += test_assistant_item_boundaries_and_errors();
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
+    failures += test_text_format();
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();
     failures += test_response_object();

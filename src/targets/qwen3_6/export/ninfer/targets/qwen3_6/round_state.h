@@ -41,6 +41,9 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    // Grammar-masked columns of each row (ops::apply_token_bitmask): one for a constrained row,
+    // zero otherwise.
+    std::array<std::int32_t, kMaximumConcurrency> token_mask_columns{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -64,6 +67,9 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
+    // Grammar-masked verification columns of each row, from its first column
+    // (ops::apply_token_bitmask); zero for an unconstrained row.
+    std::array<std::int32_t, kMaximumConcurrency> token_mask_columns{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -187,6 +193,7 @@ struct OrdinaryDecodeState {
     Tensor text_kv_table_rows;
     Tensor state_source_slots;
     Tensor state_destination_slots;
+    Tensor token_mask_columns;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;
@@ -237,6 +244,7 @@ struct MtpDecodeState {
     Tensor state_source_slots;
     Tensor state_destination_slots;
     Tensor rope_deltas;
+    Tensor token_mask_columns;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;

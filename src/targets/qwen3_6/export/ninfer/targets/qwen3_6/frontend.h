@@ -25,6 +25,10 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    StructuredOutputOptions structured_output;
+    // False when the Engine's speculative backend drafts positions that token masks cannot reach
+    // (DFlash and DFlash2): constrained requests are then rejected, never answered unconstrained.
+    bool structured_output_supported = true;
 };
 
 struct FrontendResources;
@@ -112,6 +116,9 @@ public:
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
+    // Grammar state of a constrained output, advanced by the previews of model and control
+    // tokens; null when the output is unconstrained.
+    [[nodiscard]] runtime::TokenConstraint* token_constraint() noexcept;
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;

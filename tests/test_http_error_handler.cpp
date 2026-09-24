@@ -138,6 +138,29 @@ int main() {
     failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected" &&
                           cancelled.param.empty(),
                       "preparation cancellation did not retain its HTTP classification");
+    const ninfer::serve::ApiError invalid_constraint = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::InvalidOutputConstraint,
+                             "response_format.json_schema.schema at #/a: keyword 'not' is not "
+                             "supported"));
+    failures += check(invalid_constraint.status == 400 &&
+                          invalid_constraint.code == "invalid_output_constraint" &&
+                          invalid_constraint.param.empty(),
+                      "an invalid output constraint did not map to HTTP 400");
+    const ninfer::serve::ApiError unavailable_constraint =
+        ninfer::serve::request_error_to_api_error(
+            ninfer::RequestError(ninfer::RequestErrorKind::OutputConstraintUnavailable,
+                                 "structured output is disabled"));
+    failures += check(unavailable_constraint.status == 400 &&
+                          unavailable_constraint.code == "structured_outputs_unavailable" &&
+                          unavailable_constraint.param.empty(),
+                      "an unavailable output constraint did not map to HTTP 400");
+    const ninfer::serve::ApiError violated_constraint = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::OutputConstraintViolated,
+                             "the output grammar refused a generated token"));
+    failures +=
+        check(violated_constraint.status == 500 && violated_constraint.type == "server_error" &&
+                  violated_constraint.code == "output_constraint_violated",
+              "a violated output constraint did not map to a server error");
 
     failures +=
         check(ninfer::serve::matches_bearer_credential("Bearer secret", "secret") &&

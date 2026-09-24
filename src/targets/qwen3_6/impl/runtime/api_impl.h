@@ -408,8 +408,9 @@ bool Program<Variant>::has_context_transaction() const noexcept {
 template <>
 PrefillProgress<Variant>
 Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence,
+                                  runtime::TokenConstraint* constraint,
                                   runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+    return impl_->advance_prefill(sequence, constraint, failed_timing);
 }
 
 template <>
@@ -495,10 +496,12 @@ runtime::ContextTransactionReserveStatus Program<Variant>::reserve_active_captur
 }
 
 template <>
-PendingBatch<Variant> Program<Variant>::decode(std::span<const SequenceHandle<Variant>> sequences,
-                                               std::span<const runtime::RoundBudget> budgets,
-                                               runtime::ExecutionTiming* failed_timing) {
-    return impl_->decode(sequences, budgets, failed_timing);
+PendingBatch<Variant>
+Program<Variant>::decode(std::span<const SequenceHandle<Variant>> sequences,
+                         std::span<const runtime::RoundBudget> budgets,
+                         std::span<runtime::TokenConstraint* const> constraints,
+                         runtime::ExecutionTiming* failed_timing) {
+    return impl_->decode(sequences, budgets, constraints, failed_timing);
 }
 
 template <>

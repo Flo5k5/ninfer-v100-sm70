@@ -42,10 +42,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
   tool-call behavior;
 - `test_grammar.cpp` — grammar-constrained decoding on a byte-level toy vocabulary: the enforced
   JSON Schema subset (every schema xgrammar would weaken is rejected, and output that would be
-  invalid JSON is refused), schemas no finite value satisfies, the regex and schema compile-cost
-  units and limits, including a referenced schema compiled twice, the deepest reference chain the
-  limits admit compiled on the compile thread's stack, compilation, grammars that allow no output,
-  the single-flight byte-bounded cache and cached rejections, handover of an abandoned compilation,
+  invalid JSON is refused), the regex and schema compile-cost units and limits, compilation, its
+  single-flight byte-bounded cache and cached rejections, handover of an abandoned compilation,
   token masks and the draft walk against a manual accept loop, and silence of xgrammar diagnostics;
 - `test_request_log.cpp` — the consumed request JSONL schema and exact measurement fields, plus
   representative Serve request/throughput pretty records, failure severity, zero-field elision,
@@ -160,6 +158,19 @@ artifact three times:
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_context_lookup_real_test --output-on-failure
+```
+
+The structured-output integration test uses the same variable. It loads the artifact twice, with
+MTP and adaptive context lookup and without a speculative backend, both with CUDA Graphs, and checks
+that greedy answers under a JSON schema or `json_object` are compact JSON of their format,
+including one that starts from a retained prompt frontier, one after a thinking budget control and
+one next to a free request in the same batch, and that an unsupported schema is rejected at
+preparation. With `NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS` also set, it loads that artifact with
+DFlash2 and checks that constrained requests are rejected:
+
+```bash
+NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_structured_real_test --output-on-failure
 ```
 
 Run the peer 35B-A3B route independently:

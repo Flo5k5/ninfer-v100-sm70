@@ -17,6 +17,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/token_bitmask.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -90,6 +91,17 @@ std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& p
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
                         std::initializer_list<std::int32_t> shape, const char* label) {
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
+}
+
+// Columns a round verifies per row: one for ordinary decode, the widest planned verification
+// (learned drafts or context lookup) plus the target's own next token for MTP. The same width
+// bounds the MTP workspace and graph profiles.
+std::uint32_t token_mask_columns(const SequencePlanImpl& plan) {
+    if (plan.speculative_backend == SpeculativeBackend::None) { return 1; }
+    if (plan.speculative_backend != SpeculativeBackend::Mtp) {
+        throw std::logic_error("token masks require the ordinary or MTP backend");
+    }
+    return plan.lookup.widest_window() + 1U;
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
@@ -258,6 +270,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
+    if (plan.token_masks) {
+        out.token_masks = add_tensor(builder, DType::I32,
+                                     {ops::token_bitmask_words(TextConfig::token_domain),
+                                      static_cast<std::int32_t>(token_mask_columns(plan)),
+                                      static_cast<std::int32_t>(plan.max_concurrency)},
+                                     "token masks");
+        out.token_mask_single_column =
+            add_tensor(builder, DType::I32, {1}, "token mask single column");
+    }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
@@ -812,6 +833,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
+    impl->token_masks         = inputs.token_masks;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
@@ -902,8 +924,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
-        .device              = options.device,
-        .context_cache       = options.context_cache,
+        .token_masks         = qwen3_6::structured_output_options(options).enabled &&
+                       qwen3_6::supports_token_masks(options.speculative.backend),
+        .device        = options.device,
+        .context_cache = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

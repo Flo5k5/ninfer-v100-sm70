@@ -46,6 +46,11 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
+    // Grammar masks of constrained rows (ops::apply_token_bitmask): one mask per column of the
+    // widest verification of every batch row, and a one-column count for the prompt's last
+    // position. Planned when constrained requests are served.
+    std::optional<TensorLayout> token_masks;
+    std::optional<TensorLayout> token_mask_single_column;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };
@@ -87,7 +92,9 @@ struct SequencePlanningInputs {
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
-    int device          = 0;
+    // Rows may carry grammar masks (structured output on a backend that can mask its positions).
+    bool token_masks = false;
+    int device       = 0;
     ContextCacheOptions context_cache;
 };
 
@@ -115,6 +122,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
+    bool token_masks    = false;
     int device          = 0;
     ContextCacheOptions context_cache;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
