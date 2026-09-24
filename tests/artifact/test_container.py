@@ -7,9 +7,10 @@ import struct
 import pytest
 
 from tools.artifact.reader import Artifact
+from tools.artifact.formats import NUMERIC_FORMATS
 from tools.artifact.framing import HEADER, MAGIC, PART_MAGIC
 from tools.artifact.inspect import artifact_summary
-from tools.artifact.layouts import encoded_size
+from tools.artifact.layouts import LAYOUTS, encoded_size
 from tools.artifact.schema import (
     ArtifactError,
     ResourceSpec,
@@ -149,6 +150,8 @@ def test_every_registered_storage_round_trips_with_its_summary(tmp_path):
         "row_scale_v1": 1,
         "row_split_k128_v1": 4,
     }
+    assert set(summary["formats"]) == set(NUMERIC_FORMATS)
+    assert set(summary["layouts"]) == set(LAYOUTS)
 
 
 def test_shards_use_recorded_names_and_open_only_when_needed(tmp_path):
