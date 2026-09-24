@@ -344,7 +344,10 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
         float cum                = 0.0f;
         int support              = 0;
         for (int j = 0; j < n; ++j) {
-            if (!(prob[j] > 0.0f)) { break; }
+            // Weights below the smallest normal float (FLT_MIN) are exponent underflow, for
+            // example a finite logit of -100: the public contract keeps them out of the
+            // support, or the past-the-mass fallback could still draw one.
+            if (!(prob[j] >= 1.17549435e-38f)) { break; }
             if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
             cum += prob[j];
             support = j + 1;
