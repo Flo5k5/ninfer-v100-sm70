@@ -7,13 +7,15 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace ninfer::serve {
 
 struct RequestLogContext {
     std::uint64_t id = 0;
     std::string protocol;
-    std::string model;
+    std::string model;           // the served public model ID
+    std::string requested_model; // log_safe_model_alias() of the client's model field
     bool stream                             = false;
     std::size_t message_count               = 0;
     std::size_t media_item_count            = 0;
@@ -33,8 +35,11 @@ struct RequestLogContext {
     ninfer::PromptPreparationStats preparation;
 };
 
+// Handler-supplied request identity. The views must remain valid while the handler builds its log
+// contexts, which copy only log-safe values: never the client's model field itself.
 struct RequestLogMetadata {
-    std::string model;
+    std::string_view served_model;
+    std::string_view requested_model;
     bool stream                            = false;
     bool output_tokens_explicit            = false;
     bool preserve_thinking_semantic_change = false;
@@ -45,7 +50,8 @@ struct RequestLogMetadata {
 struct RequestRejectionLogContext {
     std::uint64_t id = 0;
     std::string protocol;
-    std::string model;
+    std::string model;           // the served public model ID
+    std::string requested_model; // log_safe_model_alias() of the client's model field
     bool stream                             = false;
     std::size_t message_count               = 0;
     std::size_t media_item_count            = 0;
@@ -99,6 +105,11 @@ struct ThroughputReport {
     ninfer::RuntimeStats previous;
     ninfer::RuntimeStats current;
 };
+
+// Anthropic clients may send any non-empty string as `model`, including text a user typed or a
+// value as large as the request body. Logs therefore keep it only when it has the shape of a model
+// identifier, at most 128 characters from [A-Za-z0-9._:@/-], and record "other" otherwise.
+[[nodiscard]] std::string log_safe_model_alias(std::string_view requested_model);
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,

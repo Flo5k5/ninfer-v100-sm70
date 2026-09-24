@@ -1,8 +1,29 @@
 #include "serve/request_events.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace ninfer::serve {
+namespace {
+
+constexpr std::size_t kMaximumModelAliasBytes = 128;
+
+bool is_model_identifier_character(char value) noexcept {
+    return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+           (value >= '0' && value <= '9') || value == '.' || value == '_' || value == ':' ||
+           value == '@' || value == '/' || value == '-';
+}
+
+} // namespace
+
+std::string log_safe_model_alias(std::string_view requested_model) {
+    if (requested_model.empty() || requested_model.size() > kMaximumModelAliasBytes ||
+        !std::all_of(requested_model.begin(), requested_model.end(),
+                     is_model_identifier_character)) {
+        return "other";
+    }
+    return std::string(requested_model);
+}
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
@@ -11,7 +32,8 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     RequestLogContext context;
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
-    context.model                              = metadata.model;
+    context.model                              = std::string(metadata.served_model);
+    context.requested_model                    = log_safe_model_alias(metadata.requested_model);
     context.stream                             = metadata.stream;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
@@ -40,7 +62,8 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     RequestRejectionLogContext context;
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
-    context.model                              = metadata.model;
+    context.model                              = std::string(metadata.served_model);
+    context.requested_model                    = log_safe_model_alias(metadata.requested_model);
     context.stream                             = metadata.stream;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();

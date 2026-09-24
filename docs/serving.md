@@ -884,6 +884,13 @@ they do not infer request behavior from process-global counter deltas.
 the template has no tiered default. A preparation rejection always leaves the resolved field
 `null`.
 
+`request.model` is the served public model ID. `request.requested_model` is the client's `model`
+value when it has at most 128 characters, all from `[A-Za-z0-9._:@/-]`, and `other` otherwise.
+OpenAI endpoints accept only the served ID, so `requested_model` repeats it there, or is `other`
+when an operator's `--model-id` falls outside that shape. Anthropic clients may send any string:
+text with spaces or other characters, or a longer value, is written as `other`, but a value of that
+shape is written as sent, so clients should not put secrets or user text in `model`.
+
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
@@ -917,12 +924,12 @@ request is delayed by the full round, so these values explain request latency bu
 summed across concurrent requests**.
 
 The JSONL file contains no prompt or generated text, tool definitions or arguments, media locations,
-or error messages, and never records an API-key value; `argv` replaces that value with
-`<redacted>`. Error messages can quote client input or model output, so they reach only the HTTP
-client. Operational stderr summaries are rounded and are not the
-aggregation source. OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a
-request ID when they enter synchronous preparation. Successful preparation produces
-`request_start`; a preparation failure produces `request_rejected` without a matching start. Each
+error messages, or client model values outside the alias shape above, and never records an API-key
+value; `argv` replaces that value with `<redacted>`. Error messages can quote client input or model output, so they reach only
+the HTTP client. Operational stderr summaries are rounded and are not the aggregation source.
+OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a request ID when they
+enter synchronous preparation. Successful preparation produces `request_start`; a preparation
+failure produces `request_rejected` without a matching start. Each
 started generation transaction then has exactly one machine terminal: `request_done` when Engine
 returns its outcome, or `request_error` when generation fails before an outcome exists. Later
 response rendering, Responses storage, or terminal transport failures are operational response
@@ -970,7 +977,7 @@ state only:
 | Responses store | nothing with `--no-response-store`; see [Local response state and resources](#local-response-state-and-resources) |
 | Chat Completions and Anthropic Messages | nothing; Chat Completions rejects `store: true` |
 | Operational stderr log, every `--log-level` | request IDs, protocol, message/tool/media counts, token counts, timings, HTTP status and error codes |
-| `--request-log-jsonl FILE` | the same classes of fields at full precision, the redacted `argv`, and the requested model name, which Anthropic clients may choose freely |
+| `--request-log-jsonl FILE` | the same classes of fields at full precision, the redacted `argv`, the served model ID, and the client's model alias only when it is identifier-shaped |
 | Engine context cache | token IDs, KV, and model state of reusable prefixes in Device and pinned Host memory; bounded, evicted under pressure, and lost at exit; `--no-prefix-reuse` disables it |
 | Media cache | prepared image and video tensors keyed by a content digest in Host memory; bounded and lost at exit; `--media-cache-mib 0` disables it |
 
