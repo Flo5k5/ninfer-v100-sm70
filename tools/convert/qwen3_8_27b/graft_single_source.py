@@ -60,7 +60,7 @@ from tools.artifact.formats import QUANT_FORMATS
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
 from tools.artifact.writer import ArtifactWriter
-from tools.convert.common.provenance import input_label, strip_local_paths
+from tools.convert.common.provenance import input_label, local_name, strip_local_paths
 from tools.convert.common.quantize import quantize_and_encode
 from tools.convert.qwen3_8_27b.fp8_embedding import (
     ENCODER_PROFILE,
@@ -534,10 +534,10 @@ def convert(builder: ObjectBuilder, out_path: Path, provenance: dict) -> None:
         builder.source.close()
     elapsed = time.perf_counter() - started
     report = {
-        "artifact": out_path.name,
+        "artifact": local_name(out_path),
         "bytes": out_path.stat().st_size,
-        "template": template.path.name,
-        "source": builder.source.model_dir.name,
+        "template": local_name(template.path),
+        "source": local_name(builder.source.model_dir),
         "objects": counts,
         "copy_prefixes": list(COPY_PREFIXES),
         "fp8_bf16_encoder": ENCODER_PROFILE,
@@ -583,7 +583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         provenance, removed = strip_local_paths(template.directory.provenance)
         graft = {
             "tool": "tools.convert.qwen3_8_27b.graft_single_source",
-            "template": arguments.template.name,
+            "template": local_name(arguments.template),
             "template_artifact_id": template.artifact_id.hex(),
             "copied": list(COPY_PREFIXES),
         }

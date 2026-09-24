@@ -21,6 +21,7 @@ from typing import Mapping, Sequence
 import torch
 
 from tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
+from tools.convert.common import provenance
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
@@ -174,7 +175,7 @@ def build_conversion_report(
     model_dir: str | Path,
     dflash2_model_dir: str | Path,
     out_path: str | Path,
-    arguments: Mapping[str, object],
+    requested_device: str,
     base_config_summary: Mapping[str, object],
     dflash2_config_summary: Mapping[str, object],
     base_source_preflight: recipe.SourcePreflight,
@@ -190,9 +191,25 @@ def build_conversion_report(
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
-        model_dir=model_dir,
+        sources={
+            "base": {
+                "repository": BASE_REPOSITORY,
+                "revision": BASE_REVISION,
+                "name": provenance.local_name(model_dir),
+            },
+            "dflash2": {
+                "repository": dflash2_recipe.REPOSITORY,
+                "revision": dflash2_recipe.REVISION,
+                "name": provenance.local_name(dflash2_model_dir),
+            },
+        },
         out_path=out_path,
-        arguments=arguments,
+        arguments={
+            "model": provenance.local_name(model_dir),
+            "dflash2_model": provenance.local_name(dflash2_model_dir),
+            "out": provenance.local_name(out_path),
+            "device": requested_device,
+        },
         config_summary={
             "base": dict(base_config_summary),
             "dflash2": dict(dflash2_config_summary),
@@ -204,19 +221,6 @@ def build_conversion_report(
         device=device,
         ranking_path=ranking_path,
     )
-    report["source"] = {
-        "base": {
-            "repository": BASE_REPOSITORY,
-            "revision": BASE_REVISION,
-            "model_path": str(Path(model_dir).resolve()),
-        },
-        "dflash2": {
-            "repository": dflash2_recipe.REPOSITORY,
-            "revision": dflash2_recipe.REVISION,
-            "model_path": str(Path(dflash2_model_dir).resolve()),
-        },
-        "ranking_path": str(Path(ranking_path).resolve()),
-    }
     report["source_preflight"] = {
         "base": {
             "recipes": base_source_preflight.recipe_count,
@@ -302,17 +306,11 @@ def convert(
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
-    arguments = {
-        "model": str(model_dir),
-        "dflash2_model": str(dflash2_model_dir),
-        "out": str(out_path),
-        "device": requested_device,
-    }
     report = build_conversion_report(
         model_dir=model,
         dflash2_model_dir=preflight.dflash2_model_dir,
         out_path=output,
-        arguments=arguments,
+        requested_device=requested_device,
         base_config_summary=preflight.base_config_summary,
         dflash2_config_summary=preflight.dflash2_config_summary,
         base_source_preflight=preflight.base_source,
