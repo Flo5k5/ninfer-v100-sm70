@@ -67,8 +67,10 @@ from tools.convert.quantization.groupwise import quantize_matrix
 
 
 COPY_PREFIXES = ("resource/", "vision/", "dflash2/", "proposal/token_ids")
-# The conversion method that owns the BF16-to-FP8 row encoder, quantize_bf16_rows.
-FP8_BF16_ENCODER = "fp8_row_maxabs"
+# The BF16-to-FP8 row encoder, quantize_bf16_rows: its profile name in the Qwen3.8-27B artifact
+# reference and model card, and the conversion method that owns it.
+FP8_BF16_ENCODER = "MAXABS_BF16S_RECIP_E4M3FN_RNE_V1"
+FP8_BF16_METHOD = "fp8_row_maxabs"
 ATTENTION_HEADS = 24
 ATTENTION_HEAD_ROWS = 512
 ATTENTION_QUERY_ROWS = 256
@@ -542,6 +544,7 @@ def convert(builder: ObjectBuilder, out_path: Path, provenance: dict) -> None:
         "objects": counts,
         "copy_prefixes": list(COPY_PREFIXES),
         "fp8_bf16_encoder": FP8_BF16_ENCODER,
+        "fp8_bf16_method": FP8_BF16_METHOD,
         "provenance": provenance,
         "elapsed_seconds": round(elapsed, 1),
     }

@@ -140,6 +140,8 @@ def test_graft_report_names_files_by_name_only(tmp_path) -> None:
     assert report["artifact"] == out_path.name
     assert report["template"] == template_path.name
     assert report["source"] == source_dir.name
+    assert report["fp8_bf16_encoder"] == "MAXABS_BF16S_RECIP_E4M3FN_RNE_V1"
+    assert report["fp8_bf16_method"] == "fp8_row_maxabs"
     for value in (report["artifact"], report["template"], report["source"]):
         assert "/" not in value and "\\" not in value
     assert_no_path_fragments(json.dumps(report), tmp_path)
