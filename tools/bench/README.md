@@ -20,6 +20,28 @@ client, stages the NVFP4 artifact once in `/dev/shm`, stores raw/progress/Serve 
 JSON, and CSV summaries. The case catalog, exact profiles, TTFT boundary, and fixture qualification
 are documented in the dedicated README.
 
+## Context-lookup A/B
+
+`run_context_lookup.py` compares MTP context-lookup policies on an already running `ninfer-serve`.
+It builds five fixed workloads from public Python standard-library sources and one long document:
+`rewrite` (return a whole file after two small edits), `edits` and `write` (a coding-agent turn
+after a `cat -n` Read result, answered with Edit or Write tool calls), `prose`, and `summary`.
+It only uses the public Chat Completions endpoint; start one server per policy with
+`--request-log-jsonl` to also collect the per-request lookup counters.
+
+```bash
+python3 tools/bench/run_context_lookup.py workloads --source-dir /usr/lib/python3.10 \
+  --document long_document.txt --output lookup_workloads.json
+python3 tools/bench/run_context_lookup.py run --server http://127.0.0.1:8080 \
+  --workloads lookup_workloads.json --label adaptive --temperature 1 --output sampled.jsonl
+python3 tools/bench/run_context_lookup.py summarize sampled.jsonl \
+  --request-log adaptive requests-adaptive.jsonl
+```
+
+`summarize` pools each label's requests per workload (tokens over decode time, with a bootstrap
+95% interval over requests), reports the widened-round share and per-round cost from the request
+log, and compares greedy (`--temperature 0`) outputs against `--greedy-reference`.
+
 ## Corpus baker
 
 `ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
