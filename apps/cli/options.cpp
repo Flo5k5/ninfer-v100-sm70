@@ -114,6 +114,7 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    product::ContextLookupFlags lookup_flags;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -148,12 +149,15 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--lookup-policy") {
             options.speculative.context_lookup.policy =
                 product::parse_context_lookup_policy(value(arg));
+            lookup_flags.policy = true;
         } else if (arg == "--lookup-min-suffix") {
             options.speculative.context_lookup.min_suffix =
                 parse_u32(value(arg), "lookup-min-suffix");
+            lookup_flags.min_suffix = true;
         } else if (arg == "--lookup-max-proposal") {
             options.speculative.context_lookup.max_proposal =
                 parse_u32(value(arg), "lookup-max-proposal");
+            lookup_flags.max_proposal = true;
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
@@ -226,7 +230,7 @@ Options parse_options(int argc, char** argv) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
-    product::validate_speculative_cli_options(options.speculative);
+    product::validate_speculative_cli_options(options.speculative, lookup_flags);
     if (!options.enable_thinking && options.reasoning_effort) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
     }

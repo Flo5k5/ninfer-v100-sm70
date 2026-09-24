@@ -23,8 +23,13 @@ ninfer::EngineOptions engine_options(const char* artifact, ninfer::ContextLookup
     options.speculative.backend        = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens   = 4;
     options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
+    // A disabled lookup has no frame to size, so the Engine must accept sizes that fixed and
+    // adaptive reject.
+    const bool off                     = policy == ninfer::ContextLookupPolicy::Off;
     options.speculative.context_lookup = ninfer::ContextLookupOptions{
-        .policy = policy, .min_suffix = 4, .max_proposal = ninfer::kContextLookupMaximumProposal};
+        .policy       = policy,
+        .min_suffix   = off ? 0U : 4U,
+        .max_proposal = off ? 0U : ninfer::kContextLookupMaximumProposal};
     options.max_concurrency      = 1;
     options.max_pending_requests = 1;
     return options;
