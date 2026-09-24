@@ -290,8 +290,9 @@ cmake --build build -j --target ninfer_linear_topk_bench
 `K=1..15`, `B=1..8`, 16 candidates and rank 256, with full BF16 codebooks `[256,248320]`.
 The default sweep covers all K/B pairs in greedy, stochastic and mixed modes (B=1 omits the
 redundant mixed case). Each cold-cache CUDA Graph sample follows a 256 MiB L2 eviction write.
-It reports the selected route's required caller workspace and actual Graph node count. The timed
-interval includes all device work of the complete public Op; fixture allocation and setup are outside it.
+It reports the required caller workspace and the actual Graph node count. It reports no route:
+this port runs one coherent-path walk kernel for every K and B. The timed interval includes all
+device work of the complete public Op; fixture allocation and setup are outside it.
 
 ```bash
 cmake --build build -j --target ninfer_candidate_selector_bench
