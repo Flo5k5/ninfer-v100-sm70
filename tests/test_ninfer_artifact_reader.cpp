@@ -11,12 +11,14 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
 namespace {
 
 using ninfer::artifact::ArtifactError;
+using ninfer::artifact::ArtifactIdentity;
 using ninfer::artifact::Reader;
 using Json = nlohmann::json;
 using ninfer::test::artifact_fixture::kArtifactId;
@@ -94,11 +96,27 @@ Json normative_directory() {
     };
 }
 
+// One resource object; identity() reads only the public name and the provenance.
+Json recipe_directory(std::string_view name, Json provenance) {
+    return {
+        {"components", {{"text", {{"config", Json::object()}}}}},
+        {"objects", Json::array({{{"id", "resource"},
+                                  {"kind", "resource"},
+                                  {"encoding", "raw_bytes_v1"},
+                                  {"offset", 0},
+                                  {"bytes", 1}}})},
+        {"bindings", Json::object()},
+        {"uses", Json::array()},
+        {"metadata", {{"name", name}}},
+        {"provenance", std::move(provenance)},
+    };
+}
+
 template <typename Function>
-void expect_artifact_error(Function&& function, std::string_view label) {
+std::string expect_artifact_error(Function&& function, std::string_view label) {
     try {
         function();
-    } catch (const ArtifactError&) { return; }
+    } catch (const ArtifactError& error) { return error.what(); }
     throw std::runtime_error(std::string(label) + " was accepted");
 }
 
@@ -187,12 +205,55 @@ void test_common_validation() {
     }
 }
 
+void test_official_recipe_identities() {
+    const std::array<std::pair<std::string_view, ArtifactIdentity>, 5> official = {{
+        {"qwen3_6_27b", {"qwen3.6-27b", "groupwise-int"}},
+        {"qwen3_8_27b", {"qwen3.8-27b", "groupwise-int"}},
+        {"qwen3_6_35b_a3b", {"qwen3.6-35b-a3b", "groupwise-int"}},
+        {"qwen3_6_27b_nvfp4", {"qwen3.6-27b", "nvfp4"}},
+        {"qwen3_8_27b_nvfp4", {"qwen3.8-27b", "nvfp4"}},
+    }};
+    // Each recipe is read by a new Reader in the same process, so an identity carried over from
+    // one Reader to the next fails from the second recipe on.
+    for (const auto& [recipe, expected] : official) {
+        auto fixture = write_fixture(recipe_directory(expected.model_id, {{"recipe", recipe}}),
+                                     "recipe_" + std::string(recipe));
+        const Reader reader(fixture.path);
+        if (reader.identity() != expected) {
+            throw std::runtime_error(std::string(recipe) + " resolved to " +
+                                     reader.identity().model_id + "/" +
+                                     reader.identity().weights_id);
+        }
+    }
+}
+
+void test_unsupported_recipes() {
+    // A name that is not an official recipe resolves no weights id, even when it ends like one.
+    // The converter records a recipe file as file:function.
+    for (const std::string recipe : {"qwen3_6_35b_a3b_nvfp4", "my_recipe.py:qwen3_8_27b_nvfp4"}) {
+        auto fixture =
+            write_fixture(recipe_directory("qwen3.8-27b", {{"recipe", recipe}}), "unsupported");
+        const Reader reader(fixture.path);
+        const auto message = expect_artifact_error([&] { (void)reader.identity(); }, recipe);
+        if (message.find(recipe) == std::string::npos) {
+            throw std::runtime_error("the unsupported recipe error does not name " + recipe);
+        }
+    }
+    for (const Json& provenance : {Json::object(), Json{{"recipe", 7}}}) {
+        auto fixture = write_fixture(recipe_directory("qwen3.8-27b", provenance), "no_recipe");
+        const Reader reader(fixture.path);
+        expect_artifact_error([&] { (void)reader.identity(); }, "provenance " + provenance.dump());
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         test_normative_fixture();
         test_common_validation();
+        test_official_recipe_identities();
+        test_unsupported_recipes();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
