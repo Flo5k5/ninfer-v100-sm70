@@ -7,6 +7,8 @@ import torch
 
 from tools.artifact.layouts import (
     block_scale_geometry,
+    encoded_size,
+    row_split_geometry,
 )
 from tools.artifact.codecs.direct import decode_direct, encode_direct
 from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, encode_nvfp4
@@ -64,6 +66,36 @@ def test_direct_layout_preserves_exact_little_endian_words(
     if format_name == "bf16":
         with pytest.raises(TypeError):
             encode_direct(tensor.float(), format_name)
+
+
+def test_row_split_geometry_and_encoded_size_are_derived_from_format_and_shape():
+    geometry = row_split_geometry("q5_g64_fp16", (2, 130))
+    assert (
+        geometry.k_pad,
+        geometry.groups_per_row,
+        geometry.base_bytes,
+        geometry.high_offset,
+        geometry.high_bytes,
+        geometry.scale_offset,
+        geometry.scale_bytes,
+        geometry.payload_bytes,
+    ) == (256, 4, 256, 256, 64, 512, 16, 528)
+    assert encoded_size("row_split_k128_v1", "q5_g64_fp16", (2, 130)) == 528
+
+    q4 = row_split_geometry("q4_g64_fp16", (1, 4304))
+    q8 = row_split_geometry("q8_g32_fp16", (1, 4304))
+    assert (q4.k_pad, q4.groups_per_row, q4.base_row_bytes, q4.high_row_bytes) == (
+        4352,
+        68,
+        2176,
+        0,
+    )
+    assert (q8.k_pad, q8.groups_per_row, q8.base_row_bytes, q8.high_row_bytes) == (
+        4352,
+        136,
+        4352,
+        0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -186,3 +218,20 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
     assert torch.equal(decoded_packed, packed)
     assert torch.equal(decoded_scales, scales)
     assert bytes(decoded_divisor.reshape(1).view(torch.uint8).numpy()) == divisor
+
+
+@pytest.mark.parametrize(
+    ("layout", "format_name", "shape", "message"),
+    [
+        ("block_scale_k16_m128x4_v1", "nvfp4", (128,), "rank 2"),
+        ("block_scale_k16_m128x4_v1", "nvfp4", (64, 64), "N divisible by 128"),
+        ("block_scale_k16_m128x4_v1", "nvfp4", (128, 32), "K divisible by 64"),
+        ("block_scale_k16_m128x4_v1", "q4_g64_fp16", (128, 64), "does not accept"),
+        ("row_split_k128_v1", "nvfp4", (128, 64), "does not accept"),
+    ],
+)
+def test_nvfp4_layout_rejects_out_of_contract_signatures(
+    layout, format_name, shape, message
+):
+    with pytest.raises(ValueError, match=message):
+        encoded_size(layout, format_name, shape)

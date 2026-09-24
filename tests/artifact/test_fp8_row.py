@@ -21,6 +21,40 @@ def _bf16_words(*words: int) -> torch.Tensor:
     return torch.tensor(signed, dtype=torch.int16).view(torch.bfloat16)
 
 
+def test_fp8_weight_and_bf16_row_scale_word_validity():
+    finite_codes = [word for word in range(0x100) if word not in (0x7F, 0xFF)]
+    signed_zeros = [0x00, 0x80] * (len(finite_codes) // 2)
+    codes = torch.tensor([finite_codes] * 3 + [signed_zeros], dtype=torch.uint8)
+    scales = _bf16_words(0x0001, 0x3F80, 0x7F7F, 0x0000)
+    shape = tuple(codes.shape)
+    decoded_codes, decoded_scales = decode_fp8_row_scaled_words(
+        encode_fp8_row_scaled(codes, scales, shape), shape
+    )
+    assert torch.equal(decoded_codes, codes)
+    assert torch.equal(decoded_scales.view(torch.int16), scales.view(torch.int16))
+
+    row_shape = (1, len(finite_codes))
+    for word in (0x7F, 0xFF):
+        invalid_codes = codes[:1].clone()
+        invalid_codes[0, 0] = word
+        with pytest.raises(ValueError, match="finite E4M3FN"):
+            encode_fp8_row_scaled(invalid_codes, _bf16_words(0x3F80), row_shape)
+    for word in (0x8000, 0xBF80, 0x7F80, 0x7FC0, 0xFF80, 0xFFC0):
+        with pytest.raises(ValueError, match="nonnegative finite BF16"):
+            encode_fp8_row_scaled(codes[:1], _bf16_words(word), row_shape)
+
+    stored = encode_fp8_row_scaled(codes[:1], _bf16_words(0x3F80), row_shape)
+    geometry = row_scale_geometry("fp8_e4m3fn_row_bf16", row_shape)
+    for offset, word, message in (
+        (0, b"\x7f", "finite E4M3FN"),
+        (geometry.scale_plane_offset, b"\x00\x80", "nonnegative finite BF16"),
+    ):
+        corrupted = bytearray(stored)
+        corrupted[offset : offset + len(word)] = word
+        with pytest.raises(ValueError, match=message):
+            decode_fp8_row_scaled_words(bytes(corrupted), row_shape)
+
+
 def test_row_scale_layout_known_words_padding_and_reconstruction():
     shape = (2, 4)
     geometry = row_scale_geometry("fp8_e4m3fn_row_bf16", shape)
@@ -77,3 +111,12 @@ def test_row_scaled_fp8_rejects_invalid_words_and_signatures():
     nonzero_codes[0, 0] = 0x38
     with pytest.raises(ValueError, match="zero row scale"):
         encode_fp8_row_scaled(nonzero_codes, _bf16_words(0x0000), (1, 2))
+
+    with pytest.raises(TypeError, match="uint8"):
+        encode_fp8_row_scaled(zero_codes.to(torch.int8), positive_scale, (1, 2))
+    with pytest.raises(TypeError, match="BF16"):
+        encode_fp8_row_scaled(zero_codes, positive_scale.float(), (1, 2))
+    with pytest.raises(ValueError, match="rank 2"):
+        encoded_size("row_scale_v1", "fp8_e4m3fn_row_bf16", (2,))
+    with pytest.raises(ValueError, match="does not accept"):
+        encoded_size("row_scale_v1", "nvfp4", (128, 64))
