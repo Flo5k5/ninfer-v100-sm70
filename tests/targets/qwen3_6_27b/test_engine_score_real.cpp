@@ -9,6 +9,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -52,32 +54,36 @@ private:
     std::span<const ninfer::TokenId> targets_;
 };
 
-} // namespace
+struct Agreement {
+    bool valid     = false;
+    double mean    = 0.0;
+    double maximum = 0.0;
+};
 
-int main() {
-    const char* artifact = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "SKIP: NINFER_QWEN3_6_27B_WEIGHTS is not set\n";
-        return 77;
+// Mean and largest absolute difference of two equally shaped logprob vectors.
+Agreement agreement(const std::vector<float>& lhs, const std::vector<float>& rhs) {
+    Agreement out;
+    if (lhs.empty() || lhs.size() != rhs.size()) { return out; }
+    double total = 0.0;
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (!std::isfinite(lhs[i]) || !std::isfinite(rhs[i])) { return out; }
+        const double difference = std::abs(static_cast<double>(lhs[i]) - rhs[i]);
+        total += difference;
+        out.maximum = std::max(out.maximum, difference);
     }
+    out.mean  = total / static_cast<double>(lhs.size());
+    out.valid = true;
+    return out;
+}
 
-    ninfer::EngineOptions options;
-    options.artifact_path = artifact;
-    options.purpose       = ninfer::EnginePurpose::CausalScoring;
-    options.max_context   = 2048;
-    options.kv_cache      = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    ninfer::Engine engine(options);
-    const auto& effective = engine.options();
-    if (effective.max_concurrency != 1 || effective.prefill_chunk != 1024 ||
-        effective.kv_capacity.mode != ninfer::KvCapacityMode::Explicit ||
-        effective.kv_capacity.explicit_tokens != effective.max_context ||
-        effective.context_cache.enabled ||
-        effective.speculative.backend != ninfer::SpeculativeBackend::None ||
-        effective.kv_cache != ninfer::KvCacheStorage::Fp8E4M3Row256) {
-        std::cerr << "causal scoring options were not normalized correctly\n";
-        return 1;
-    }
+// Target log-probabilities of one engine in the prefill scoring shape and in the decode/verify
+// shape (four scored columns per forward call).
+struct ShapeScores {
+    std::vector<float> prefill;
+    std::vector<float> narrow;
+};
 
+std::vector<ninfer::TokenId> scoring_tokens(const ninfer::Engine& engine) {
     std::string text;
     const std::string paragraph =
         "NInfer scores each target token from the preceding hidden state. "
@@ -88,6 +94,31 @@ int main() {
         tokens = engine.tokenize_text(text);
     }
     tokens.resize(1537);
+    return tokens;
+}
+
+ninfer::EngineOptions scoring_options(const char* artifact, ninfer::TextResidualStorage residual) {
+    ninfer::EngineOptions options;
+    options.artifact_path = artifact;
+    options.purpose       = ninfer::EnginePurpose::CausalScoring;
+    options.max_context   = 2048;
+    options.kv_cache      = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.text_residual = residual;
+    return options;
+}
+
+int exercise_scoring(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& tokens,
+                     ShapeScores& scores) {
+    const auto& effective = engine.options();
+    if (effective.max_concurrency != 1 || effective.prefill_chunk != 1024 ||
+        effective.kv_capacity.mode != ninfer::KvCapacityMode::Explicit ||
+        effective.kv_capacity.explicit_tokens != effective.max_context ||
+        effective.context_cache.enabled ||
+        effective.speculative.backend != ninfer::SpeculativeBackend::None ||
+        effective.kv_cache != ninfer::KvCacheStorage::Fp8E4M3Row256) {
+        std::cerr << "causal scoring options were not normalized correctly\n";
+        return 1;
+    }
 
     const std::vector<float> all      = engine.score_tokens(tokens, 1);
     const std::vector<float> suffix   = engine.score_tokens(tokens, 513);
@@ -145,25 +176,10 @@ int main() {
     // sitting on a near tie can move by a nat between two kernel paths, so the mean difference is
     // the agreement gate and the maximum only bounds a gross failure.
     const std::vector<float> narrow = engine.score_tokens(tokens, 513, nullptr, {.scored_chunk = 4});
-    if (narrow.size() != suffix.size()) {
-        std::cerr << "decode-width scoring returned an invalid result shape\n";
-        return 1;
-    }
-    float maximum_shape_error = 0.0F;
-    double total_shape_error  = 0.0;
-    for (std::size_t i = 0; i < suffix.size(); ++i) {
-        if (!std::isfinite(narrow[i])) {
-            std::cerr << "decode-width scoring returned a non-finite logprob\n";
-            return 1;
-        }
-        const float difference = std::abs(narrow[i] - suffix[i]);
-        maximum_shape_error    = std::max(maximum_shape_error, difference);
-        total_shape_error += difference;
-    }
-    const double mean_shape_error = total_shape_error / static_cast<double>(suffix.size());
-    if (mean_shape_error > 0.02 || maximum_shape_error > 2.0F) {
-        std::cerr << "decode-width scoring moved targets by " << mean_shape_error
-                  << " on average, " << maximum_shape_error << " at most\n";
+    const Agreement shape = agreement(narrow, suffix);
+    if (!shape.valid || shape.mean > 0.02 || shape.maximum > 2.0) {
+        std::cerr << "decode-width scoring moved targets by " << shape.mean << " on average, "
+                  << shape.maximum << " at most\n";
         return 1;
     }
     try {
@@ -173,9 +189,72 @@ int main() {
         return 1;
     } catch (const std::invalid_argument&) {
     }
-    std::cout << "OK causal_score_real max_overlap_error=" << maximum_overlap_error
-              << " max_sink_error=" << maximum_sink_error
-              << " decode_shape_error mean=" << mean_shape_error << " max=" << maximum_shape_error
-              << '\n';
+    std::cout << "causal_score_real max_overlap_error=" << maximum_overlap_error
+              << " max_sink_error=" << maximum_sink_error << " decode_shape_error mean="
+              << shape.mean << " max=" << shape.maximum << '\n';
+    scores.prefill = suffix;
+    scores.narrow  = narrow;
+    return 0;
+}
+
+} // namespace
+
+// Default: the BF16 residual stream on any 27B artifact (NINFER_QWEN3_6_27B_WEIGHTS).
+// --text-residual fp32: the FP32 residual stream, available for qwen3.8-27b/nvfp4
+// (NINFER_QWEN3_8_27B_NVFP4_WEIGHTS). The same checks run on an FP32-residual engine, and both of
+// its scoring shapes must agree with a BF16-residual engine on the same artifact.
+int main(int argc, char** argv) {
+    const bool fp32 = argc == 3 && std::string_view(argv[1]) == "--text-residual" &&
+                      std::string_view(argv[2]) == "fp32";
+    if (argc != 1 && !fp32) {
+        std::cerr << "usage: " << argv[0] << " [--text-residual fp32]\n";
+        return 2;
+    }
+    const char* variable =
+        fp32 ? "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS" : "NINFER_QWEN3_6_27B_WEIGHTS";
+    const char* artifact = std::getenv(variable);
+    if (artifact == nullptr || *artifact == '\0') {
+        std::cout << "SKIP: " << variable << " is not set\n";
+        return 77;
+    }
+
+    std::vector<ninfer::TokenId> tokens;
+    ShapeScores bf16;
+    {
+        ninfer::Engine engine(scoring_options(artifact, ninfer::TextResidualStorage::BFloat16));
+        tokens = scoring_tokens(engine);
+        if (const int result = exercise_scoring(engine, tokens, bf16); result != 0) {
+            return result;
+        }
+    }
+    if (!fp32) {
+        std::cout << "OK causal_score_real\n";
+        return 0;
+    }
+
+    ninfer::Engine engine(scoring_options(artifact, ninfer::TextResidualStorage::Float32));
+    if (engine.options().text_residual != ninfer::TextResidualStorage::Float32) {
+        std::cerr << "the FP32 text residual was not retained by the Engine\n";
+        return 1;
+    }
+    ShapeScores residual32;
+    if (const int result = exercise_scoring(engine, tokens, residual32); result != 0) {
+        return result;
+    }
+    // The FP32 residual removes BF16 roundings of the stream; it must not move the model. On this
+    // near-deterministic text the targets agree like the two scoring shapes do.
+    for (const auto& [label, fp32_scores, bf16_scores] :
+         {std::tuple{"prefill", &residual32.prefill, &bf16.prefill},
+          std::tuple{"decode-width", &residual32.narrow, &bf16.narrow}}) {
+        const Agreement agreed = agreement(*fp32_scores, *bf16_scores);
+        std::cout << "fp32/bf16 residual " << label << " agreement mean=" << agreed.mean
+                  << " max=" << agreed.maximum << '\n';
+        if (!agreed.valid || agreed.mean > 0.02 || agreed.maximum > 2.0) {
+            std::cerr << "the FP32 residual moved " << label << " targets by " << agreed.mean
+                      << " on average, " << agreed.maximum << " at most\n";
+            return 1;
+        }
+    }
+    std::cout << "OK causal_score_real fp32 residual\n";
     return 0;
 }
