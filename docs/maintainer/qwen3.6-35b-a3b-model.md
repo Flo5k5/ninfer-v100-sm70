@@ -951,7 +951,7 @@ The registered implementation maps these concerns as follows:
 | tokenizer, template, multimodal processing, and output decoding | `src/targets/qwen3_6/impl/frontend/` |
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |
-| exact artifact and converter | [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md), `tools/convert/qwen3_6_35b_a3b/` |
+| exact artifact and conversion | [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md), `tools/convert/official_recipes.py`, [weight conversion guide](../weight-conversion.md) |
 
 The registered 35B Public Engine conditionally materializes the DFlash companion when DFlash is the
 selected speculative backend and independently materializes Vision when Vision is enabled. DFlash

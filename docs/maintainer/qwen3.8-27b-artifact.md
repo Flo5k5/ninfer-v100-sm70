@@ -5,13 +5,23 @@ inventory, shapes, numeric formats, storage layouts, fused row order, aliases, f
 source-to-object transforms. Sections 1 through 12 define the `nvfp4` profile and the DFlash2
 suffix shared by both profiles; Section 13 defines the `groupwise-int` base allocation.
 
-The NVFP4 profile is a registered Engine identity implemented by the target converter, exact
-binder, and Qwen3.8 execution leaves. The generic artifact registry resolves its version-2
-identity without a runtime profile flag. Common framing is defined in
+The NVFP4 profile is a registered Engine identity implemented by its official recipe, the exact
+binder, and Qwen3.8 execution leaves. The generic artifact reader resolves its identity without a
+runtime profile flag. Common framing is defined in
 [`artifact-container.md`](artifact-container.md), numeric semantics in
 [`tensor-formats.md`](tensor-formats.md), byte packing in
 [`storage-layouts.md`](storage-layouts.md), and model mathematics and state behavior in
 [`qwen3.6-27b-model.md`](qwen3.6-27b-model.md).
+
+The v3 conversion pipeline writes both artifacts with the official recipes `qwen3_8_27b_nvfp4` and
+`qwen3_8_27b`; see the [weight conversion guide](../weight-conversion.md). The object names,
+counts, and identities below describe the version-2 layout, which the Volta binder still
+addresses: its v2-to-v3 shim (`src/artifact/typed_binding.cpp`) resolves each name to the v3
+object that its logical bindings cover, and derives the identity from the v3 metadata name and
+recipe. The source transforms and payload encodings below remain the contract of both artifacts.
+Today only the NVFP4 artifact loads on this port: `Reader::identity` derives `27b` from the
+`qwen3_8_27b` recipe name, and the Engine rejects the `groupwise-int` artifact of Section 13 until
+the identity fix in [#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17) lands.
 
 ## 1. NVFP4 artifact identity and contents
 
@@ -20,7 +30,7 @@ filename   = qwen3_8_27b_nvfp4.ninfer
 model_id   = qwen3.8-27b
 weights_id = nvfp4
 target_key = qwen3_8_27b
-recipe_id  = qwen3_8_27b_nvfp4-v2
+recipe     = qwen3_8_27b_nvfp4
 ```
 
 The current artifact is one complete image containing Text, the optimized proposal head, MTP,
@@ -791,9 +801,9 @@ For source prefix `model.visual.merger.`:
 
 ### 12.3 DFlash2 source mapping
 
-Each converter reads only DFlash2 `config.json` and the single-file `model.safetensors` from the
-fixed source in Section 10.1. The safetensors file must contain exactly the 81 declared BF16 source
-tensors: no missing, extra, differently shaped, or differently typed tensor is accepted.
+Conversion reads DFlash2 `config.json` and the single-file `model.safetensors` from the fixed
+source in Section 10.1, and requires each of the 81 declared BF16 source tensors with its declared
+shape.
 
 | Artifact object | DFlash2 source | Transform |
 |---|---|---|
@@ -828,37 +838,38 @@ quantized code/scale planes are never concatenated.
 
 ### 12.4 Producer requirements
 
-Before opening the output, the converter must validate all fixed checkpoint configurations, every
-selected source name, shape, dtype, format assignment, source scale geometry, frontend resource,
-ranking input, and the complete ordered object plan. The DFlash2 config must match the fixed facts
-in Section 2 and the base hidden width, vocabulary, layer count, maximum positions, and RoPE theta.
+The official recipe `qwen3_8_27b_nvfp4` produces this profile. Before writing, conversion normalizes
+the base and DFlash2 configurations and refuses changed fixed mathematics; the DFlash2 config must
+match the base hidden width, vocabulary, and layer count. Every selected source tensor must exist
+with its declared shape, the recipe must cover every logical parameter, and the conversion methods
+check source scale geometry and encoded words as they prepare.
 
-During materialization, the converter must:
+During materialization, the recipe:
 
-- preserve every source-derived E4M3FN code and BF16 row-scale word exactly after the defined
-  split, permutation, and fusion;
-- preserve every NVFP4 packed code, natural scale word, `d_w`, and `d_x` exactly, including
-  all gate/up equality requirements;
-- preserve direct words exactly and perform the specified BF16-to-FP32 expansions;
-- encode the embedding with the bit-level profile in Section 10.4;
-- encode draft-head, MTP, and Vision weights with `MAXABS_F16_RECIP_RNE_V1`;
-- preserve or encode DFlash2 weights according to Section 3.1;
-- write the complete object inventory and six resource payloads in the order required by the
-  documented logical views and aliases.
+- imports every source-derived E4M3FN code and BF16 row-scale word, and every NVFP4 packed code,
+  natural scale word, `d_w`, and `d_x`, after the defined split, permutation, and fusion, without
+  decoding or requantizing them (`import_encoded`); a gate/up parent requires equal `d_w` words;
+- preserves direct words and performs the specified BF16-to-FP32 expansions;
+- encodes the embedding with the bit-level profile in Section 10.4 (`fp8_row_maxabs`);
+- encodes draft-head, MTP, and Vision weights with `MAXABS_F16_RECIP_RNE_V1` (`grouped_absmax`);
+- preserves or encodes DFlash2 weights according to Section 3.1.
 
-Validation must reject an incomplete or alternate mixed-precision allocation. It must not fill a
-missing source matrix from the official BF16 checkpoint, silently requantize a preserved FP8 or
-NVFP4 field, or add unused source calibration fields as artifact objects.
+It takes every Text weight other than the embedding from the quantized source and never fills a
+missing source matrix from the official BF16 checkpoint. The recipe fixes the mixed-precision
+allocation: a different allocation is a different recipe, which the Volta binder refuses.
 
-The canonical NVFP4 conversion entry point is:
+The official recipe writes the NVFP4 artifact and its `.conversion.json` report:
 
 ```bash
-python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
-  --model /path/to/Qwen3.8-27B/base-hf-bf16 \
-  --quantized-model /path/to/Qwen3.8-27B/vllm-nvfp4-fp8 \
-  --dflash2-model /path/to/Qwen3.8-27B-DFlash2 \
-  --out out/qwen3_8_27b_nvfp4.ninfer \
-  --device cuda
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B \
+  --recipe qwen3_8_27b_nvfp4 \
+  --source quantized=/path/to/Qwen3.8-27B-NVFP4 \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --proposal \
+  --name qwen3.8-27b \
+  --out out/qwen3_8_27b_nvfp4.ninfer
 ```
 
 ## 13. `groupwise-int` peer artifact
@@ -870,12 +881,15 @@ filename   = qwen3_8_27b.ninfer
 model_id   = qwen3.8-27b
 weights_id = groupwise-int
 target_key = qwen3_8_27b
-recipe_id  = qwen3_8_27b-v2
+recipe     = qwen3_8_27b
 ```
 
-The current artifact contains the same 66-object DFlash2 suffix, 1118 base tensors, and six
-resources. Its base inventory, logical row views, aliases, and writer order are defined by
-`tools/convert/qwen3_8_27b/inventory.py`; DFlash2 follows Sections 2 through 12. Its complete format
+The artifact contains the same 66-object DFlash2 suffix, 1118 base tensors, and six resources. The
+version-2 converter's inventory defined its base inventory, logical row views, aliases, and writer
+order; the official recipe `qwen3_8_27b` now produces it, and DFlash2 follows Sections 2 through 12.
+On this port the result binds only once the identity fix in
+[#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17) lands: until then `Reader::identity`
+derives `27b` from the recipe name, and `resolve_weights` rejects the artifact. Its complete format
 counts are:
 
 | Format | Tensors |
@@ -896,20 +910,22 @@ integer tensors using `row-split-k128-v1`.
 layers use the registered Q4/Q5 allocation; the optimized draft head uses Q4; MTP matrices and
 the Vision merger use W8; and the Vision patch projection uses Q6. All groupwise integer tensors
 use `MAXABS_F16_RECIP_RNE_V1` with `row-split-k128-v1`. Base tensors come solely from the official
-source revision in Section 10.1; DFlash2 tensors come from the fixed companion source. The artifact
-binds through the `Qwen38GroupwiseInt` profile, and its registered NVFP4 peer binds through
-`Qwen38Nvfp4`.
+source revision in Section 10.1; DFlash2 tensors come from the fixed companion source. Once its
+identity resolves, the artifact binds through the `Qwen38GroupwiseInt` profile; its registered
+NVFP4 peer binds through `Qwen38Nvfp4`.
 
-Its canonical conversion entry point remains:
+The official recipe writes it:
 
 ```bash
-python3 -m tools.convert.qwen3_8_27b.convert \
+python3 -m tools.convert \
   --model /path/to/Qwen3.8-27B \
-  --dflash2-model /path/to/Qwen3.8-27B-DFlash2 \
-  --out out/qwen3_8_27b.ninfer \
-  --device cuda
+  --recipe qwen3_8_27b \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --proposal \
+  --name qwen3.8-27b \
+  --out out/qwen3_8_27b.ninfer
 ```
 
-The converter validates the official and DFlash2 checkpoints, frontend resources, complete object
-plan, and numeric recipes before opening the output, then writes the sibling
-`qwen3_8_27b.ninfer.conversion.json` report.
+Conversion rejects missing logical coverage, invalid source geometry, unsupported encodings, and
+invalid method output, and writes the sibling `qwen3_8_27b.ninfer.conversion.json` report.

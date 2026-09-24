@@ -9,6 +9,16 @@ defines the separately generated NVFP4 artifact. Common framing is defined in
 [`storage-layouts.md`](storage-layouts.md), and model mathematics in
 [`qwen3.6-27b-model.md`](qwen3.6-27b-model.md).
 
+The v3 conversion pipeline writes both artifacts with the official recipes `qwen3_6_27b` and
+`qwen3_6_27b_nvfp4`; see the [weight conversion guide](../weight-conversion.md). The object names,
+counts, and identities below describe the version-2 layout, which the Volta binder still
+addresses: its v2-to-v3 shim (`src/artifact/typed_binding.cpp`) resolves each name to the v3
+object that its logical bindings cover, and derives the identity from the v3 metadata name and
+recipe. The source transforms and payload encodings below remain the contract of both artifacts.
+Today only the NVFP4 artifact of Section 13 loads on this port: `Reader::identity` derives `27b`
+from the `qwen3_6_27b` recipe name, and the Engine rejects the groupwise-int artifact until the
+identity fix in [#17](https://github.com/Flo5k5/ninfer-v100-sm70/pull/17) lands.
+
 ## 1. Artifact identity and contents
 
 The registered hierarchical artifact identities are:
@@ -539,16 +549,15 @@ For source prefix `model.visual.merger.`:
 The NVFP4 artifact has this fixed identity:
 
 ```text
-converter  = tools.convert.qwen3_6_27b.convert_nvfp4
-recipe_id  = qwen3_6_27b_nvfp4-v1
+recipe     = qwen3_6_27b_nvfp4
 filename   = qwen3_6_27b_nvfp4.ninfer
 model_id   = qwen3.6-27b
 weights_id = nvfp4
 objects    = 1307
 ```
 
-It is a separate weight contract under the same model as `qwen3_6_27b.ninfer`. Python produces and
-verifies it. The Python and C++ generic artifact registries recognize `NVFP4` and
+It is a separate weight contract under the same model as `qwen3_6_27b.ninfer`, produced by its
+official recipe. The Python and C++ generic artifact registries recognize `NVFP4` and
 `blockscale-k16-m128x4-v1`, and the C++ reader validates their descriptor geometry and payload
 range. The 27B package resolves the complete identity to a closed target-private weights profile,
 then its exact NVFP4 binder consumes all 1307 objects. CLI, serving, benchmark, Text, Vision, MTP,
@@ -571,10 +580,11 @@ The NVFP4 source is
 NVFP4/BF16 selection, packed E2M1 words, E4M3FN block-scale words, weight divisors, and input
 divisors. Its MTP, Vision, embedding, and head payloads are ignored.
 
-The converter exact-compares all 117 selected BF16 source linears against the base source before
-creating the output file. It requires bit-identical weight divisors within all 122 multi-source
-parent groups and bit-identical input divisors among every set of source linears mapped to one of
-the 247 sites. It copies NVFP4 words without decoding and requantizing them.
+The official recipe reads the linears it selects as BF16 from the base source. It imports the NVFP4
+words, block scales, and weight divisors without decoding and requantizing them (`import_encoded`),
+and refuses a parent whose source linears carry different weight divisors. Each linear's input
+divisor becomes the `activation_input_divisor` auxiliary of its Use; the Volta binder requires
+every Use of one fused parent to carry the same divisor.
 
 ### 13.3 Text allocation and complete counts
 
@@ -734,28 +744,22 @@ no device allocation.
 
 ### 13.5 Production and verification
 
-The canonical command is:
+The official recipe writes the artifact and its `.conversion.json` report:
 
 ```bash
-python3 -m tools.convert.qwen3_6_27b.convert_nvfp4 \
-  --model /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16 \
-  --nvfp4-model /home/neroued/models/llm/qwen/Qwen3.6-27B/vllm-nvfp4-bf16 \
+python3 -m tools.convert \
+  --model /path/to/Qwen3.6-27B \
+  --recipe qwen3_6_27b_nvfp4 \
+  --source quantized=/path/to/Qwen3.6-27B-NVFP4 \
+  --components text,vision,mtp \
+  --proposal \
+  --name qwen3.6-27b \
   --out out/qwen3_6_27b_nvfp4.ninfer
 ```
 
-The converter refuses any other output basename before source I/O or file creation. The generated
-artifact and report are:
-
-```text
-out/qwen3_6_27b_nvfp4.ninfer
-out/qwen3_6_27b_nvfp4.ninfer.conversion.json
-```
-
-The generated file is 18,324,064,000 bytes, with an 18,323,855,104-byte payload region. Reopening it
-with `verify_nvfp4.py` validates the complete ordered directory, representative rows and groups
-from both W8 endpoints against their base BF16 sources, all 247 packed-code/scale/divisor payloads
-against 379 source linears, all 247 input-divisor words, all 105 fused/base BF16 Text matrix
-objects representing the 117 selected BF16 source linears, and all six resources.
+Conversion rejects missing logical coverage, invalid source geometry, unsupported encodings, and
+invalid method output before or while writing; the
+[weight conversion guide](../weight-conversion.md) describes the pipeline.
 
 Native qualification additionally validates both real 27B artifacts through their exact C++
 load plans. The NVFP4 plan consumes 1307 objects, retains six frontend resources, places 1054

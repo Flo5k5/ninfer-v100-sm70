@@ -531,7 +531,8 @@ checkpoint catalog。
 | media URL/path/data acquisition | `src/product/media_acquire/`, CLI and serving |
 | media decode from already-owned bytes | `src/media/decode/` |
 | HTTP Gateway | `src/serve/` |
-| target-private inventories, source recipes, conversion, payload verification | `tools/convert/<target>/` |
+| source adapters, recipes, and conversion methods | `tools/convert/` |
+| Python artifact reading, encoded output, and writer | `tools/artifact/` |
 
 这些路径用于定位当前 authority，不把文件拆分固化为外部接口。
 
