@@ -99,7 +99,7 @@ std::string usage_text(const char* argv0) {
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--text-residual fp32 keeps the residual stream in FP32 (Volta, qwen3.8-27b/nvfp4,\n"
-           "nvfp4-full-a or nvfp4-full-b, no DFlash).\n"
+           "nvfp4-full-a, nvfp4-full-b or nvfp4-full-c, no DFlash).\n"
            "--prefill-attention selects the Volta wide prefill attention kernel "
            "(default auto).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "

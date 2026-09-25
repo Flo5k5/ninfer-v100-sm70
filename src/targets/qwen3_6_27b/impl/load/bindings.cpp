@@ -46,6 +46,7 @@ NumericFormat token_embedding_format(WeightsProfile weights_profile) {
     case WeightsProfile::Qwen38Nvfp4:
     case WeightsProfile::Qwen38Nvfp4FullA:
     case WeightsProfile::Qwen38Nvfp4FullB:
+    case WeightsProfile::Qwen38Nvfp4FullC:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
     }
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
@@ -55,31 +56,50 @@ NumericFormat token_embedding_format(WeightsProfile weights_profile) {
 // the embedding gather reads rows directly and has no NVFP4 route.
 NumericFormat output_head_format(WeightsProfile weights_profile) {
     if (weights_profile == WeightsProfile::Qwen38Nvfp4FullA ||
-        weights_profile == WeightsProfile::Qwen38Nvfp4FullB) {
+        weights_profile == WeightsProfile::Qwen38Nvfp4FullB ||
+        weights_profile == WeightsProfile::Qwen38Nvfp4FullC) {
         return NumericFormat::NVFP4;
     }
     return token_embedding_format(weights_profile);
 }
 
 // Text-layer roles whose format differs between the Qwen3.8 NVFP4 profiles. The other roles are
-// the same in all of them: FP8 attention and GDN output projections, the BF16 GDN a_b projection
-// and BF16 norms.
+// the same in all of them: the BF16 GDN a_b projection and BF16 norms.
 struct Qwen38Nvfp4Formats {
     NumericFormat attention_input;   // query/key/gate/value [14336,5120], full-attention layers
+    NumericFormat attention_output;  // [5120,6144], full-attention layers
     NumericFormat gdn_input;         // query/key/value/z [16384,5120], GDN layers
+    NumericFormat gdn_output;        // [5120,6144], GDN layers
     std::size_t first_fp8_mlp_layer; // MLP layers below it are NVFP4 (kTextLayers: all of them)
 };
 
 Qwen38Nvfp4Formats qwen38_nvfp4_formats(WeightsProfile weights_profile) {
-    constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    constexpr NumericFormat kFp8   = NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    constexpr NumericFormat kNvfp4 = NumericFormat::NVFP4;
     switch (weights_profile) {
     case WeightsProfile::Qwen38Nvfp4:
-        return {.attention_input = kFp8, .gdn_input = kFp8, .first_fp8_mlp_layer = 56};
+        return {.attention_input     = kFp8,
+                .attention_output    = kFp8,
+                .gdn_input           = kFp8,
+                .gdn_output          = kFp8,
+                .first_fp8_mlp_layer = 56};
     case WeightsProfile::Qwen38Nvfp4FullA:
-        return {.attention_input = kFp8, .gdn_input = kFp8, .first_fp8_mlp_layer = kTextLayers};
+        return {.attention_input     = kFp8,
+                .attention_output    = kFp8,
+                .gdn_input           = kFp8,
+                .gdn_output          = kFp8,
+                .first_fp8_mlp_layer = kTextLayers};
     case WeightsProfile::Qwen38Nvfp4FullB:
-        return {.attention_input     = NumericFormat::NVFP4,
-                .gdn_input           = NumericFormat::NVFP4,
+        return {.attention_input     = kNvfp4,
+                .attention_output    = kFp8,
+                .gdn_input           = kNvfp4,
+                .gdn_output          = kFp8,
+                .first_fp8_mlp_layer = kTextLayers};
+    case WeightsProfile::Qwen38Nvfp4FullC:
+        return {.attention_input     = kNvfp4,
+                .attention_output    = kNvfp4,
+                .gdn_input           = kNvfp4,
+                .gdn_output          = kNvfp4,
                 .first_fp8_mlp_layer = kTextLayers};
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -233,6 +253,20 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                                       /*swiglu_interleave=*/true);
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
     }
+#endif
+    return out;
+}
+
+// An attention or GDN output projection [5120,6144]. It updates the residual stream through
+// linear_add, like the MLP down projection, and an NVFP4 one is prepacked for QPN the same way:
+// every Volta route of the NVFP4 linear_add reads that layout (QPN2 up to 32 columns, the CUTLASS
+// GEMM from 33, for a BF16 or an FP32 residual), and the prepacked QPN2 kernel batches its group
+// loads. FP8 outputs are prepacked by materialized_weight.
+Weight load_mixer_output(const artifact::MaterializedArtifact& materialized,
+                         const WeightPlan& plan) {
+    Weight out = materialized_weight(materialized, plan, 5120, 6144);
+#ifdef NINFER_VOLTA_BUILD
+    if (out.qtype == QType::NVFP4) { ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out); }
 #endif
     return out;
 }
@@ -431,7 +465,8 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out,
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
             target.attention.output =
-                bind_weight(binder, prefix + "attention/output", kFp8, {5120, 6144});
+                bind_projection(binder, prefix + "attention/output", formats.attention_output, 5120,
+                                6144, prefix + "attention/output_projection/input_scale_divisor");
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {48});
@@ -448,9 +483,11 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out,
                     binder, prefix + "gdn/query_key_value_z", formats.gdn_input, 16384, 5120,
                     prefix + "gdn/input_projection/input_scale_divisor"),
             };
-            target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
-                                                             NumericFormat::BF16, {128});
-            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {5120, 6144});
+            target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
+                                                           NumericFormat::BF16, {128});
+            target.gdn.output =
+                bind_projection(binder, prefix + "gdn/output", formats.gdn_output, 5120, 6144,
+                                prefix + "gdn/output_projection/input_scale_divisor");
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
@@ -572,6 +609,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     case WeightsProfile::Qwen38Nvfp4:
     case WeightsProfile::Qwen38Nvfp4FullA:
     case WeightsProfile::Qwen38Nvfp4FullB:
+    case WeightsProfile::Qwen38Nvfp4FullC:
         bind_qwen38_nvfp4_text_layers(binder, out, qwen38_nvfp4_formats(weights_profile));
         break;
     default:
@@ -676,7 +714,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                               NumericFormat::BF16, {256});
             target.key_norm   = artifact::materialized_tensor(backing, source.attention.key_norm,
                                                               NumericFormat::BF16, {256});
-            target.output     = materialized_weight(backing, source.attention.output, 5120, 6144);
+            target.output     = load_mixer_output(backing, source.attention.output);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120});
             target.post_mixer = load_mlp(source.mlp, backing);
@@ -694,7 +732,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.projection.input_projection   = load_gdn_input_projection(source.gdn, backing);
             target.norm =
                 artifact::materialized_tensor(backing, source.gdn.norm, NumericFormat::BF16, {128});
-            target.output = materialized_weight(backing, source.gdn.output, 5120, 6144);
+            target.output              = load_mixer_output(backing, source.gdn.output);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120});
             target.post_mixer = load_mlp(source.mlp, backing);

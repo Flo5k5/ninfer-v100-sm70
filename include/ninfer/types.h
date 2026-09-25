@@ -37,8 +37,8 @@ enum class KvCacheStorage : std::uint8_t {
 
 // Storage of the text residual stream that every decoder layer updates twice. Float32 keeps the
 // stream out of BF16 between updates; it is available on Volta builds for qwen3.8-27b/nvfp4,
-// nvfp4-full-a and nvfp4-full-b without DFlash, and the Engine rejects it anywhere else at
-// construction.
+// nvfp4-full-a, nvfp4-full-b and nvfp4-full-c without DFlash, and the Engine rejects it anywhere
+// else at construction.
 enum class TextResidualStorage : std::uint8_t {
     BFloat16,
     Float32,
