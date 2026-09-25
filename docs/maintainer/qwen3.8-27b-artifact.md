@@ -1054,6 +1054,19 @@ reads it as `attention/output_projection/input_scale_divisor` or
 the other NVFP4 roles, sm_70 runs these matrices with 16-bit activations and never scales by the
 input divisor.
 
+The activation input divisors of a full-c artifact do not come from one calibration:
+
+- the attention and GDN input and output divisors come from the checkpoint that supplies those
+  matrices;
+- the MLP divisors are those of the base artifact, layers `56..63` repeating the nearest NVFP4
+  layer below as in full-a (Section 14); they are not the input scales of the checkpoint that
+  supplies the MLP matrices;
+- the output head divisor is 1.0.
+
+Only a route with 16-bit activations may ignore that mix, which is why the profile stays sm_70-only.
+A W4A4 route would scale activations by these divisors, so it needs the MLP input scales of the
+matrices' own checkpoint imported first.
+
 The artifact binds through `Qwen38Nvfp4FullC`, on sm_70 builds only (its output head is the NVFP4
 head of full-a). The outputs update the residual stream through `linear_add`, like the MLP down
 projections, and are prepacked for QPN at load the same way: the QPN2 residual epilogue serves up
