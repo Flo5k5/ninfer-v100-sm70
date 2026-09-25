@@ -59,6 +59,7 @@ from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.common import nvfp4_quantize
+from tools.convert.official_recipes import QWEN3_8_27B_NVFP4_FULL_A
 from tools.convert.qwen3_8_27b.graft_single_source import SourceCheckpoint
 
 
@@ -86,7 +87,7 @@ class Stage:
 
 
 STAGES = {
-    "a": Stage("a", "qwen3_8_27b_nvfp4-full-a", tuple(range(56, 64)), True),
+    "a": Stage("a", QWEN3_8_27B_NVFP4_FULL_A, tuple(range(56, 64)), True),
 }
 
 

@@ -342,7 +342,8 @@ def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path, monkeypatch,
     report = _report(tmp_path)
     assert report["verified"] is True
     assert report["recipe"] == "qwen3_8_27b_nvfp4"
-    assert report["reencode"]["layers"] == list(LAYERS)
+    assert report["reencode"]["mlp_layers"] == list(LAYERS)
+    assert report["reencode"]["output_head"] is False
     assert report["inexact_divisors"] == (1 if layout == "modelopt" else 0)
     entries = {item["object"]: item for item in report["objects"]}
     donor_sha256, weights_sha256 = _stored_sha256(fixture.donor_dir), _stored_sha256(
@@ -388,6 +389,9 @@ def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path, monkeypatch,
             assert entry["divisor_exact"] is (
                 layout != "modelopt" or _scale_2_word(layer, names[0]) not in INEXACT_SCALES_2)
             assert entry["relative_rms_error_vs_base"] < 0.3
+            by_parameter = entry["relative_rms_error_vs_base_by_parameter"]
+            assert list(by_parameter) == entry["parameters"]
+            assert max(by_parameter.values()) < 0.3
             assert entry["relative_rms_error_vs_weights"] < 0.2
             tensors = [source + name + suffix for name in names for suffix in DONOR_SUFFIXES[layout]]
             assert entry["donor_sha256"] == {name: donor_sha256[name] for name in tensors}
@@ -563,7 +567,8 @@ LAYER1 = "model.language_model.layers.1.mlp."
          "layers.1.mlp.down_proj: no NVFP4 words in the donor checkpoint"),
         ({}, _edit_donor(LAYER1 + "down_proj.weight", lambda t: t[:64].contiguous()), (),
          r"codes \(64, 64\) and scales \(128, 8\) are not an NVFP4 matrix of 128 columns"),
-        ({}, _both_rows(64), (), "weight/000001: donor matrices have 64 rows, object has 128"),
+        ({}, _both_rows(64), (),
+         "weight/000001: donor matrices have 64 rows for text/layers/0/mlp/down, object has 128"),
         ({}, _edit_donor(LAYER1 + "down_proj.weight_scale", lambda t: t.view(torch.uint8)), (),
          "weight_scale must be F8_E4M3 block scales, not U8"),
         ({"up_scale_2": 0x39800000}, None, (), "weight/000000: fused donor matrices have different"),
@@ -651,7 +656,10 @@ def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None
     assert reencode_nvfp4.main(_arguments(fixture, out_path, "--round", "down",
                                           weights=True)) == 0
     expected = {item["object"]: item["payload_sha256"] for item in _report(tmp_path)["objects"]}
-    assert reencode_nvfp4.verify_output(fixture.base, out_path, expected) == 0
+    with Artifact(fixture.base) as base:
+        keywords = {"converted": {}, "uses": list(base.directory.uses),
+                    "recipe": "qwen3_8_27b_nvfp4"}
+    assert reencode_nvfp4.verify_output(fixture.base, out_path, expected, **keywords) == 0
     for object_id in ("weight/head", "weight/000001"):
         with Artifact(out_path) as out:
             offset = out.payload_offset + out.object(object_id).offset + 5
@@ -660,7 +668,7 @@ def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None
             byte = handle.read(1)[0]
             handle.seek(offset)
             handle.write(bytes([byte ^ 0x10]))
-        assert reencode_nvfp4.verify_output(fixture.base, out_path, expected) == 1
+        assert reencode_nvfp4.verify_output(fixture.base, out_path, expected, **keywords) == 1
         with out_path.open("r+b") as handle:
             handle.seek(offset)
             handle.write(bytes([byte]))
@@ -723,6 +731,16 @@ def test_converts_an_fp8_layer_to_calibrated_nvfp4(tmp_path) -> None:
         assert down_use["activation_policy"] == "AllowA4"
         aux_id = down_use["auxiliaries"]["activation_input_divisor"]["object"]
         assert out.object(aux_id).format == "fp32"
+        # This fixture's FP8 down Use already names a divisor: it keeps it, and no auxiliary
+        # object nothing references is written for it (orphan auxiliary regression).
+        with Artifact(fixture.base) as base:
+            assert down_use["auxiliaries"] == next(
+                use for use in base.directory.uses
+                if use["parameter"] == "text/layers/1/mlp/down")["auxiliaries"]
+            new = {obj.id for obj in out.objects} - {obj.id for obj in base.objects}
+        referenced = {aux["object"] for use in out.directory.uses
+                      for aux in use.get("auxiliaries", {}).values()}
+        assert new and new <= referenced
         # The output head converts too (stage A): NVFP4 object, AllowA4, one shared divisor.
         head = out.object("weight/head")
         assert head.format == "nvfp4" and head.layout == NVFP4_LAYOUT

@@ -78,3 +78,24 @@ def test_relative_error() -> None:
     assert zero.value() == 0.0
     zero.add(torch.ones(1, 2), torch.zeros(1, 2))
     assert zero.value() == math.inf
+
+
+def test_merged_error_is_the_error_of_the_parts_together() -> None:
+    """Sums of squares add up: a part with a large norm weighs more than one with a small norm,
+    unlike a mean of the parts' ratios."""
+
+    generator = torch.Generator().manual_seed(3)
+    references = [torch.randn(64, 32, generator=generator),
+                  0.1 * torch.randn(16, 32, generator=generator)]
+    values = [references[0] + 0.01 * torch.randn(64, 32, generator=generator),
+              references[1].flip(0)]
+    parts, whole = [], RelativeError()
+    for value, reference in zip(values, references):
+        part = RelativeError()
+        part.add(value, reference)
+        parts.append(part)
+    whole.add(torch.cat(values), torch.cat(references))
+    merged = RelativeError.merged(parts).value()
+    assert merged == pytest.approx(whole.value(), rel=1e-12)
+    mean = (parts[0].value() + parts[1].value()) / 2
+    assert abs(merged - mean) > 0.5
