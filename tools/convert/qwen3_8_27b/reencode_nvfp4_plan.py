@@ -36,6 +36,11 @@ class ReencodeError(ValueError):
     pass
 
 
+FP8_ROW_FORMAT = "fp8_e4m3fn_row_bf16"
+# Layout of the NVFP4 text-MLP objects; the FP8 rows of an original artifact carry row_scale_v1.
+NVFP4_LAYOUT = "block_scale_k16_m128x4_v1"
+
+
 @dataclass(frozen=True, slots=True)
 class DonorMatrix:
     """One donor matrix checked from its safetensors header, and the divisor of its tensor scale."""
@@ -58,6 +63,13 @@ class Target:
     parameters: tuple[str, ...]
     donors: tuple[DonorMatrix, ...]
     rounded: bool
+    # Format of the base object this target replaces: NVFP4 for a re-encode of words already in
+    # NVFP4, the FP8 row format for a layer the original artifact keeps in FP8 (converted here).
+    base_format: str = NVFP4_FORMAT
+
+    @property
+    def converts(self) -> bool:
+        return self.base_format != NVFP4_FORMAT
 
     @property
     def divisor(self) -> torch.Tensor:
@@ -110,10 +122,14 @@ def _object_of(directory, logical: str) -> tuple[str, int, int]:
     return part["object"], int(part["range"][0]), int(part["range"][1])
 
 
-def _nvfp4_object(base: Artifact, object_id: str, logical: str) -> TensorObject:
+def _mlp_object(base: Artifact, object_id: str, logical: str) -> TensorObject:
+    """One text-MLP matrix of the base: NVFP4, or FP8 row-scaled for the layers the original
+    artifact keeps in FP8 (re-encoded here into NVFP4 with the donor's calibrated words)."""
     obj = base.object(object_id)
-    if not isinstance(obj, TensorObject) or len(obj.shape) != 2 or obj.format != NVFP4_FORMAT:
-        raise ReencodeError(f"{logical}: object {object_id} is not an NVFP4 matrix in the base")
+    if not isinstance(obj, TensorObject) or len(obj.shape) != 2 or \
+            obj.format not in (NVFP4_FORMAT, FP8_ROW_FORMAT):
+        raise ReencodeError(f"{logical}: object {object_id} is neither an NVFP4 nor an FP8 "
+                            "row-scaled matrix in the base")
     return obj
 
 
@@ -145,7 +161,7 @@ def _target(obj: TensorObject, layer: int, parameters: list[str], modules: list[
         if weights.meta[name][1] != (item.rows, shape[1]):
             raise ReencodeError(f"{name}: --weights shape {weights.meta[name][1]} differs from "
                                 f"the donor matrix {(item.rows, shape[1])}")
-    return Target(obj.id, shape, layer, tuple(parameters), donors, rounded)
+    return Target(obj.id, shape, layer, tuple(parameters), donors, rounded, obj.format)
 
 
 def plan_targets(base: Artifact, layers: Iterable[int], rounded: set[str],
@@ -161,14 +177,14 @@ def plan_targets(base: Artifact, layers: Iterable[int], rounded: set[str],
         module = f"model.language_model.layers.{layer}.mlp."
         gate_id, gate_begin, gate_end = _object_of(directory, prefix + "gate")
         up_id, up_begin, up_end = _object_of(directory, prefix + "up")
-        gate_up = _nvfp4_object(base, gate_id, prefix + "gate")
+        gate_up = _mlp_object(base, gate_id, prefix + "gate")
         elements = gate_up.shape[0] * gate_up.shape[1]
         if up_id != gate_id or gate_begin != 0 or up_begin != gate_end or up_end != elements:
             raise ReencodeError(f"{prefix}gate_up: gate and up are not one fused object")
         targets.append(_target(gate_up, layer, [prefix + "gate", prefix + "up"],
                                [module + "gate_proj", module + "up_proj"], "gate" in rounded,
                                donor, weights))
-        down = _nvfp4_object(base, _object_of(directory, prefix + "down")[0], prefix + "down")
+        down = _mlp_object(base, _object_of(directory, prefix + "down")[0], prefix + "down")
         targets.append(_target(down, layer, [prefix + "down"], [module + "down_proj"],
                                "down" in rounded, donor, weights))
     if not targets:
