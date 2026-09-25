@@ -444,8 +444,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="text MLP layers, e.g. 0-55 (default: every NVFP4 MLP layer); a "
                              "conversion needs every FP8 MLP layer")
     parser.add_argument("--max-error", type=_max_error, default=DEFAULT_MAX_ERROR,
-                        help="largest relative RMS error of a re-encoded object against the "
-                             "base's decoded values and against --weights (default 0.3)")
+                        help="largest relative RMS error of each parameter against the base's "
+                             "decoded values, and of each object against --weights (default 0.3)")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--verify", action="store_true",
                         help="re-read the output and compare it with the encoded words and the "
