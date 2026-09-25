@@ -21,9 +21,11 @@ from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.quantization.fp8_row import quantize_bf16_rows
-from tools.convert.qwen3_8_27b import reencode_nvfp4
+from tools.convert.qwen3_8_27b import reencode_nvfp4, reencode_nvfp4_encode
+from tools.convert.qwen3_8_27b.reencode_nvfp4_plan import ReencodeError
 
 from .test_reencode_nvfp4 import (
+    DONOR_LABEL,
     HIDDEN,
     NVFP4_LAYOUT,
     Fixture,
@@ -111,14 +113,16 @@ def specs_of(artifact: Artifact, shapes: dict[str, tuple[int, ...]] | None = Non
 
 
 def _build_inputs(tmp_path, *, roles=None, misplaced: str | None = None,
-                  order: tuple[str, ...] | None = None, short: str | None = None) -> InputFixture:
-    """The MLP fixture (layer 1's down in FP8) plus FP8 input projections placed first, as in
-    the real artifact, their Uses first too, and the compressed-tensors input donor.
+                  order: tuple[str, ...] | None = None, short: str | None = None,
+                  layout: str = "modelopt") -> InputFixture:
+    """The MLP fixture (layer 1's down in FP8, MLP donor words in ``layout``) plus FP8 input
+    projections placed first, as in the real artifact, their Uses first too, and the
+    compressed-tensors input donor.
 
     ``order`` stores and binds the attention leaves in another row order; ``short`` (a leaf such
     as ``gdn/z``) leaves its binding's last row unbound."""
 
-    fixture = _build(tmp_path, layer1_down_format="fp8")
+    fixture = _build(tmp_path, layout=layout, layer1_down_format="fp8")
     generator = torch.Generator().manual_seed(11)
     with Artifact(fixture.base) as base:
         directory = base.directory
@@ -202,7 +206,7 @@ def _divisor_uses(out: Artifact) -> dict[str, tuple[str, str, int]]:
 def test_full_b_converts_the_input_projections_with_the_input_donor_words(tmp_path,
                                                                            monkeypatch) -> None:
     # Row chunks that divide neither a head's 256 rows nor a leaf: chunks cross both boundaries.
-    monkeypatch.setattr(reencode_nvfp4, "ROW_CHUNK", 100)
+    monkeypatch.setattr(reencode_nvfp4_encode, "ROW_CHUNK", 100)
     fixture = _build_inputs(tmp_path)
     out_path = tmp_path / "out.ninfer"
     assert reencode_nvfp4.main(full_b(fixture, out_path, "--verify")) == 0
@@ -212,8 +216,10 @@ def test_full_b_converts_the_input_projections_with_the_input_donor_words(tmp_pa
         record = out.directory.provenance["reencode"]
         assert out.directory.provenance["recipe"] == FULL_B
         assert record["base_recipe"] == "qwen3_8_27b_nvfp4"
-        assert record["input_donor"] == {"label": INPUT_LABEL, "layers": [0, 1]}
-        assert record["mlp_layers"] == [0, 1] and record["output_head"] is True
+        assert record["donors"] == {
+            "mlp": {"label": DONOR_LABEL, "layers": [0, 1]}, "head": {"label": DONOR_LABEL},
+            "attention_input": {"label": INPUT_LABEL, "layers": [1]},
+            "gdn_input": {"label": INPUT_LABEL, "layers": [0]}}
         divisors = _divisor_uses(out)
         for object_id in OBJECTS.values():
             assert (out.object(object_id).format, out.object(object_id).layout) == (
@@ -237,7 +243,8 @@ def test_full_b_converts_the_input_projections_with_the_input_donor_words(tmp_pa
             ("AllowA4", _word(input_scale))}
         assert len({aux for _, aux, _ in leaf_divisors}) == len(parameters)
         assert {labels[aux] for _, aux, _ in leaf_divisors} == {
-            f"{parameter}: input_global_scale of the input donor" for parameter in parameters}
+            f"{parameter}: input_global_scale of the {kind}_input donor"
+            for parameter in parameters}
         entry = entries[object_id]
         assert entry["role"] == f"{kind}/input" and entry["codes"] == "donor"
         assert list(entry["relative_rms_error_vs_base_by_parameter"]) == parameters
@@ -271,7 +278,7 @@ def test_full_b_is_full_a_plus_the_input_projections(tmp_path) -> None:
     inputs = set(OBJECTS.values())
     with Artifact(full_a_path) as full_a, Artifact(full_b_path) as full_b_out:
         assert full_a.directory.provenance["recipe"] == FULL_A
-        assert "input_donor" not in full_a.directory.provenance["reencode"]
+        assert list(full_a.directory.provenance["reencode"]["donors"]) == ["mlp", "head"]
         a_ids, b_ids = [obj.id for obj in full_a.objects], [obj.id for obj in full_b_out.objects]
         assert b_ids[:len(a_ids)] == a_ids
         for object_id in a_ids:
@@ -301,7 +308,7 @@ def test_rows_in_a_wrong_order_are_refused_against_the_base(tmp_path, misplaced,
     fixture = _build_inputs(tmp_path, misplaced=misplaced)
     kind, leaves = MISPLACED[misplaced]
     layer = next(layer for layer, role in ROLES.items() if role == kind)
-    with pytest.raises(reencode_nvfp4.ReencodeError,
+    with pytest.raises(ReencodeError,
                        match=rf"{OBJECTS[kind]}: relative RMS error 1\.\d+ against the base "
                              rf"object's values of text/layers/{layer}/{kind}/({leaves}) exceeds "
                              "--max-error 0.3"):
@@ -325,7 +332,7 @@ def test_a_small_misplaced_parameter_is_not_diluted_in_its_object(tmp_path) -> N
 
 def test_provenance_records_each_role_s_layers(tmp_path) -> None:
     """--layers 1: layer 0's MLP is NVFP4 and keeps its words, the input projections of both
-    layers convert, and the record keeps the two lists apart."""
+    layers convert, and the record keeps each role's layers apart."""
 
     fixture = _build_inputs(tmp_path)
     arguments = full_b(fixture, tmp_path / "out.ninfer")
@@ -334,8 +341,10 @@ def test_provenance_records_each_role_s_layers(tmp_path) -> None:
     with Artifact(tmp_path / "out.ninfer") as out:
         record = out.directory.provenance["reencode"]
         assert out.directory.provenance["recipe"] == FULL_B
-    assert record["mlp_layers"] == [1] and record["output_head"] is True
-    assert record["input_donor"] == {"label": INPUT_LABEL, "layers": [0, 1]}
+    assert record["donors"] == {
+        "mlp": {"label": DONOR_LABEL, "layers": [1]}, "head": {"label": DONOR_LABEL},
+        "attention_input": {"label": INPUT_LABEL, "layers": [1]},
+        "gdn_input": {"label": INPUT_LABEL, "layers": [0]}}
 
 
 def _edit_input_donor(name: str, value):
@@ -416,7 +425,7 @@ def test_input_projection_refusals_before_writing(tmp_path, monkeypatch, build, 
     arguments = full_b(fixture, tmp_path / "out.ninfer")
     if extra:
         arguments[arguments.index("--layers") + 1] = extra[1]
-    with pytest.raises(reencode_nvfp4.ReencodeError, match=match):
+    with pytest.raises(ReencodeError, match=match):
         reencode_nvfp4.main(arguments)
 
 

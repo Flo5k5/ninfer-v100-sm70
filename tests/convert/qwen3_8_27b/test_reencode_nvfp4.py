@@ -17,7 +17,8 @@ from tools.artifact.framing import HEADER
 from tools.artifact.reader import Artifact, TensorObject
 from tools.artifact.schema import ResourceSpec, TensorSpec
 from tools.artifact.writer import ArtifactWriter
-from tools.convert.qwen3_8_27b import reencode_nvfp4
+from tools.convert.qwen3_8_27b import reencode_nvfp4, reencode_nvfp4_encode
+from tools.convert.qwen3_8_27b.reencode_nvfp4_plan import ReencodeError
 
 from ..path_fragments import assert_no_path_fragments
 
@@ -333,7 +334,7 @@ def _assert_nothing_written(tmp_path) -> None:
 @pytest.mark.parametrize("layout", ["modelopt", "compressed-tensors"])
 def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path, monkeypatch, layout) -> None:
     # Row chunks that divide neither part: offsets across chunk and gate/up boundaries are exercised.
-    monkeypatch.setattr(reencode_nvfp4, "ROW_CHUNK", 48)
+    monkeypatch.setattr(reencode_nvfp4_encode, "ROW_CHUNK", 48)
     fixture = _build(tmp_path, layout=layout)
     out_path = tmp_path / "out.ninfer"
     arguments = _arguments(fixture, out_path, "--round", "down", "--verify", weights=True)
@@ -342,8 +343,8 @@ def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path, monkeypatch,
     report = _report(tmp_path)
     assert report["verified"] is True
     assert report["recipe"] == "qwen3_8_27b_nvfp4"
-    assert report["reencode"]["mlp_layers"] == list(LAYERS)
-    assert report["reencode"]["output_head"] is False
+    # Nothing converts: the head is not re-encoded and its donor is not recorded.
+    assert report["reencode"]["donors"] == {"mlp": {"label": DONOR_LABEL, "layers": list(LAYERS)}}
     assert report["inexact_divisors"] == (1 if layout == "modelopt" else 0)
     entries = {item["object"]: item for item in report["objects"]}
     donor_sha256, weights_sha256 = _stored_sha256(fixture.donor_dir), _stored_sha256(
@@ -408,7 +409,7 @@ def test_output_metadata_names_inputs_without_paths(tmp_path) -> None:
         provenance = dict(out.directory.provenance)
     record = provenance.pop("reencode")
     assert provenance == INHERITED_PROVENANCE
-    assert record["donor"] == {"label": DONOR_LABEL}
+    assert record["donors"] == {"mlp": {"label": DONOR_LABEL, "layers": list(LAYERS)}}
     assert record["weights"] == {"label": WEIGHTS_LABEL}
     assert record["base"] == "base.ninfer"
     assert record["removed_base_paths"] == REMOVED_BASE_PATHS
@@ -453,7 +454,7 @@ def test_donor_of_other_weights_is_refused_without_weights(tmp_path) -> None:
     swap = {"layers.0.": "layers.1.", "layers.1.": "layers.0."}
     _save(fixture.donor_dir, {re.sub(r"layers\.[01]\.", lambda match: swap[match.group(0)], name):
                               tensor for name, tensor in fixture.donor.items()})
-    with pytest.raises(reencode_nvfp4.ReencodeError,
+    with pytest.raises(ReencodeError,
                        match=r"weight/000000: relative RMS error 1\.\d+ against the base"):
         reencode_nvfp4.main(_arguments(fixture, tmp_path / "out.ninfer", "--verify"))
     _assert_nothing_written(tmp_path)
@@ -522,7 +523,7 @@ def test_refusals_while_encoding_leave_no_output(tmp_path, build, mutate, extra,
     fixture = _build(tmp_path, **build)
     if mutate is not None:
         mutate(fixture)
-    with pytest.raises(reencode_nvfp4.ReencodeError, match=match):
+    with pytest.raises(ReencodeError, match=match):
         reencode_nvfp4.main(_arguments(fixture, tmp_path / "out.ninfer", *extra, weights=True))
     _assert_nothing_written(tmp_path)
 
@@ -602,7 +603,7 @@ def test_refusals_before_writing(tmp_path, monkeypatch, build, mutate, extra, ma
         mutate(fixture)
     weights = "--weights" in extra
     options = [item for item in extra if item != "--weights"]
-    with pytest.raises(reencode_nvfp4.ReencodeError, match=match):
+    with pytest.raises(ReencodeError, match=match):
         reencode_nvfp4.main(_arguments(fixture, tmp_path / "out.ninfer", *options,
                                        weights=weights))
 
@@ -646,7 +647,7 @@ def test_base_checks(tmp_path) -> None:
     # An earlier re-encode is not a valid base.
     first = tmp_path / "first.ninfer"
     assert reencode_nvfp4.main(_arguments(fixture, first)) == 0
-    with pytest.raises(reencode_nvfp4.ReencodeError, match="already re-encoded"):
+    with pytest.raises(ReencodeError, match="already re-encoded"):
         reencode_nvfp4.main(_arguments(replace(fixture, base=first), tmp_path / "second.ninfer"))
 
 
