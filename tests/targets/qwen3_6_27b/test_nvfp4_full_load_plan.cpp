@@ -44,6 +44,30 @@ using namespace ninfer::targets::qwen3_6_27b::detail;
 
 constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
 
+// A v3 leaf of a fused input parent and the parent rows it covers (docs/maintainer/
+// qwen3.8-27b-artifact.md, section 8.1); every parent row has 5120 columns.
+struct FusedLeaf {
+    std::string_view name;
+    std::uint64_t first_row;
+    std::uint64_t rows;
+};
+
+constexpr std::uint64_t kParentColumns = 5120;
+
+constexpr std::array<FusedLeaf, 4> kAttentionLeaves{{
+    {.name = "query", .first_row = 0, .rows = 6144},
+    {.name = "key", .first_row = 6144, .rows = 1024},
+    {.name = "gate", .first_row = 7168, .rows = 6144},
+    {.name = "value", .first_row = 13312, .rows = 1024},
+}};
+
+constexpr std::array<FusedLeaf, 4> kGdnLeaves{{
+    {.name = "query", .first_row = 0, .rows = 2048},
+    {.name = "key", .first_row = 2048, .rows = 2048},
+    {.name = "value", .first_row = 4096, .rows = 6144},
+    {.name = "z", .first_row = 10240, .rows = 6144},
+}};
+
 // Bindings that meet the FP32 residual criterion below must be accepted by Variant's per-profile
 // guard, which Engine startup checks. Checked at compile time, so a build that drops a profile from
 // the guard fails even where this test cannot run (no artifact).
@@ -138,16 +162,33 @@ int verify_fp32_residual_form(const BindingPlan& bindings) {
     return 0;
 }
 
-// The activation input divisor that every v3 leaf Use of an NVFP4 input parent carries: a scalar
-// FP32 object, finite and positive, bit-identical across the leaves, and the value the binder bound
-// for the parent.
-int verify_input_divisors(const ninfer::artifact::Reader& reader, const std::string& group,
-                          std::span<const std::string_view> leaves, const WeightPlan& parent) {
+// The v3 leaves of an NVFP4 input parent. Each binds one part of the bound parent object, the rows
+// of section 8.1: the binder only checks that the leaves follow each other and cover the object,
+// not where each one ends, so leaves with the wrong row counts would pass it. Every leaf Use
+// carries the activation input divisor: a scalar FP32 object, finite and positive, bit-identical
+// across the leaves, and the value the binder bound for the parent.
+int verify_input_leaves(const ninfer::artifact::Reader& reader, const std::string& group,
+                        std::span<const FusedLeaf> leaves, const WeightPlan& parent) {
     const ninfer::artifact::Directory& directory = reader.directory();
     std::optional<std::uint32_t> shared;
-    for (const std::string_view leaf : leaves) {
-        const std::string parameter = group + std::string(leaf);
-        std::size_t divisors        = 0;
+    for (const FusedLeaf& leaf : leaves) {
+        const std::string parameter = group + std::string(leaf.name);
+        const auto binding          = directory.bindings.find(parameter);
+        if (binding == directory.bindings.end() || binding->second.parts.size() != 1) {
+            std::cerr << parameter << ": not bound to one part of its parent\n";
+            return 1;
+        }
+        const ninfer::artifact::Part& part = binding->second.parts.front();
+        const std::uint64_t begin          = leaf.first_row * kParentColumns;
+        const std::uint64_t end            = (leaf.first_row + leaf.rows) * kParentColumns;
+        if (!(part.object == parent.object) || part.begin != begin || part.end != end) {
+            std::cerr << parameter << ": binds elements [" << part.begin << "," << part.end
+                      << ") instead of rows [" << leaf.first_row << ","
+                      << leaf.first_row + leaf.rows << ") x " << kParentColumns
+                      << " of the bound parent\n";
+            return 1;
+        }
+        std::size_t divisors = 0;
         for (auto use = directory.uses.lower_bound({parameter, std::string()});
              use != directory.uses.end() && use->first.first == parameter; ++use) {
             const auto aux = use->second.auxiliaries.find("activation_input_divisor");
@@ -190,12 +231,10 @@ int verify_input_divisors(const ninfer::artifact::Reader& reader, const std::str
     return 0;
 }
 
-// Formats per role: the input projections in the profile's format (with their divisors when
-// NVFP4), FP8 attention and GDN outputs, every MLP and the output head in NVFP4.
+// Formats per role: the input projections in the profile's format (with their leaf rows and
+// divisors when NVFP4), FP8 attention and GDN outputs, every MLP and the output head in NVFP4.
 int verify_formats(const ninfer::artifact::Reader& reader, const BindingPlan& bindings,
                    const DerivedProfile& tested) {
-    constexpr std::array<std::string_view, 4> kAttentionLeaves{"query", "key", "gate", "value"};
-    constexpr std::array<std::string_view, 4> kGdnLeaves{"query", "key", "value", "z"};
     if (!valid_nvfp4(bindings.output_head)) {
         std::cerr << "output head is not NVFP4 with valid divisors\n";
         return 1;
@@ -220,10 +259,10 @@ int verify_formats(const ninfer::artifact::Reader& reader, const BindingPlan& bi
             return 1;
         }
         if (tested.input_projection == NumericFormat::NVFP4) {
-            const int divisors =
-                full ? verify_input_divisors(reader, prefix + "attention/", kAttentionLeaves, input)
-                     : verify_input_divisors(reader, prefix + "gdn/", kGdnLeaves, input);
-            if (divisors != 0) { return divisors; }
+            const int leaves =
+                full ? verify_input_leaves(reader, prefix + "attention/", kAttentionLeaves, input)
+                     : verify_input_leaves(reader, prefix + "gdn/", kGdnLeaves, input);
+            if (leaves != 0) { return leaves; }
         }
         if (full) {
             ++attention_inputs;
@@ -276,7 +315,14 @@ int verify_profile(const DerivedProfile& tested, const std::filesystem::path& pa
 // The derived profile must need fewer device weight bytes than the artifact it derives from.
 int verify_smaller_than_parent(const DerivedProfile& tested, const std::filesystem::path& path) {
     const std::filesystem::path parent = environment_path(tested.parent_variable);
-    if (parent.empty() || !std::filesystem::is_regular_file(parent)) { return 0; }
+    if (parent.empty()) {
+        std::cout << "skip device bytes: " << tested.parent_variable << " not set\n";
+        return 0;
+    }
+    if (!std::filesystem::is_regular_file(parent)) {
+        std::cout << "skip device bytes: " << tested.parent_variable << " does not name a file\n";
+        return 0;
+    }
     // NINFER_QWEN3_8_27B_NVFP4_WEIGHTS also names the artifact of the real FP32 tests, which may be
     // a derived one.
     if (Package::resolve_weights(ninfer::artifact::Reader(parent).identity()) !=

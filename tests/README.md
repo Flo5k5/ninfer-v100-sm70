@@ -173,6 +173,44 @@ NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_structured_real_test --output-on-failure
 ```
 
+The derived Qwen3.8-27B NVFP4 profiles (`nvfp4-full-a`, `nvfp4-full-b`) have load-plan tests,
+registered on sm_70 builds only. They bind the artifact on the host without GPU work, although the
+binary needs the CUDA driver library to load. They check:
+
+- the identity and the format of every role;
+- for `nvfp4-full-b`, the rows and the activation input divisors of the NVFP4 attention and GDN
+  input leaves;
+- the FP32 residual criterion and the DFlash2 refusal.
+
+When the artifact a profile derives from is also set, they check that the profile needs fewer
+device weight bytes: the mixed `nvfp4` artifact (`NINFER_QWEN3_8_27B_NVFP4_WEIGHTS`) for full-a,
+full-a for full-b.
+
+```bash
+NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_full_a.ninfer \
+NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_8_27b_nvfp4_full_load_plan_test --output-on-failure
+
+NINFER_QWEN3_8_27B_NVFP4_FULL_B_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_full_b.ninfer \
+NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_full_a.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_8_27b_nvfp4_full_b_load_plan_test --output-on-failure
+```
+
+`NINFER_QWEN3_8_27B_NVFP4_WEIGHTS` has two meanings:
+
+- the artifact under test for the FP32 residual real tests (`nvfp4`, `nvfp4-full-a` or
+  `nvfp4-full-b`);
+- the mixed parent for the full-a load-plan test.
+
+So the FP32 real tests need one invocation per artifact, selected with `-R`. The full-a load-plan
+test skips its byte comparison when the variable names another profile.
+
+```bash
+NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4_full_b.ninfer \
+  ctest --test-dir build -R 'ninfer_qwen3_6_27b_(residual_real|score_real_fp32)_test' \
+  --output-on-failure
+```
+
 Run the peer 35B-A3B route independently:
 
 ```bash
