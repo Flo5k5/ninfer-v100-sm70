@@ -91,12 +91,14 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool prepack) {
 #ifdef NINFER_VOLTA_BUILD
-    // 5 is the K=4 verify width; 9..32 cover the two- and four-tile QPN2 buckets.
+    // 5 is the K=4 verify width; 9..32 cover the two- and four-tile QPN2 buckets; 33 and 128 the
+    // prefill route (CUTLASS GEMM, then the residual add), 128 also under graph capture.
     const std::array invocations{
-        Invocation{1, ops::LinearPolicy::A16Only},  Invocation{4, ops::LinearPolicy::A16Only},
-        Invocation{5, ops::LinearPolicy::A16Only},  Invocation{8, ops::LinearPolicy::A16Only},
-        Invocation{9, ops::LinearPolicy::A16Only},  Invocation{16, ops::LinearPolicy::A16Only},
-        Invocation{32, ops::LinearPolicy::A16Only},
+        Invocation{1, ops::LinearPolicy::A16Only},   Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{5, ops::LinearPolicy::A16Only},   Invocation{8, ops::LinearPolicy::A16Only},
+        Invocation{9, ops::LinearPolicy::A16Only},   Invocation{16, ops::LinearPolicy::A16Only},
+        Invocation{32, ops::LinearPolicy::A16Only},  Invocation{33, ops::LinearPolicy::A16Only},
+        Invocation{128, ops::LinearPolicy::A16Only},
     };
 #else
     const std::int32_t first_a4 = k == 6144 ? 7 : 8;
