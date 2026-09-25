@@ -29,8 +29,9 @@ using ninfer::artifact::NumericFormat;
 using ninfer::targets::qwen3_6_27b::Package;
 using namespace ninfer::targets::qwen3_6_27b::detail;
 
-// Compile-time twin of the runtime guard check: a build that drops either profile from the guard
-// fails even where this test cannot run (no Volta device or no artifact).
+// Bindings that meet the FP32 residual criterion below must be accepted by Variant's per-profile
+// guard, which Engine startup checks. Checked at compile time, so a build that drops either profile
+// from the guard fails even where this test cannot run (no artifact).
 static_assert(Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4) &&
                   Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullA),
               "both Qwen3.8 NVFP4 profiles must allow the FP32 text residual");
@@ -68,8 +69,8 @@ bool fp32_residual_projection(NumericFormat format) {
 
 // The FP32 residual stream needs an FP32 form of every op that writes it: the FP8 embedding gather
 // and, in each layer, the attention or GDN output projection and the MLP down projection. The
-// output head reads the normed BF16 hidden state, not the stream. Bindings that meet this criterion
-// must be accepted by Variant's per-profile guard, which Engine startup checks.
+// output head reads the normed BF16 hidden state, not the stream. The guard side of the contract is
+// the static_assert above.
 int verify_fp32_residual_form(const BindingPlan& bindings) {
     if (bindings.token_embedding.format != NumericFormat::FP8_E4M3FN_ROW_BF16S) {
         std::cerr << "token embedding is not FP8\n";
@@ -84,10 +85,6 @@ int verify_fp32_residual_form(const BindingPlan& bindings) {
             std::cerr << "layer " << layer << " writes the residual stream without an FP32 form\n";
             return 1;
         }
-    }
-    if (!Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullA)) {
-        std::cerr << "Variant rejects an FP32 residual for full A, whose bindings support it\n";
-        return 1;
     }
     return 0;
 }
