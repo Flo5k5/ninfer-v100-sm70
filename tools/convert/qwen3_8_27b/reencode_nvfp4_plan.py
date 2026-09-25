@@ -374,10 +374,10 @@ def plan_uses(base: Artifact, targets: Sequence[Target]) -> UsesPlan:
     """The Uses of the output and the auxiliary divisor objects they add.
 
     Every Use of a converted leaf takes ``AllowA4`` and an activation input divisor auxiliary, as
-    the full-a and full-b profiles require of NVFP4 leaves (a divisor the base Use has is kept);
-    each leaf gets its own auxiliary object. The divisor is the input donor's input global scale
-    for an input projection, the one of the same MLP leaf in the nearest NVFP4 layer below for an
-    MLP leaf, and 1.0 for the output head."""
+    the full-a and full-b profiles require of NVFP4 leaves. A Use that names a divisor keeps it;
+    each leaf with Uses that do not gets one new auxiliary object of its own. The divisor is the
+    input donor's input global scale for an input projection, the one of the same MLP leaf in the
+    nearest NVFP4 layer below for an MLP leaf, and 1.0 for the output head."""
 
     converted = {parameter: target for target in targets if target.converts
                  for parameter in target.parameters}
@@ -386,7 +386,8 @@ def plan_uses(base: Artifact, targets: Sequence[Target]) -> UsesPlan:
     # Imported divisors are numbered last, so the auxiliaries of the full-a roles keep the ids
     # that a full-a conversion of the same base gives them.
     parameters = sorted(dict.fromkeys(use["parameter"] for use in base.directory.uses
-                                      if use["parameter"] in converted),
+                                      if use["parameter"] in converted
+                                      and DIVISOR_ROLE not in use.get("auxiliaries", {})),
                         key=lambda parameter: converted[parameter].role in INPUT_ROLES)
     aux_ids: dict[str, str] = {}
     divisors: dict[str, float] = {}
@@ -400,9 +401,10 @@ def plan_uses(base: Artifact, targets: Sequence[Target]) -> UsesPlan:
     uses = []
     for use in base.directory.uses:
         use = copy.deepcopy(use)
-        aux_id = aux_ids.get(use["parameter"])
-        if aux_id is not None:
+        if use["parameter"] in converted:
             use["activation_policy"] = "AllowA4"
-            use.setdefault("auxiliaries", {}).setdefault(DIVISOR_ROLE, {"object": aux_id})
+            if DIVISOR_ROLE not in use.get("auxiliaries", {}):
+                aux_id = aux_ids[use["parameter"]]
+                use.setdefault("auxiliaries", {})[DIVISOR_ROLE] = {"object": aux_id}
         uses.append(use)
     return UsesPlan(uses, divisors, labels)

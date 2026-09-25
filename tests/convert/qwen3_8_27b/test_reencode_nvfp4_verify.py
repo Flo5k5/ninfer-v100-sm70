@@ -24,17 +24,19 @@ QUERY = "text/layers/1/attention/query"
 
 
 def _rewrite(source: Path, target: Path, *, uses: list[dict] | None = None,
-             shapes: dict[str, tuple[int, ...]] | None = None) -> None:
-    """Copy of an artifact with other Uses or other object shapes, payloads byte for byte."""
+             shapes: dict[str, tuple[int, ...]] | None = None, drop: str | None = None) -> None:
+    """Copy of an artifact with other Uses, other object shapes or without one object, payloads
+    byte for byte."""
 
     with Artifact(source) as artifact:
         directory = artifact.directory
-        writer = ArtifactWriter(target, specs_of(artifact, shapes),
+        specs = [spec for spec in specs_of(artifact, shapes) if spec.id != drop]
+        writer = ArtifactWriter(target, specs,
                                 components=directory.components, bindings=directory.bindings,
                                 uses=directory.uses if uses is None else uses,
                                 metadata=directory.metadata, provenance=directory.provenance)
-        for obj in artifact.objects:
-            writer.write_object(obj.id, artifact.read_object(obj.id))
+        for spec in specs:
+            writer.write_object(spec.id, artifact.read_object(spec.id))
     writer.finish()
 
 
@@ -95,21 +97,26 @@ def _other_leaf_divisor(use: dict, others: list[dict]) -> None:
     use["auxiliaries"] = copy.deepcopy(key["auxiliaries"])
 
 
+USES, DIVISORS = "DIFF directory uses", "DIFF divisor objects of the converted leaves"
+
+
 @pytest.mark.parametrize(
-    "tamper, planned",
+    "tamper, planned, diff",
     [
-        (_set_policy, False),
-        (_drop_divisor, False),
-        (_other_leaf_divisor, False),
-        # The plan has it too: it no longer differs from the base as a conversion does.
-        (_set_policy, True),
-        (_drop_divisor, True),
+        (_set_policy, False, USES),
+        (_drop_divisor, False, USES),
+        (_other_leaf_divisor, False, USES),
+        # The plan has it too: it no longer differs from the base as a conversion does, or two
+        # leaves share one divisor object and query's own is left unused.
+        (_set_policy, True, USES),
+        (_drop_divisor, True, USES),
+        (_other_leaf_divisor, True, DIVISORS),
     ],
 )
-def test_verify_refuses_converted_uses_that_differ(plan, tmp_path, capsys, tamper,
-                                                   planned) -> None:
+def test_verify_refuses_converted_uses_that_differ(plan, tmp_path, capsys, tamper, planned,
+                                                   diff) -> None:
     """A converted leaf's Use set back to AllowA8, without its divisor, or naming another leaf's
-    divisor object where the plan does not, with every record intact."""
+    divisor object, in the output only or in the plan too, with every record intact."""
 
     verify, out_path, _, uses = plan
     tampered_uses = copy.deepcopy(uses)
@@ -119,7 +126,26 @@ def test_verify_refuses_converted_uses_that_differ(plan, tmp_path, capsys, tampe
     capsys.readouterr()
     assert verify(tampered, uses=tampered_uses if planned else uses) == 1
     printed = capsys.readouterr().out
-    assert "DIFF directory uses" in printed and "DIFF object record" not in printed
+    assert diff in printed and "DIFF object record" not in printed
+
+
+def test_verify_refuses_two_leaves_sharing_one_new_divisor(plan, tmp_path, capsys) -> None:
+    """Query names key's divisor object in the plan and the output, and query's own object is
+    gone, so no new object is left unused: only the sharing shows."""
+
+    verify, out_path, report, uses = plan
+    tampered_uses = copy.deepcopy(uses)
+    query = next(use for use in tampered_uses if use["parameter"] == QUERY)
+    own = query["auxiliaries"][DIVISOR]["object"]
+    _other_leaf_divisor(query, tampered_uses)
+    tampered = tmp_path / "tampered.ninfer"
+    _rewrite(out_path, tampered, uses=tampered_uses, drop=own)
+    expected = {item["object"]: item["payload_sha256"]
+                for item in (*report["objects"], *report["auxiliaries"]) if item["object"] != own}
+    capsys.readouterr()
+    assert verify(tampered, expected=expected, uses=tampered_uses) == 1
+    printed = capsys.readouterr().out
+    assert DIVISORS in printed and USES not in printed
 
 
 @pytest.mark.parametrize("kind", ["converted object", "auxiliary object"])

@@ -731,6 +731,16 @@ def test_converts_an_fp8_layer_to_calibrated_nvfp4(tmp_path) -> None:
         assert down_use["activation_policy"] == "AllowA4"
         aux_id = down_use["auxiliaries"]["activation_input_divisor"]["object"]
         assert out.object(aux_id).format == "fp32"
+        # This fixture's FP8 down Use already names a divisor: it keeps it, and no auxiliary
+        # object nothing references is written for it (orphan auxiliary regression).
+        with Artifact(fixture.base) as base:
+            assert down_use["auxiliaries"] == next(
+                use for use in base.directory.uses
+                if use["parameter"] == "text/layers/1/mlp/down")["auxiliaries"]
+            new = {obj.id for obj in out.objects} - {obj.id for obj in base.objects}
+        referenced = {aux["object"] for use in out.directory.uses
+                      for aux in use.get("auxiliaries", {}).values()}
+        assert new and new <= referenced
         # The output head converts too (stage A): NVFP4 object, AllowA4, one shared divisor.
         head = out.object("weight/head")
         assert head.format == "nvfp4" and head.layout == NVFP4_LAYOUT

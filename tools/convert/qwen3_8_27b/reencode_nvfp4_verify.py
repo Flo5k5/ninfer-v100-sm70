@@ -4,8 +4,8 @@ The output must keep the base's components, bindings and metadata, carry the rec
 conversion and the planned Uses, and hold, for every object, the payload the tool wrote
 (re-encoded objects and new FP32 scalar auxiliary objects) or the base's bytes (everything else).
 Converted objects change format and layout only, and the planned Uses of their leaves differ from
-the base's only by ``AllowA4`` and an activation input divisor; every other record and Use is the
-base's.
+the base's only by ``AllowA4`` and an activation input divisor, each converted leaf naming its own
+new auxiliary object; every other record and Use is the base's.
 """
 
 from __future__ import annotations
@@ -46,6 +46,23 @@ def _expected_uses(base_uses: Sequence[dict], planned_uses: Sequence[dict],
     return expected
 
 
+def _new_divisors_match(base_uses: Sequence[dict], planned_uses: Sequence[dict],
+                        converted_parameters: set[str], new_objects: set[str]) -> bool:
+    """Every converted leaf whose base Uses had no divisor names one new auxiliary object in all
+    its Uses (the output head's Uses share one), no two leaves the same, and together all of the
+    new auxiliary objects."""
+
+    by_parameter: dict[str, set] = {}
+    for base_use, planned_use in zip(base_uses, planned_uses):
+        if planned_use["parameter"] in converted_parameters and \
+                DIVISOR_ROLE not in base_use.get("auxiliaries", {}):
+            divisor = planned_use.get("auxiliaries", {}).get(DIVISOR_ROLE) or {}
+            by_parameter.setdefault(planned_use["parameter"], set()).add(divisor.get("object"))
+    named = [objects.pop() for objects in by_parameter.values() if len(objects) == 1]
+    return len(named) == len(by_parameter) and len(set(named)) == len(named) and \
+        set(named) == new_objects
+
+
 def _record(obj) -> dict:
     # A converted object changes byte size, so every object stored after one shifts its offset:
     # records compare without it (the order is checked on its own, sizes through the digests).
@@ -74,6 +91,10 @@ def verify_output(base_path: Path, out_path: Path, expected: Mapping[str, str], 
         if len(planned) != len(base_uses) or list(out.directory.uses) != planned or \
                 planned != _expected_uses(base_uses, planned, converted_parameters):
             print("DIFF directory uses", flush=True)
+            failures += 1
+        new_objects = set(expected) - {obj.id for obj in base.objects}
+        if not _new_divisors_match(base_uses, planned, converted_parameters, new_objects):
+            print("DIFF divisor objects of the converted leaves", flush=True)
             failures += 1
         if out.directory.provenance.get("recipe") != recipe:
             print(f"DIFF provenance recipe (expected {recipe})", flush=True)
