@@ -960,3 +960,9 @@ The artifact binds through `Qwen38Nvfp4FullA`, on sm_70 builds only: its output 
 bind time. `linear_topk` has no NVFP4 vocabulary route; DFlash2 is refused with this profile as a
 precaution (its optimized-proposal path would not need that route but is not validated), and MTP
 is the supported speculative backend.
+
+Like `nvfp4`, the profile accepts the FP32 text residual stream (`--text-residual fp32`, see
+[V100 long-context numerics](../v100.md#long-context-numerics)). The token embedding is still FP8,
+the NVFP4 down projections of layers `56..63` update the FP32 stream through the same Volta route
+as those of layers `0..55`, and the NVFP4 output head reads the normed BF16 hidden state, not the
+stream.

@@ -115,7 +115,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --text-residual fp32 keeps the residual stream in FP32 (Volta, "
-           "qwen3.8-27b/nvfp4, no DFlash)\n"
+           "qwen3.8-27b/nvfp4 or qwen3.8-27b/nvfp4-full-a, no DFlash)\n"
            "       --prefill-attention selects the Volta wide prefill attention kernel "
            "(default auto)\n"
            "       --kv-capacity auto leaves " +
