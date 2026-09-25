@@ -1,6 +1,7 @@
 // Host-only binding check for the Qwen3.8 NVFP4 "full A" profile: MLP 0-63 and the output head in
 // NVFP4, the token embedding, attention and GDN in FP8. Binding reads the directory and a few small
-// host objects (divisors, proposal ids); nothing here touches a device.
+// host objects (divisors, proposal ids); nothing here touches a device. The bound formats must also
+// give the text residual stream its FP32 form, which Variant must then accept for the profile.
 //
 //   NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS=<stage A artifact>
 //   NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=<mixed NVFP4/FP8 artifact it was derived from>   (optional)
@@ -8,6 +9,7 @@
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
+#include "targets/qwen3_6_27b/impl/variant.h"
 
 #include <ninfer/targets/qwen3_6_27b/package.h>
 
@@ -53,6 +55,37 @@ std::uint64_t device_bytes(const std::filesystem::path& path, WeightsProfile pro
     return bind_artifact(binder, profile, mtp_features()).materialization.device_capacity_bytes;
 }
 
+// linear_add updates an FP32 residual stream from FP8 and NVFP4 weights only.
+bool fp32_residual_projection(NumericFormat format) {
+    return format == NumericFormat::FP8_E4M3FN_ROW_BF16S || format == NumericFormat::NVFP4;
+}
+
+// The FP32 residual stream needs an FP32 form of every op that writes it: the FP8 embedding gather
+// and, in each layer, the attention or GDN output projection and the MLP down projection. The
+// output head reads the normed BF16 hidden state, not the stream. Bindings that meet this criterion
+// must be accepted by Variant's per-profile guard, which Engine startup checks.
+int verify_fp32_residual_form(const BindingPlan& bindings) {
+    if (bindings.token_embedding.format != NumericFormat::FP8_E4M3FN_ROW_BF16S) {
+        std::cerr << "token embedding is not FP8\n";
+        return 1;
+    }
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        const TextLayerPlan& plan = bindings.text_layers[layer];
+        const WeightPlan& mixer_output =
+            plan.is_full_attention ? plan.attention.output : plan.gdn.output;
+        if (!fp32_residual_projection(mixer_output.format) ||
+            !fp32_residual_projection(plan.mlp.down.format)) {
+            std::cerr << "layer " << layer << " writes the residual stream without an FP32 form\n";
+            return 1;
+        }
+    }
+    if (!Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullA)) {
+        std::cerr << "Variant rejects an FP32 residual for full A, whose bindings support it\n";
+        return 1;
+    }
+    return 0;
+}
+
 int verify_full_a(const std::filesystem::path& path) {
     ninfer::artifact::Reader reader(path);
     if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen38Nvfp4FullA) {
@@ -64,10 +97,6 @@ int verify_full_a(const std::filesystem::path& path) {
     const ArtifactLoadPlan plan =
         bind_artifact(binder, WeightsProfile::Qwen38Nvfp4FullA, mtp_features());
     const BindingPlan& bindings = plan.bindings;
-    if (bindings.token_embedding.format != NumericFormat::FP8_E4M3FN_ROW_BF16S) {
-        std::cerr << "token embedding is not FP8\n";
-        return 1;
-    }
     if (!valid_nvfp4(bindings.output_head)) {
         std::cerr << "output head is not NVFP4 with valid divisors\n";
         return 1;
@@ -95,6 +124,7 @@ int verify_full_a(const std::filesystem::path& path) {
         std::cerr << "expected every MLP in NVFP4, found " << nvfp4_mlp << '\n';
         return 1;
     }
+    if (const int result = verify_fp32_residual_form(bindings); result != 0) { return result; }
     std::cout << "full A: " << plan.materialization.device_objects.size() << " device objects, "
               << plan.materialization.device_capacity_bytes << " device bytes (MTP, optimized "
               << "proposal head)\n";

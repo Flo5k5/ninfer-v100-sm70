@@ -2,12 +2,12 @@
 // (EngineOptions::text_residual and prefill_attention) on the 27B package. Planning needs a CUDA
 // Volta device for the compute-capability check, but no artifact.
 //
-// The FP32 residual stream is accepted only for qwen3.8-27b/nvfp4 without DFlash, and unknown
-// option values are rejected. The residual is the root allocation of the prefill chunk, the
-// ordinary decode batch (TextContext::ordinary_decode_batch) and the MTP lookup verify aggregate
-// (TextContext::target_verify_batch_impl), so planning it in FP32 must grow each of these phases
-// by exactly two more bytes per element. The prefill plan must also reserve the staging of the
-// selected attention kernel.
+// The FP32 residual stream is accepted only for qwen3.8-27b/nvfp4 and qwen3.8-27b/nvfp4-full-a
+// without DFlash, and unknown option values are rejected. The residual is the root allocation of
+// the prefill chunk, the ordinary decode batch (TextContext::ordinary_decode_batch) and the MTP
+// lookup verify aggregate (TextContext::target_verify_batch_impl), so planning it in FP32 must grow
+// each of these phases by exactly two more bytes per element on both profiles. The prefill plan
+// must also reserve the staging of the selected attention kernel.
 
 #include "targets/qwen3_6_27b/impl/variant.h"
 
@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -37,6 +38,12 @@ using WeightsProfile = Package::WeightsProfile;
 using WorkspacePlan  = ninfer::targets::qwen3_6::detail::qwen3_6_27b_runtime::WorkspacePlan;
 
 constexpr std::size_t kHidden = 5120;
+
+// The weights profiles with an FP32 form of the text residual stream.
+constexpr std::array kFp32ResidualProfiles = {
+    std::pair{WeightsProfile::Qwen38Nvfp4, "qwen3.8-27b/nvfp4"},
+    std::pair{WeightsProfile::Qwen38Nvfp4FullA, "qwen3.8-27b/nvfp4-full-a"},
+};
 
 ninfer::EngineOptions production_options() {
     ninfer::EngineOptions options;
@@ -95,8 +102,10 @@ int verify_rejections(ninfer::DeviceContext& device) {
     dflash.speculative.backend        = ninfer::SpeculativeBackend::DFlash2;
     dflash.speculative.draft_tokens   = 7;
     dflash.speculative.proposal_head  = ninfer::ProposalHead::Full;
-    failures += expect_rejection(device, dflash, WeightsProfile::Qwen38Nvfp4, "DFlash",
-                                 "an FP32 residual with DFlash2");
+    for (const auto& [profile, name] : kFp32ResidualProfiles) {
+        failures += expect_rejection(device, dflash, profile, "DFlash",
+                                     std::string("an FP32 residual with DFlash2 on ") + name);
+    }
 
     ninfer::EngineOptions unknown_residual = production_options();
     unknown_residual.text_residual         = static_cast<ninfer::TextResidualStorage>(7);
@@ -107,30 +116,33 @@ int verify_rejections(ninfer::DeviceContext& device) {
     failures += expect_rejection(device, unknown_kernel, WeightsProfile::Qwen38Nvfp4,
                                  "prefill attention", "an unknown prefill attention kernel");
 
-    try {
-        (void)workspace_plan(device, fp32, WeightsProfile::Qwen38Nvfp4);
-    } catch (const std::exception& error) {
-        std::cerr << "an FP32 residual with MTP on qwen3.8-27b/nvfp4 was rejected: "
-                  << error.what() << '\n';
-        ++failures;
+    for (const auto& [profile, name] : kFp32ResidualProfiles) {
+        try {
+            (void)workspace_plan(device, fp32, profile);
+        } catch (const std::exception& error) {
+            std::cerr << "an FP32 residual with MTP on " << name
+                      << " was rejected: " << error.what() << '\n';
+            ++failures;
+        }
     }
     return failures;
 }
 
-int verify_residual_sizing(ninfer::DeviceContext& device) {
+int verify_residual_sizing(ninfer::DeviceContext& device, WeightsProfile profile,
+                           const std::string& name) {
     int failures = 0;
     const auto compare = [&](ninfer::EngineOptions options, const char* label,
                              const std::function<std::size_t(const WorkspacePlan&)>& phase,
                              std::size_t columns) {
-        options.text_residual   = ninfer::TextResidualStorage::BFloat16;
-        const WorkspacePlan bf16 = workspace_plan(device, options, WeightsProfile::Qwen38Nvfp4);
-        options.text_residual   = ninfer::TextResidualStorage::Float32;
-        const WorkspacePlan fp32 = workspace_plan(device, options, WeightsProfile::Qwen38Nvfp4);
+        options.text_residual      = ninfer::TextResidualStorage::BFloat16;
+        const WorkspacePlan bf16   = workspace_plan(device, options, profile);
+        options.text_residual      = ninfer::TextResidualStorage::Float32;
+        const WorkspacePlan fp32   = workspace_plan(device, options, profile);
         const std::size_t expected = kHidden * columns * 2;
-        std::cout << label << ": BF16 " << phase(bf16) << " FP32 " << phase(fp32)
+        std::cout << name << ' ' << label << ": BF16 " << phase(bf16) << " FP32 " << phase(fp32)
                   << " bytes, expected growth " << expected << '\n';
         failures += check(phase(fp32) == phase(bf16) + expected,
-                          std::string(label) + ": the FP32 residual was not planned");
+                          name + ' ' + label + ": the FP32 residual was not planned");
     };
 
     // Prefill: the chunk-wide residual root.
@@ -202,7 +214,9 @@ int main() {
     try {
         ninfer::DeviceContext device(0);
         int failures = verify_rejections(device);
-        failures += verify_residual_sizing(device);
+        for (const auto& [profile, name] : kFp32ResidualProfiles) {
+            failures += verify_residual_sizing(device, profile, name);
+        }
         failures += verify_prefill_attention_sizing(device);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " qwen3_6_27b numerics planning\n";
         return failures == 0 ? 0 : 1;

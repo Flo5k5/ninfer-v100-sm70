@@ -185,8 +185,9 @@ ninfer_add_test(ninfer_qwen3_6_27b_structured_real_test
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_structured_real_test PROPERTIES SKIP_RETURN_CODE 77)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  # The FP32 text residual stream (Volta, qwen3.8-27b/nvfp4): scoring in both shapes against a
-  # BF16-residual engine, the production MTP + CUDA Graph decode, and its startup planning.
+  # The FP32 text residual stream (Volta, qwen3.8-27b/nvfp4 and nvfp4-full-a): scoring in both
+  # shapes against a BF16-residual engine, the production MTP + CUDA Graph decode, and its startup
+  # planning.
   add_test(NAME ninfer_qwen3_6_27b_score_real_fp32_test
     COMMAND ninfer_qwen3_6_27b_score_real_test --text-residual fp32)
   ninfer_add_test(ninfer_qwen3_6_27b_residual_real_test
@@ -214,15 +215,18 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
-ninfer_add_test(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test
-  SOURCES targets/qwen3_6_27b/test_nvfp4_full_load_plan.cpp
-  LIBRARIES ninfer_engine)
-target_include_directories(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
-target_link_libraries(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test PRIVATE CUDA::cudart)
-set_tests_properties(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test
-  PROPERTIES SKIP_RETURN_CODE 77)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  # nvfp4-full-a binds on sm_70 builds only: other builds refuse its NVFP4 output head.
+  ninfer_add_test(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test
+    SOURCES targets/qwen3_6_27b/test_nvfp4_full_load_plan.cpp
+    LIBRARIES ninfer_engine)
+  target_include_directories(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+  target_link_libraries(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test PRIVATE CUDA::cudart)
+  set_tests_properties(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test
+    PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)
