@@ -347,7 +347,9 @@ def verify_output(base_path: Path, out_path: Path, expected: dict[str, str],
             if getattr(out.directory, field) != getattr(base.directory, field):
                 print(f"DIFF directory {field}", flush=True)
                 failures += 1
-        if out.directory.provenance.get("recipe") != base.directory.provenance.get("recipe"):
+        expected_recipe = (FULL_A_RECIPE if converted
+                           else base.directory.provenance.get("recipe"))
+        if out.directory.provenance.get("recipe") != expected_recipe:
             print("DIFF provenance recipe", flush=True)
             failures += 1
         for base_obj, out_obj in zip(base.objects, out.objects):
