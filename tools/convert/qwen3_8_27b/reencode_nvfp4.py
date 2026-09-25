@@ -32,7 +32,10 @@ converted leaf take ``AllowA4`` and an ``activation_input_divisor`` auxiliary, o
 leaf: the donor's ``input_global_scale`` for an attention or GDN projection (compressed-tensors
 stores the divisor itself, and the fused matrices must share it), the divisor of the same leaf in
 the nearest NVFP4 layer below for an MLP leaf, and 1.0 for the output head (sm_70 runs NVFP4 with
-16-bit activations).
+16-bit activations). Re-encoded MLP layers keep the base's divisors, so no MLP activation divisor
+comes from the mlp donor's ``input_global_scale``: the activation calibration then mixes sources,
+which only a route with 16-bit activations may ignore. A W4A4 route needs the donor's MLP input
+scales imported first.
 
 An object's parameters are its bindings in row order; each takes its donor matrix and rows from
 the artifact converter's source routes. The attention input object is [query | key | gate |
