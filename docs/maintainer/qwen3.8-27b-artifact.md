@@ -966,3 +966,50 @@ Like `nvfp4`, the profile accepts the FP32 text residual stream (`--text-residua
 the NVFP4 down projections of layers `56..63` update the FP32 stream through the same Volta route
 as those of layers `0..55`, and the NVFP4 output head reads the normed BF16 hidden state, not the
 stream.
+
+## 15. `nvfp4-full-b` derived artifact (sm_70)
+
+`nvfp4-full-b` is `nvfp4-full-a` (Section 14) with the attention and GDN input projections moved to
+NVFP4 as well. Like full-a, it is derived rather than converted from scratch, and its builder
+records the recipe in `provenance.recipe`:
+
+```text
+model_id   = qwen3.8-27b
+weights_id = nvfp4-full-b
+recipe_id  = qwen3_8_27b_nvfp4-full-b
+```
+
+Formats per role, against the two profiles it derives from:
+
+| Role | Layers | `nvfp4` | `nvfp4-full-a` | `nvfp4-full-b` |
+|---|---|---|---|---|
+| `attention/query_key_gate_value` `[14336,5120]` | 16 full-attention | FP8 | FP8 | `NVFP4` |
+| `gdn/query_key_value_z` `[16384,5120]` | 48 GDN | FP8 | FP8 | `NVFP4` |
+| attention and GDN `output` `[5120,6144]` | all | FP8 | FP8 | FP8 |
+| `gdn/a_b_projection` `[96,5120]` | 48 GDN | BF16 | BF16 | BF16 |
+| MLP gate/up and down | `0..55` | `NVFP4` | `NVFP4` | `NVFP4` |
+| MLP gate/up and down | `56..63` | FP8 | `NVFP4` | `NVFP4` |
+| `text/output_head` | - | FP8 | `NVFP4` | `NVFP4` |
+| `text/token_embedding` | - | FP8 | FP8 | FP8 |
+
+FP8 is `FP8_E4M3FN_ROW_BF16S`. Norms stay BF16; MTP, the proposal head, Vision and DFlash2 objects
+are those of `nvfp4`.
+
+Each new input parent keeps the row order of Section 3.2 (`[query,key,output_gate,value]`,
+`[query,key,value,z]`) and carries one weight divisor for the whole parent. Every leaf Use of a
+parent (`text/layers/{l}/attention/{query,key,gate,value}` or
+`text/layers/{l}/gdn/{query,key,value,z}`, input `text/layers/{l}/mixer_input`) switches to
+`AllowA4` and carries an `activation_input_divisor` auxiliary: a whole rank-zero FP32 object,
+finite and positive, bit-identical across the four leaves of the parent (they may share one
+object). The binder reads them as `attention/input_projection/input_scale_divisor` and
+`gdn/input_projection/input_scale_divisor` and refuses a parent whose leaves disagree. As for the
+other NVFP4 roles, sm_70 runs these matrices with 16-bit activations and never scales by the input
+divisor.
+
+The artifact binds through `Qwen38Nvfp4FullB`, on sm_70 builds only (its output head is the NVFP4
+head of full-a). The NVFP4 input parents keep their checkpoint-native layout at load and run on the
+NVFP4 A16 routes of `attn_input_proj` and `gdn_input_proj` (projection, convolution snapshot and
+record): the SIMT kernels that the Qwen3.6-27B `nvfp4` profile uses on sm_70, correct but slower
+than the FP8 QPN routes of full-a, prefill most of all. DFlash2 is refused as with full-a. The FP32
+text residual stream is accepted: the input projections read the normed hidden state, never the
+stream.

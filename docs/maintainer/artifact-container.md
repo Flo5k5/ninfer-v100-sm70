@@ -209,7 +209,7 @@ The version-2 registry contains:
 |---|---|---|
 | tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S` | [`tensor-formats.md`](tensor-formats.md) |
 | `model_id` | `qwen3.6-27b`, `qwen3.6-35b-a3b`, `qwen3.8-27b` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
-| `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
+| `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4`, `qwen3.8-27b/nvfp4-full-a`, `qwen3.8-27b/nvfp4-full-b` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
 | tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1` | [`storage-layouts.md`](storage-layouts.md) |
 | resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
 
