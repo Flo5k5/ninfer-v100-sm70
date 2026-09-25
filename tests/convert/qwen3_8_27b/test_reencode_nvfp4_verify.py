@@ -7,11 +7,14 @@ field changed, so exactly one check can refuse it.
 from __future__ import annotations
 
 import copy
+import hashlib
 from pathlib import Path
+import struct
 
 import pytest
 
 from tools.artifact.reader import Artifact
+from tools.artifact.schema import TensorSpec
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.qwen3_8_27b import reencode_nvfp4
 
@@ -21,22 +24,27 @@ from .test_reencode_nvfp4_inputs import FULL_A, FULL_B, OBJECTS, _build_inputs, 
 
 DIVISOR = "activation_input_divisor"
 QUERY = "text/layers/1/attention/query"
+EXTRA, EXTRA_PAYLOAD = "auxiliary/000099", struct.pack("<f", 1.0)
 
 
 def _rewrite(source: Path, target: Path, *, uses: list[dict] | None = None,
-             shapes: dict[str, tuple[int, ...]] | None = None, drop: str | None = None) -> None:
-    """Copy of an artifact with other Uses, other object shapes or without one object, payloads
-    byte for byte."""
+             shapes: dict[str, tuple[int, ...]] | None = None, drop: str | None = None,
+             extra: bool = False) -> None:
+    """Copy of an artifact with other Uses, other object shapes, without one object or with one
+    more FP32 scalar (``EXTRA``), payloads byte for byte."""
 
     with Artifact(source) as artifact:
         directory = artifact.directory
         specs = [spec for spec in specs_of(artifact, shapes) if spec.id != drop]
-        writer = ArtifactWriter(target, specs,
+        added = [TensorSpec(EXTRA, (), "fp32", "contiguous_le_v1")] if extra else []
+        writer = ArtifactWriter(target, specs + added,
                                 components=directory.components, bindings=directory.bindings,
                                 uses=directory.uses if uses is None else uses,
                                 metadata=directory.metadata, provenance=directory.provenance)
         for spec in specs:
             writer.write_object(spec.id, artifact.read_object(spec.id))
+        if extra:
+            writer.write_object(EXTRA, EXTRA_PAYLOAD)
     writer.finish()
 
 
@@ -129,19 +137,31 @@ def test_verify_refuses_converted_uses_that_differ(plan, tmp_path, capsys, tampe
     assert diff in printed and "DIFF object record" not in printed
 
 
-def test_verify_refuses_two_leaves_sharing_one_new_divisor(plan, tmp_path, capsys) -> None:
-    """Query names key's divisor object in the plan and the output, and query's own object is
-    gone, so no new object is left unused: only the sharing shows."""
+@pytest.mark.parametrize("case", ["another leaf's new divisor", "a base divisor", "an orphan"])
+def test_verify_refuses_new_divisors_that_do_not_match_the_leaves(plan, tmp_path, capsys,
+                                                                  case) -> None:
+    """The plan and the output agree, and the Uses differ from the base only as a conversion's
+    do, yet query shares key's new divisor object, or names one already in the base (a layer-0
+    MLP divisor), each with its own object gone; or a new object is one no Use names. Only the
+    check of the converted leaves' divisor objects shows it."""
 
     verify, out_path, report, uses = plan
     tampered_uses = copy.deepcopy(uses)
     query = next(use for use in tampered_uses if use["parameter"] == QUERY)
     own = query["auxiliaries"][DIVISOR]["object"]
-    _other_leaf_divisor(query, tampered_uses)
-    tampered = tmp_path / "tampered.ninfer"
-    _rewrite(out_path, tampered, uses=tampered_uses, drop=own)
     expected = {item["object"]: item["payload_sha256"]
-                for item in (*report["objects"], *report["auxiliaries"]) if item["object"] != own}
+                for item in (*report["objects"], *report["auxiliaries"])}
+    tampered = tmp_path / "tampered.ninfer"
+    if case == "an orphan":
+        expected[EXTRA] = hashlib.sha256(EXTRA_PAYLOAD).hexdigest()
+        _rewrite(out_path, tampered, uses=tampered_uses, extra=True)
+    else:
+        if case == "a base divisor":
+            query["auxiliaries"] = {DIVISOR: {"object": "auxiliary/000000"}}
+        else:
+            _other_leaf_divisor(query, tampered_uses)
+        del expected[own]
+        _rewrite(out_path, tampered, uses=tampered_uses, drop=own)
     capsys.readouterr()
     assert verify(tampered, expected=expected, uses=tampered_uses) == 1
     printed = capsys.readouterr().out
