@@ -192,3 +192,5 @@ RECIPES = {
 QWEN3_8_27B_NVFP4_FULL_A = "qwen3_8_27b_nvfp4-full-a"
 # full-b: full-a plus the attention and GDN input projections in NVFP4.
 QWEN3_8_27B_NVFP4_FULL_B = "qwen3_8_27b_nvfp4-full-b"
+# full-c: full-b plus the attention and GDN output projections in NVFP4.
+QWEN3_8_27B_NVFP4_FULL_C = "qwen3_8_27b_nvfp4-full-c"

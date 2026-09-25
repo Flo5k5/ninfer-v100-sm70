@@ -14,7 +14,7 @@ selected tool.
 |---|---|
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Rebuild the Qwen3.8-27B NVFP4 artifact from one single-source checkpoint | [`convert/qwen3_8_27b/graft_single_source.py`](convert/qwen3_8_27b/graft_single_source.py) |
-| Re-encode its NVFP4 roles from calibrated checkpoints, or convert FP8 roles to NVFP4 (`full-a`, `full-b`) | [`convert/qwen3_8_27b/reencode_nvfp4.py`](convert/qwen3_8_27b/reencode_nvfp4.py) |
+| Re-encode its NVFP4 roles from calibrated checkpoints, or convert FP8 roles to NVFP4 (`full-a`, `full-b`, `full-c`) | [`convert/qwen3_8_27b/reencode_nvfp4.py`](convert/qwen3_8_27b/reencode_nvfp4.py) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
@@ -53,9 +53,10 @@ workflows.
 Two tools start from a published Qwen3.8-27B NVFP4 v3 artifact instead of a whole checkpoint set,
 and keep its directory: `graft_single_source` replaces its payloads with those of one
 compressed-tensors checkpoint of the same architecture, and `reencode_nvfp4` rewrites objects with
-the words of calibrated NVFP4 checkpoints of the same weights: its NVFP4 MLP objects, and, as FP8 to
-NVFP4 conversions, the FP8 MLP layers and the output head (recipe `qwen3_8_27b_nvfp4-full-a`) plus,
-from a second donor, the attention and GDN input projections (`qwen3_8_27b_nvfp4-full-b`). Their
+the words of calibrated NVFP4 checkpoints of the same weights, each role from its own donor: its
+NVFP4 MLP objects, and, as FP8 to NVFP4 conversions, the FP8 MLP layers and the output head (recipe
+`qwen3_8_27b_nvfp4-full-a`), plus the attention and GDN input projections
+(`qwen3_8_27b_nvfp4-full-b`), plus their output projections (`qwen3_8_27b_nvfp4-full-c`). Their
 module docstrings give the commands.
 
 ## Benchmark orchestration

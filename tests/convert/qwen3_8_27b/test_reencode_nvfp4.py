@@ -343,8 +343,8 @@ def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path, monkeypatch,
     report = _report(tmp_path)
     assert report["verified"] is True
     assert report["recipe"] == "qwen3_8_27b_nvfp4"
-    assert report["reencode"]["mlp_layers"] == list(LAYERS)
-    assert report["reencode"]["output_head"] is False
+    # Nothing converts: the head is not re-encoded and its donor is not recorded.
+    assert report["reencode"]["donors"] == {"mlp": {"label": DONOR_LABEL, "layers": list(LAYERS)}}
     assert report["inexact_divisors"] == (1 if layout == "modelopt" else 0)
     entries = {item["object"]: item for item in report["objects"]}
     donor_sha256, weights_sha256 = _stored_sha256(fixture.donor_dir), _stored_sha256(
@@ -409,7 +409,7 @@ def test_output_metadata_names_inputs_without_paths(tmp_path) -> None:
         provenance = dict(out.directory.provenance)
     record = provenance.pop("reencode")
     assert provenance == INHERITED_PROVENANCE
-    assert record["donor"] == {"label": DONOR_LABEL}
+    assert record["donors"] == {"mlp": {"label": DONOR_LABEL, "layers": list(LAYERS)}}
     assert record["weights"] == {"label": WEIGHTS_LABEL}
     assert record["base"] == "base.ninfer"
     assert record["removed_base_paths"] == REMOVED_BASE_PATHS
