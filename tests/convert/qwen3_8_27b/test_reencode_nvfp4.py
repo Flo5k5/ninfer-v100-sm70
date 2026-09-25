@@ -35,6 +35,7 @@ MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 # reciprocal is stored and reported inexact.
 GATE_UP_SCALE_2 = 0x39A2877F
 DOWN_SCALE_2 = {0: 0x3A03126F, 1: 0x397DBE11}
+HEAD_SCALE_2 = 0x39A2877F
 DIVISOR_WORDS = {0x39A2877F: 0x45499CE7, 0x3A03126F: 0x44F9FFFF, 0x397DBE11: 0x4581238A}
 INEXACT_SCALES_2 = {0x397DBE11}
 # compressed-tensors global scales are the divisors themselves, not powers of two.
@@ -235,7 +236,18 @@ def _build(tmp_path, *, layout: str = "modelopt", up_scale_2: int | None = None,
                          "auxiliaries": {"activation_input_divisor": {"object": aux_id}}})
             specs.append(TensorSpec(aux_id, (), "fp32", "contiguous_le_v1"))
             payloads[aux_id] = struct.pack("<f", 40.0 + 3 * index + LEAF_INDEX[leaf])
-    head = torch.randn(VOCAB, HIDDEN, generator=generator)
+    head = (torch.randn(VOCAB, HIDDEN, generator=generator) * 0.02).to(torch.bfloat16)
+    # Donor lm_head words (calibrated), so a conversion can graft the head as the loader
+    # full-a profile requires.
+    head_multiplier = _f32(HEAD_SCALE_2)
+    head_words = _block_words(head.float(), 1.0 / head_multiplier,
+                              torch.randint(-1, 5, (VOCAB, HIDDEN // 16),
+                                            generator=generator, dtype=torch.int16))
+    head_steps = _steps(head_words, multiplier=head_multiplier)
+    donor["lm_head.weight"] = _pack(_nearest_codes(head.float(), head_steps))
+    donor["lm_head.weight_scale"] = head_words.view(torch.float8_e4m3fn)
+    donor["lm_head.weight_scale_2"] = torch.tensor(head_multiplier)
+    weights["lm_head.weight"] = head
     specs.append(TensorSpec("weight/head", (VOCAB, HIDDEN), "fp8_e4m3fn_row_bf16", "row_scale_v1"))
     payloads["weight/head"] = encode_fp8_row_scaled(
         head.to(torch.float8_e4m3fn).view(torch.uint8), torch.ones(VOCAB, dtype=torch.bfloat16),
@@ -674,16 +686,17 @@ def test_converted_layer_keeps_following_object_records(tmp_path) -> None:
     assert reencode_nvfp4.main(_arguments(fixture, out_path, "--layers", "0-1",
                                           "--round", "down", weights=True)) == 0
     with Artifact(fixture.base) as base, Artifact(out_path) as out:
+        converted = {"weight/000003", "weight/head"}
         shifted = 0
         for base_obj, out_obj in zip(base.objects, out.objects):
             assert base_obj.id == out_obj.id
             if base_obj.offset != out_obj.offset:
                 shifted += 1
-                # The shifted object is not the converted one and keeps its own record intact
-                # apart from the offset.
-                assert base_obj.id != "weight/000003"
-                assert {k: v for k, v in base_obj.to_json().items() if k != "offset"} \
-                    == {k: v for k, v in out_obj.to_json().items() if k != "offset"}
+                # A shifted object that was not converted keeps its own record intact apart
+                # from the offset; converted objects legitimately change format and layout.
+                assert base_obj.id in converted or (
+                    {k: v for k, v in base_obj.to_json().items() if k != "offset"}
+                    == {k: v for k, v in out_obj.to_json().items() if k != "offset"})
         assert shifted > 0, "the fixture must store objects after the converted one"
 
 
@@ -710,6 +723,14 @@ def test_converts_an_fp8_layer_to_calibrated_nvfp4(tmp_path) -> None:
         assert down_use["activation_policy"] == "AllowA4"
         aux_id = down_use["auxiliaries"]["activation_input_divisor"]["object"]
         assert out.object(aux_id).format == "fp32"
+        # The output head converts too (stage A): NVFP4 object, AllowA4, one shared divisor.
+        head = out.object("weight/head")
+        assert head.format == "nvfp4" and head.layout == NVFP4_LAYOUT
+        head_use = next(use for use in out.directory.uses
+                        if use["parameter"] == "text/output_head")
+        assert head_use["activation_policy"] == "AllowA4"
+        assert out.object(head_use["auxiliaries"]["activation_input_divisor"]
+                          ["object"]).format == "fp32"
     codes, scales, divisor, _ = _words(out_path, "weight/000003", (DOWN_ROWS, INTERMEDIATE))
     local = fixture.weights[source + "down_proj.weight"].float()
     divisor_word = DIVISOR_WORDS[DOWN_SCALE_2[1]]

@@ -189,6 +189,14 @@ def plan_targets(base: Artifact, layers: Iterable[int], rounded: set[str],
                                "down" in rounded, donor, weights))
     if not targets:
         raise ReencodeError("no MLP layer selected")
+    if any(target.converts for target in targets):
+        # The full-a profile binds the output head as NVFP4 too (stage A): convert it with the
+        # donor's calibrated lm_head words — orca's head is the base model's, so the words
+        # transpose as-is.
+        head_object = _mlp_object(base, _object_of(directory, "text/output_head")[0],
+                                  "text/output_head")
+        targets.append(_target(head_object, -1, ("text/output_head",),
+                               ("lm_head",), False, donor, weights))
     return targets
 
 
