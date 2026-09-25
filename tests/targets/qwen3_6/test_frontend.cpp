@@ -1938,9 +1938,9 @@ int test_structured_output(const Frontend& frontend) {
     with_tools.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"f","parameters":{"type":"object"}}})");
     const auto tools_error = request_error([&] { (void)frontend.prepare(with_tools); });
-    failures += check(tools_error &&
-                          tools_error->kind() == ninfer::RequestErrorKind::InvalidOutputConstraint,
-                      "a response format was combined with callable tools");
+    failures += check(!tools_error,
+                      "a response format alongside callable tools prepares the value-or-calls "
+                      "grammar");
 
     ninfer::PromptInput continued = with_tools;
     continued.options.tool_jsons.clear();
