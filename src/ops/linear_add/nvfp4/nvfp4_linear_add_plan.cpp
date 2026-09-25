@@ -199,7 +199,8 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
     // any launch instead of reading it wrong.
     if (weight.layout != QuantLayout::BlockScaleK16M128x4) {
         throw std::invalid_argument(
-            "nvfp4 linear_add: the A16 and W4A4 routes read the checkpoint-native layout only");
+            "nvfp4 linear_add: a QPN-prepacked weight cannot take the A16/W4A4 routes "
+            "(checkpoint-native planes only); use A16Only on sm_70");
     }
     if (route == Nvfp4LinearAddRoute::A16) {
         launch_a16(x, weight, residual, stream);
