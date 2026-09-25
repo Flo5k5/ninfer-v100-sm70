@@ -665,6 +665,28 @@ def test_failed_verification_removes_the_output(tmp_path, monkeypatch) -> None:
     assert report["verified"] is False and report["removed"] is True
 
 
+def test_converted_layer_keeps_following_object_records(tmp_path) -> None:
+    """A converted object changes byte size, shifting the offsets of every object stored after
+    it: verification must compare records without the offset (found on the real G23 build,
+    where weight/000156 shrinks and weight/000157 shifts)."""
+    fixture = _build(tmp_path, layer1_down_format="fp8")
+    out_path = tmp_path / "g23-offset.ninfer"
+    assert reencode_nvfp4.main(_arguments(fixture, out_path, "--layers", "0-1",
+                                          "--round", "down", weights=True)) == 0
+    with Artifact(fixture.base) as base, Artifact(out_path) as out:
+        shifted = 0
+        for base_obj, out_obj in zip(base.objects, out.objects):
+            assert base_obj.id == out_obj.id
+            if base_obj.offset != out_obj.offset:
+                shifted += 1
+                # The shifted object is not the converted one and keeps its own record intact
+                # apart from the offset.
+                assert base_obj.id != "weight/000003"
+                assert {k: v for k, v in base_obj.to_json().items() if k != "offset"} \
+                    == {k: v for k, v in out_obj.to_json().items() if k != "offset"}
+        assert shifted > 0, "the fixture must store objects after the converted one"
+
+
 def test_converts_an_fp8_layer_to_calibrated_nvfp4(tmp_path) -> None:
     """G23's shape: layer 1's down object is FP8 in the base and leaves as NVFP4, donor scales
     rounded on the local weights; the object's format and layout change in the output."""

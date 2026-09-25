@@ -345,10 +345,15 @@ def verify_output(base_path: Path, out_path: Path, expected: dict[str, str],
             if base_obj.id != out_obj.id:
                 print(f"DIFF object order at {base_obj.id}", flush=True)
                 return 1
-            if base_obj.to_json() == out_obj.to_json() or base_obj.id in converted:
+            if base_obj.id in converted:
                 continue
-            print(f"DIFF object record {base_obj.id}", flush=True)
-            return 1
+            # A converted object changes byte size, so every object stored after one shifts its
+            # offset: records compare without the offset (order is enforced above, sizes below).
+            base_record = {k: v for k, v in base_obj.to_json().items() if k != "offset"}
+            out_record = {k: v for k, v in out_obj.to_json().items() if k != "offset"}
+            if base_record != out_record:
+                print(f"DIFF object record {base_obj.id}", flush=True)
+                return 1
         for obj in base.objects:
             want = expected.get(obj.id) or _digest(base.iter_object(obj.id))
             if _digest(out.iter_object(obj.id)) != want:
