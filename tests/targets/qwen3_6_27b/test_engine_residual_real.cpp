@@ -1,8 +1,8 @@
-// FP32 text residual stream on qwen3.8-27b/nvfp4 (NINFER_QWEN3_8_27B_NVFP4_WEIGHTS) in the
-// production decode configuration: MTP with four drafts and the optimized proposal head, CUDA
-// graphs, INT8 KV and 2048-token prefill chunks. The prompt spans two prefill chunks (the wide
-// FP32 residual projections and split-D attention), then greedy decoding runs through the
-// captured MTP verify and draft graphs with the FP32 stream.
+// FP32 text residual stream on the artifact named by NINFER_QWEN3_8_27B_NVFP4_WEIGHTS
+// (qwen3.8-27b/nvfp4 or nvfp4-full-a) in the production decode configuration: MTP with four drafts
+// and the optimized proposal head, CUDA graphs, INT8 KV and 2048-token prefill chunks. The prompt
+// spans two prefill chunks (the wide FP32 residual projections and split-D attention), then greedy
+// decoding runs through the captured MTP verify and draft graphs with the FP32 stream.
 //
 // Greedy MTP decoding is lossless: its tokens must equal plain eager decoding with the same FP32
 // residual. The drafts must keep being accepted, so the MTP head still reads a valid target hidden
