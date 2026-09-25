@@ -206,7 +206,7 @@ void test_common_validation() {
 }
 
 void test_official_recipe_identities() {
-    const std::array<std::pair<std::string_view, ArtifactIdentity>, 7> official = {{
+    const std::array<std::pair<std::string_view, ArtifactIdentity>, 8> official = {{
         {"qwen3_6_27b", {"qwen3.6-27b", "groupwise-int"}},
         {"qwen3_8_27b", {"qwen3.8-27b", "groupwise-int"}},
         {"qwen3_6_35b_a3b", {"qwen3.6-35b-a3b", "groupwise-int"}},
@@ -214,6 +214,7 @@ void test_official_recipe_identities() {
         {"qwen3_8_27b_nvfp4", {"qwen3.8-27b", "nvfp4"}},
         {"qwen3_8_27b_nvfp4-full-a", {"qwen3.8-27b", "nvfp4-full-a"}},
         {"qwen3_8_27b_nvfp4-full-b", {"qwen3.8-27b", "nvfp4-full-b"}},
+        {"qwen3_8_27b_nvfp4-full-c", {"qwen3.8-27b", "nvfp4-full-c"}},
     }};
     // Each recipe is read by a new Reader in the same process, so an identity carried over from
     // one Reader to the next fails from the second recipe on.

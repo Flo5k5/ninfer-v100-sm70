@@ -201,9 +201,9 @@ int exercise_scoring(ninfer::Engine& engine, const std::vector<ninfer::TokenId>&
 
 // Default: the BF16 residual stream on any 27B artifact (NINFER_QWEN3_6_27B_WEIGHTS).
 // --text-residual fp32: the FP32 residual stream on the artifact named by
-// NINFER_QWEN3_8_27B_NVFP4_WEIGHTS (qwen3.8-27b/nvfp4, nvfp4-full-a or nvfp4-full-b). The same
-// checks run on an FP32-residual engine, and both of its scoring shapes must agree with a
-// BF16-residual engine on the same artifact.
+// NINFER_QWEN3_8_27B_NVFP4_WEIGHTS (qwen3.8-27b/nvfp4, nvfp4-full-a, nvfp4-full-b or
+// nvfp4-full-c). The same checks run on an FP32-residual engine, and both of its scoring shapes
+// must agree with a BF16-residual engine on the same artifact.
 int main(int argc, char** argv) {
     const bool fp32 = argc == 3 && std::string_view(argv[1]) == "--text-residual" &&
                       std::string_view(argv[2]) == "fp32";
