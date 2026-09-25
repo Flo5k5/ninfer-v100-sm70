@@ -29,6 +29,12 @@ using ninfer::artifact::NumericFormat;
 using ninfer::targets::qwen3_6_27b::Package;
 using namespace ninfer::targets::qwen3_6_27b::detail;
 
+// Compile-time twin of the runtime guard check: a build that drops either profile from the guard
+// fails even where this test cannot run (no Volta device or no artifact).
+static_assert(Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4) &&
+                  Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullA),
+              "both Qwen3.8 NVFP4 profiles must allow the FP32 text residual");
+
 std::filesystem::path environment_path(const char* name) {
     const char* value = std::getenv(name);
     return value == nullptr ? std::filesystem::path() : std::filesystem::path(value);
@@ -156,6 +162,13 @@ int main() {
         if (const int result = verify_full_a(full_a); result != 0) { return result; }
         const std::filesystem::path mixed = environment_path("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
         if (!mixed.empty() && std::filesystem::is_regular_file(mixed)) {
+            // The variable also names the artifact of the real FP32 tests, which may be full A.
+            if (Package::resolve_weights(ninfer::artifact::Reader(mixed).identity()) !=
+                WeightsProfile::Qwen38Nvfp4) {
+                std::cout << "skip device bytes: NINFER_QWEN3_8_27B_NVFP4_WEIGHTS is not a "
+                             "qwen3.8-27b/nvfp4 artifact\n";
+                return 0;
+            }
             const std::uint64_t before = device_bytes(mixed, WeightsProfile::Qwen38Nvfp4);
             const std::uint64_t after  = device_bytes(full_a, WeightsProfile::Qwen38Nvfp4FullA);
             std::cout << "device weight bytes: mixed " << before << ", full A " << after

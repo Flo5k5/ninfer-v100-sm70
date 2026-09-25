@@ -185,9 +185,9 @@ ninfer_add_test(ninfer_qwen3_6_27b_structured_real_test
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_structured_real_test PROPERTIES SKIP_RETURN_CODE 77)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  # The FP32 text residual stream (Volta, qwen3.8-27b/nvfp4 and nvfp4-full-a): scoring in both
-  # shapes against a BF16-residual engine, the production MTP + CUDA Graph decode, and its startup
-  # planning.
+  # The FP32 text residual stream (Volta): startup planning on both qwen3.8-27b NVFP4 profiles;
+  # scoring in both shapes against a BF16-residual engine and the production MTP + CUDA Graph
+  # decode on the artifact named by NINFER_QWEN3_8_27B_NVFP4_WEIGHTS (nvfp4 or nvfp4-full-a).
   add_test(NAME ninfer_qwen3_6_27b_score_real_fp32_test
     COMMAND ninfer_qwen3_6_27b_score_real_test --text-residual fp32)
   ninfer_add_test(ninfer_qwen3_6_27b_residual_real_test
