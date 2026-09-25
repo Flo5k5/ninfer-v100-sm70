@@ -70,6 +70,7 @@ from typing import Iterator, Sequence
 
 import torch
 
+from tools.artifact.codecs.fp8_row import dequantize_fp8_row_scaled
 from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, encode_nvfp4
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
@@ -86,6 +87,9 @@ from tools.convert.qwen3_8_27b.reencode_nvfp4_numeric import (
     update_digest,
 )
 from tools.convert.qwen3_8_27b.reencode_nvfp4_plan import (
+    FP8_ROW_FORMAT,
+    NVFP4_FORMAT,
+    NVFP4_LAYOUT,
     ReencodeError,
     Target,
     check_base,
@@ -146,8 +150,13 @@ class Encoder:
                report: dict) -> torch.Tensor:
         """Packed codes of the object, compared with the base object and with --weights."""
 
-        base_codes, base_scales, base_divisor = decode_nvfp4_words(
-            self.base.read_object(target.object_id), target.shape)
+        if target.converts:
+            base_codes, base_scales, base_divisor = None, None, None
+            base_values = dequantize_fp8_row_scaled(
+                self.base.read_object(target.object_id), target.shape)
+        else:
+            base_codes, base_scales, base_divisor = decode_nvfp4_words(
+                self.base.read_object(target.object_id), target.shape)
         against_base, against_weights = RelativeError(), RelativeError()
         rounded, same, saturated, zeroed = [], 0, 0, 0
         weights_sha256: dict[str, str] = {}
@@ -169,8 +178,11 @@ class Encoder:
             values = dequantize_words(codes, scales[begin:end], target.divisor)
             if weights is not None:
                 against_weights.add(values, weights)
-            against_base.add(values, dequantize_words(base_codes[begin:end],
-                                                      base_scales[begin:end], base_divisor))
+            if target.converts:
+                against_base.add(values, base_values[begin:end])
+            else:
+                against_base.add(values, dequantize_words(base_codes[begin:end],
+                                                          base_scales[begin:end], base_divisor))
         report["relative_rms_error_vs_base"] = against_base.value()
         self._refuse(target, against_base.value(), "the base object's values")
         if self.weights is None:
@@ -216,11 +228,17 @@ class Encoder:
             row += item.rows
 
 
-def _specs(base: Artifact) -> list:
+def _specs(base: Artifact, targets: Sequence["Target"]) -> list:
+    """Output specs: the base's, with every converted target's object switched to NVFP4."""
+    converted = {t.object_id: t for t in targets if t.converts}
     specs = []
     for obj in base.objects:
         if isinstance(obj, TensorObject):
-            specs.append(TensorSpec(obj.id, tuple(obj.shape), obj.format, obj.layout))
+            if obj.id in converted:
+                specs.append(TensorSpec(obj.id, tuple(converted[obj.id].shape),
+                                        NVFP4_FORMAT, NVFP4_LAYOUT))
+            else:
+                specs.append(TensorSpec(obj.id, tuple(obj.shape), obj.format, obj.layout))
         else:
             specs.append(ResourceSpec(obj.id, obj.bytes, obj.encoding))
     return specs
@@ -256,7 +274,7 @@ def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Enco
     started = time.perf_counter()
     writer = ArtifactWriter(
         arguments.out,
-        _specs(base),
+        _specs(base, targets),
         components=directory.components,
         bindings=directory.bindings,
         uses=directory.uses,

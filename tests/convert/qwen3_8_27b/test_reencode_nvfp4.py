@@ -14,7 +14,7 @@ import torch
 from tools.artifact.codecs.fp8_row import encode_fp8_row_scaled
 from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, dequantize_nvfp4, encode_nvfp4
 from tools.artifact.framing import HEADER
-from tools.artifact.reader import Artifact
+from tools.artifact.reader import Artifact, TensorObject
 from tools.artifact.schema import ResourceSpec, TensorSpec
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.qwen3_8_27b import reencode_nvfp4
@@ -213,7 +213,10 @@ def _build(tmp_path, *, layout: str = "modelopt", up_scale_2: int | None = None,
             codes = _nearest_codes(values, _steps(words, divisor=divisor))
             payloads[object_id] = encode_nvfp4(_pack(codes), words, torch.tensor(divisor), shape)
         specs.append(TensorSpec(gate_up_id, gate_up_shape, "nvfp4", NVFP4_LAYOUT))
-        if layer == 1 and layer1_down_format != "nvfp4":
+        if layer == 1 and layer1_down_format == "bf16":
+            payloads[down_id] = edited_down.to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes()
+            specs.append(TensorSpec(down_id, down_shape, "bf16", "contiguous_le_v1"))
+        elif layer == 1 and layer1_down_format == "fp8":
             codes8 = edited_down.float().to(torch.float8_e4m3fn).view(torch.uint8)
             payloads[down_id] = encode_fp8_row_scaled(
                 codes8, torch.ones(DOWN_ROWS, dtype=torch.bfloat16), down_shape)
@@ -565,7 +568,10 @@ LAYER1 = "model.language_model.layers.1.mlp."
          ("--weights",), r"--weights shape \(256, 128\) differs from the donor matrix \(128, 128\)"),
         ({}, _edit_weights(LAYER1 + "up_proj.weight", lambda t: t.to(torch.float8_e4m3fn)),
          ("--weights",), "up_proj.weight: expected unquantized weights in --weights, got F8_E4M3"),
-        ({"layer1_down_format": "fp8"}, None, ("--layers", "0-1"), "not an NVFP4 matrix"),
+        # An FP8 base object is now CONVERTED (donor words, or scales rounded on --weights),
+        # so the refusal suite keeps a genuinely foreign format instead:
+        ({"layer1_down_format": "bf16"}, None, ("--layers", "0-1"),
+         "neither an NVFP4 nor an FP8 row-scaled matrix"),
         ({}, None, ("--weights", "--round", "gate"), "round both or neither"),
     ],
 )
@@ -657,3 +663,35 @@ def test_failed_verification_removes_the_output(tmp_path, monkeypatch) -> None:
     assert not out_path.exists()
     report = _report(tmp_path)
     assert report["verified"] is False and report["removed"] is True
+
+
+def test_converts_an_fp8_layer_to_calibrated_nvfp4(tmp_path) -> None:
+    """G23's shape: layer 1's down object is FP8 in the base and leaves as NVFP4, donor scales
+    rounded on the local weights; the object's format and layout change in the output."""
+    fixture = _build(tmp_path, layer1_down_format="fp8")
+    out_path = tmp_path / "g23.ninfer"
+    assert reencode_nvfp4.main(_arguments(fixture, out_path, "--layers", "0-1",
+                                          "--round", "down", weights=True)) == 0
+    source = "model.language_model.layers.1.mlp."
+    with Artifact(out_path) as out:
+        converted = out.object("weight/000003")
+        assert isinstance(converted, TensorObject)
+        assert converted.format == "nvfp4"
+        assert converted.layout == NVFP4_LAYOUT
+        assert tuple(converted.shape) == (DOWN_ROWS, INTERMEDIATE)
+    codes, scales, divisor, _ = _words(out_path, "weight/000003", (DOWN_ROWS, INTERMEDIATE))
+    local = fixture.weights[source + "down_proj.weight"].float()
+    divisor_word = DIVISOR_WORDS[DOWN_SCALE_2[1]]
+    assert _word(float(divisor)) == divisor_word
+    steps = _decode_steps(scales, divisor_word)
+    assert torch.equal(codes, _nearest_codes(local, steps))
+    values = _values(codes, steps)
+    # The conversion stays close to the FP8 values it replaces and to the local weights.
+    from tools.artifact.codecs.fp8_row import dequantize_fp8_row_scaled
+    with Artifact(fixture.base) as base:
+        fp8_values = dequantize_fp8_row_scaled(
+            base.read_object("weight/000003"), (DOWN_ROWS, INTERMEDIATE)).float()
+    error = (values - fp8_values).pow(2).mean().sqrt() / fp8_values.pow(2).mean().sqrt()
+    assert error < 0.30, error
+    error_weights = (values - local).pow(2).mean().sqrt() / local.pow(2).mean().sqrt()
+    assert error_weights < 0.13, error_weights
