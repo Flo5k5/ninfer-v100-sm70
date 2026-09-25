@@ -563,7 +563,8 @@ LAYER1 = "model.language_model.layers.1.mlp."
          "layers.1.mlp.down_proj: no NVFP4 words in the donor checkpoint"),
         ({}, _edit_donor(LAYER1 + "down_proj.weight", lambda t: t[:64].contiguous()), (),
          r"codes \(64, 64\) and scales \(128, 8\) are not an NVFP4 matrix of 128 columns"),
-        ({}, _both_rows(64), (), "weight/000001: donor matrices have 64 rows, object has 128"),
+        ({}, _both_rows(64), (),
+         "weight/000001: donor matrices have 64 rows for text/layers/0/mlp/down, object has 128"),
         ({}, _edit_donor(LAYER1 + "down_proj.weight_scale", lambda t: t.view(torch.uint8)), (),
          "weight_scale must be F8_E4M3 block scales, not U8"),
         ({"up_scale_2": 0x39800000}, None, (), "weight/000000: fused donor matrices have different"),
@@ -651,7 +652,8 @@ def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None
     assert reencode_nvfp4.main(_arguments(fixture, out_path, "--round", "down",
                                           weights=True)) == 0
     expected = {item["object"]: item["payload_sha256"] for item in _report(tmp_path)["objects"]}
-    assert reencode_nvfp4.verify_output(fixture.base, out_path, expected) == 0
+    keywords = {"converted": {}, "recipe": "qwen3_8_27b_nvfp4"}
+    assert reencode_nvfp4.verify_output(fixture.base, out_path, expected, **keywords) == 0
     for object_id in ("weight/head", "weight/000001"):
         with Artifact(out_path) as out:
             offset = out.payload_offset + out.object(object_id).offset + 5
@@ -660,7 +662,7 @@ def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None
             byte = handle.read(1)[0]
             handle.seek(offset)
             handle.write(bytes([byte ^ 0x10]))
-        assert reencode_nvfp4.verify_output(fixture.base, out_path, expected) == 1
+        assert reencode_nvfp4.verify_output(fixture.base, out_path, expected, **keywords) == 1
         with out_path.open("r+b") as handle:
             handle.seek(offset)
             handle.write(bytes([byte]))

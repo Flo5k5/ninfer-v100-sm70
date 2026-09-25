@@ -183,3 +183,12 @@ RECIPES = {
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
 }
+
+# Recipes derived from a qwen3_8_27b_nvfp4 artifact by
+# tools.convert.qwen3_8_27b.reencode_nvfp4, which records them in its output: they
+# move FP8 roles to NVFP4 with the calibrated words of other checkpoints, so no
+# conversion function above builds them. They load under the same kOfficialRecipes rule.
+# full-a: every text MLP layer and the output head in NVFP4.
+QWEN3_8_27B_NVFP4_FULL_A = "qwen3_8_27b_nvfp4-full-a"
+# full-b: full-a plus the attention and GDN input projections in NVFP4.
+QWEN3_8_27B_NVFP4_FULL_B = "qwen3_8_27b_nvfp4-full-b"
