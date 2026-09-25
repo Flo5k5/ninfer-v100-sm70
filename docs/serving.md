@@ -114,9 +114,9 @@ The endpoint supports:
 - `stream_options.include_usage`;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
   streaming `return_progress` observations;
-- non-strict function tools with `tool_choice` `auto`, `none`, or `allowed_tools` in `auto` mode,
-  parallel calls enabled, assistant tool-call history, tool-result messages, and legacy
-  function-call history;
+- function tools with `tool_choice` `auto`, `none`, `required`, a named function, or
+  `allowed_tools` in `auto` mode; strict tools, `parallel_tool_calls:false`, assistant
+  tool-call history, tool-result messages, and legacy function-call history;
 - the top-level `reasoning_effort` field;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
@@ -124,8 +124,7 @@ The endpoint supports:
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes nonzero `logit_bias`, requested log probabilities,
-audio/file input or audio output, `strict:true`, required or named tool choice,
-`parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
+audio/file input or audio output, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
@@ -419,8 +418,8 @@ wire response contains typed `output` Items.
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | `{"type":"text"}`, `{"type":"json_object"}`, or `json_schema` with `name`, `description`, `schema` and `strict`; see [Structured output](#structured-output) |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
-| `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
-| `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
+| `tool_choice` | `auto`, `none`, `required`, a function name, or function-only `allowed_tools` with mode `auto` or `required`; a namespaced selection carries both `namespace` and `name` |
+| `parallel_tool_calls` | `true` by default; `false` constrains the answer to at most one tool call |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | omitted or `0` |
@@ -517,10 +516,12 @@ undeclared model output remains ordinary text. `allowed_tools` with mode `auto` 
 without changing declaration order, while `tool_choice:"none"` disables structured tool output even
 when the history contains earlier calls.
 
-NInfer does not execute functions, and tool calls are not constrained by a grammar, so
-`strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
+NInfer does not execute functions, and hosted tools, remote MCP tools, and custom free-form
 tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
-invocation are also rejected because their semantics cannot be honored.
+invocation are also rejected because their semantics cannot be honored. Everything else about
+the calls is enforced by a grammar: `strict:true` binds the arguments to the declared schema,
+required or named tool choice forces at least the requested call, and
+`parallel_tool_calls:false` stops the answer after the first call.
 
 ### Response object and usage
 
@@ -710,11 +711,12 @@ declared effort capability. `output_config.format` of type `json_schema` constra
 its `schema` (see [Structured output](#structured-output)); the top-level `output_format` of the
 structured-outputs beta is accepted as the same field, and setting both is rejected.
 
-User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
-`input_examples`. `tool_choice:auto` and `none` are executable. Forced or named choice,
-`strict:true`, active single-call enforcement, deferred tools, tools that exclude direct model
+User-defined tools support `name`, `description`, object `input_schema`, and
+`input_examples`. `tool_choice:auto` and `none` are executable, a forced or named choice and
+`disable_parallel_tool_use` are enforced by the constrained decoding of [Structured
+output](#structured-output). Deferred tools, tools that exclude direct model
 calls, Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their
-required constraint or executor is absent. `tool_result` preserves text/image order and marks
+executor is absent. `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated
@@ -779,8 +781,9 @@ answer, so the answer is valid by construction rather than repaired afterwards.
   `</think>` and a blank line before the value, which is also what the thinking budget control
   injects.
 - A format applies to a new assistant turn. Continuing a final assistant message with a format is
-  rejected, and so is a format combined with callable tools (`tool_choice:"none"` makes tools not
-  callable).
+  rejected. With callable tools in `auto` mode the answer is either the JSON value or the tool
+  calls (`tool_choice:"none"` makes tools not callable); a required or named call is the whole
+  answer and the format applies to a later turn.
 - The answer ends at the model's stop token once the value is complete. An output limit can still
   cut it (`length`, `max_tokens`), and a stop string that matches inside the value ends it there.
   A stop string that matches inside the reasoning part ends the output before the value, with an
