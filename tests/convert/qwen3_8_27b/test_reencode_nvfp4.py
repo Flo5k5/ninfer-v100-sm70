@@ -657,7 +657,7 @@ def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None
 def test_failed_verification_removes_the_output(tmp_path, monkeypatch) -> None:
     fixture = _build(tmp_path)
     out_path = tmp_path / "out.ninfer"
-    monkeypatch.setattr(reencode_nvfp4, "verify_output", lambda *arguments: 1)
+    monkeypatch.setattr(reencode_nvfp4, "verify_output", lambda *arguments, **keywords: 1)
     assert reencode_nvfp4.main(_arguments(fixture, out_path, "--round", "down", "--verify",
                                           weights=True)) == 1
     assert not out_path.exists()

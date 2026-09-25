@@ -323,9 +323,15 @@ def _digest(chunks) -> str:
     return digest.hexdigest()
 
 
-def verify_output(base_path: Path, out_path: Path, expected: dict[str, str]) -> int:
-    """0 when re-encoded objects hold the digests in ``expected`` and all else matches the base."""
+def verify_output(base_path: Path, out_path: Path, expected: dict[str, str],
+                   converted: set[str] | None = None) -> int:
+    """0 when re-encoded objects hold the digests in ``expected`` and all else matches the base.
 
+    Objects in ``converted`` keep their payload digest check but are allowed a different object
+    record: an FP8 layer converted to NVFP4 changes format and layout while keeping its id, shape
+    and position."""
+
+    converted = converted or set()
     failures = 0
     with Artifact(base_path) as base, Artifact(out_path) as out:
         for field in ("components", "bindings", "uses", "metadata"):
@@ -335,9 +341,20 @@ def verify_output(base_path: Path, out_path: Path, expected: dict[str, str]) -> 
         if out.directory.provenance.get("recipe") != base.directory.provenance.get("recipe"):
             print("DIFF provenance recipe", flush=True)
             failures += 1
-        if [obj.to_json() for obj in out.objects] != [obj.to_json() for obj in base.objects]:
-            print("DIFF object records", flush=True)
+        for base_obj, out_obj in zip(base.objects, out.objects):
+            if base_obj.id != out_obj.id:
+                print(f"DIFF object order at {base_obj.id}", flush=True)
+                return 1
+            if base_obj.to_json() == out_obj.to_json() or base_obj.id in converted:
+                continue
+            print(f"DIFF object record {base_obj.id}", flush=True)
             return 1
+        for obj in base.objects:
+            want = expected.get(obj.id) or _digest(base.iter_object(obj.id))
+            if _digest(out.iter_object(obj.id)) != want:
+                kind = "re-encoded" if obj.id in expected else "copied"
+                print(f"DIFF {obj.id} ({kind} object)", flush=True)
+                failures += 1
         for obj in base.objects:
             want = expected.get(obj.id) or _digest(base.iter_object(obj.id))
             if _digest(out.iter_object(obj.id)) != want:
@@ -421,7 +438,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     status = 0
     if arguments.verify:
         expected = {item["object"]: item["payload_sha256"] for item in report["objects"]}
-        status = verify_output(arguments.base, arguments.out, expected)
+        status = verify_output(arguments.base, arguments.out, expected,
+                               converted={t.object_id for t in targets if t.converts})
         report["verified"] = status == 0
         if status:
             _remove_output(arguments.out)
