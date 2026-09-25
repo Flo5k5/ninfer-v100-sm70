@@ -21,7 +21,8 @@ from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.quantization.fp8_row import quantize_bf16_rows
-from tools.convert.qwen3_8_27b import reencode_nvfp4
+from tools.convert.qwen3_8_27b import reencode_nvfp4, reencode_nvfp4_encode
+from tools.convert.qwen3_8_27b.reencode_nvfp4_plan import ReencodeError
 
 from .test_reencode_nvfp4 import (
     HIDDEN,
@@ -202,7 +203,7 @@ def _divisor_uses(out: Artifact) -> dict[str, tuple[str, str, int]]:
 def test_full_b_converts_the_input_projections_with_the_input_donor_words(tmp_path,
                                                                            monkeypatch) -> None:
     # Row chunks that divide neither a head's 256 rows nor a leaf: chunks cross both boundaries.
-    monkeypatch.setattr(reencode_nvfp4, "ROW_CHUNK", 100)
+    monkeypatch.setattr(reencode_nvfp4_encode, "ROW_CHUNK", 100)
     fixture = _build_inputs(tmp_path)
     out_path = tmp_path / "out.ninfer"
     assert reencode_nvfp4.main(full_b(fixture, out_path, "--verify")) == 0
@@ -301,7 +302,7 @@ def test_rows_in_a_wrong_order_are_refused_against_the_base(tmp_path, misplaced,
     fixture = _build_inputs(tmp_path, misplaced=misplaced)
     kind, leaves = MISPLACED[misplaced]
     layer = next(layer for layer, role in ROLES.items() if role == kind)
-    with pytest.raises(reencode_nvfp4.ReencodeError,
+    with pytest.raises(ReencodeError,
                        match=rf"{OBJECTS[kind]}: relative RMS error 1\.\d+ against the base "
                              rf"object's values of text/layers/{layer}/{kind}/({leaves}) exceeds "
                              "--max-error 0.3"):
@@ -416,7 +417,7 @@ def test_input_projection_refusals_before_writing(tmp_path, monkeypatch, build, 
     arguments = full_b(fixture, tmp_path / "out.ninfer")
     if extra:
         arguments[arguments.index("--layers") + 1] = extra[1]
-    with pytest.raises(reencode_nvfp4.ReencodeError, match=match):
+    with pytest.raises(ReencodeError, match=match):
         reencode_nvfp4.main(arguments)
 
 
