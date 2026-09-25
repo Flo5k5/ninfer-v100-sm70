@@ -701,6 +701,9 @@ def test_converts_an_fp8_layer_to_calibrated_nvfp4(tmp_path) -> None:
         assert converted.format == "nvfp4"
         assert converted.layout == NVFP4_LAYOUT
         assert tuple(converted.shape) == (DOWN_ROWS, INTERMEDIATE)
+        # A conversion switches the recipe so the engine resolves the full-a weights profile.
+        assert out.directory.provenance["recipe"] == "qwen3_8_27b_nvfp4-full-a"
+        assert out.directory.provenance["reencode"]["base_recipe"] == "qwen3_8_27b_nvfp4"
     codes, scales, divisor, _ = _words(out_path, "weight/000003", (DOWN_ROWS, INTERMEDIATE))
     local = fixture.weights[source + "down_proj.weight"].float()
     divisor_word = DIVISOR_WORDS[DOWN_SCALE_2[1]]

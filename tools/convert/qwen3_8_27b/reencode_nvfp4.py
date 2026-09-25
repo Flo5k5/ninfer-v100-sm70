@@ -265,11 +265,20 @@ def _record(arguments, base: Artifact, targets: Sequence[Target], removed: list[
     return record
 
 
+FULL_A_RECIPE = "qwen3_8_27b_nvfp4-full-a"
+
+
 def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Encoder) -> dict:
     directory = base.directory
     provenance, removed = strip_local_paths(directory.provenance)
     record = _record(arguments, base, targets, removed)
     provenance["reencode"] = record
+    if any(target.converts for target in targets):
+        # Layers 56-63 leave as NVFP4: the engine resolves the weights profile from the
+        # recipe, and only the full-a profile binds those layers as NVFP4.
+        if provenance.get("recipe") != FULL_A_RECIPE:
+            record["base_recipe"] = provenance.get("recipe")
+            provenance["recipe"] = FULL_A_RECIPE
     by_id = {target.object_id: target for target in targets}
     started = time.perf_counter()
     writer = ArtifactWriter(
