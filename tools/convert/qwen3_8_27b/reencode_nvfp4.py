@@ -64,6 +64,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import struct
 import sys
 import time
 from typing import Iterator, Sequence
@@ -228,8 +229,8 @@ class Encoder:
             row += item.rows
 
 
-def _specs(base: Artifact, targets: Sequence["Target"]) -> list:
-    """Output specs: the base's, with every converted target's object switched to NVFP4."""
+def _specs(base: Artifact, targets: Sequence["Target"], aux_values: dict | None = None) -> list:
+    """Output specs: the base's, converted targets switched to NVFP4, plus divisor auxes."""
     converted = {t.object_id: t for t in targets if t.converts}
     specs = []
     for obj in base.objects:
@@ -241,7 +242,58 @@ def _specs(base: Artifact, targets: Sequence["Target"]) -> list:
                 specs.append(TensorSpec(obj.id, tuple(obj.shape), obj.format, obj.layout))
         else:
             specs.append(ResourceSpec(obj.id, obj.bytes, obj.encoding))
+    for aux_id in aux_values or {}:
+        specs.append(TensorSpec(aux_id, (), AUX_FORMAT, AUX_LAYOUT))
     return specs
+
+
+def _neighbor_divisor(base: Artifact, parameter: str) -> tuple[float, str]:
+    """Input divisor of the same MLP leaf in the nearest calibrated NVFP4 layer below."""
+    import re as _re
+    match = _re.match(r"^text/layers/(\d+)/mlp/(gate|up|down)$", parameter)
+    if not match:
+        return 1.0, "unit placeholder"
+    layer, leaf = int(match.group(1)), match.group(2)
+    for candidate in range(layer - 1, -1, -1):
+        name = f"text/layers/{candidate}/mlp/{leaf}"
+        for use in base.directory.uses:
+            aux = use.get("auxiliaries", {}).get(DIVISOR_ROLE)
+            if use["parameter"] == name and aux is not None:
+                (value,) = struct.unpack("<f", base.read_object(aux["object"]))
+                return value, f"copied from {name}"
+    raise ReencodeError(f"{parameter}: no calibrated NVFP4 neighbor for the input divisor")
+
+
+def _plan_conversion_uses(base: Artifact, targets: Sequence["Target"]):
+    """Uses of the output: converted MLP leaves gain AllowA4 and an activation input divisor
+    auxiliary copied from the nearest calibrated NVFP4 layer, as the full-a loader expects."""
+    import copy as _copy
+    aux_numbers = [int(obj.id.split("/")[1]) for obj in base.objects
+                   if obj.id.startswith("auxiliary/") and obj.id.split("/")[1].isdigit()]
+    next_number = max(aux_numbers, default=-1) + 1
+    converted_params = {logical for target in targets if target.converts
+                        for logical in target.parameters}
+    aux_values: dict[str, float] = {}
+    aux_labels: dict[str, str] = {}
+    shared: dict[str, str] = {}
+    uses = []
+    for use in base.directory.uses:
+        use = _copy.deepcopy(use)
+        parameter = use["parameter"]
+        if parameter in converted_params:
+            aux_id = shared.get(parameter)
+            if aux_id is None:
+                aux_id = f"auxiliary/{next_number:06d}"
+                next_number += 1
+                value, label = _neighbor_divisor(base, parameter)
+                aux_values[aux_id] = value
+                aux_labels[aux_id] = f"{parameter}: {label}"
+                shared[parameter] = aux_id
+            use["activation_policy"] = "AllowA4"
+            if DIVISOR_ROLE not in use.get("auxiliaries", {}):
+                use.setdefault("auxiliaries", {})[DIVISOR_ROLE] = {"object": aux_id}
+        uses.append(use)
+    return aux_values, aux_labels, uses
 
 
 def _record(arguments, base: Artifact, targets: Sequence[Target], removed: list[str]) -> dict:
@@ -268,6 +320,11 @@ def _record(arguments, base: Artifact, targets: Sequence[Target], removed: list[
 FULL_A_RECIPE = "qwen3_8_27b_nvfp4-full-a"
 
 
+DIVISOR_ROLE = "activation_input_divisor"
+AUX_FORMAT = "fp32"
+AUX_LAYOUT = "contiguous_le_v1"
+
+
 def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Encoder) -> dict:
     directory = base.directory
     provenance, removed = strip_local_paths(directory.provenance)
@@ -279,14 +336,17 @@ def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Enco
         if provenance.get("recipe") != FULL_A_RECIPE:
             record["base_recipe"] = provenance.get("recipe")
             provenance["recipe"] = FULL_A_RECIPE
+    aux_values, aux_labels, uses = _plan_conversion_uses(base, targets)
+    if aux_labels:
+        record["activation_input_divisors"] = aux_labels
     by_id = {target.object_id: target for target in targets}
     started = time.perf_counter()
     writer = ArtifactWriter(
         arguments.out,
-        _specs(base, targets),
+        _specs(base, targets, aux_values),
         components=directory.components,
         bindings=directory.bindings,
-        uses=directory.uses,
+        uses=uses,
         metadata=directory.metadata,
         provenance=provenance,
     )
@@ -308,6 +368,8 @@ def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Enco
                   f"vs_base={report['relative_rms_error_vs_base']:.5f}"
                   f"{'' if error is None else f' vs_weights={error:.5f}'} ({report['seconds']}s)",
                   flush=True)
+        for aux_id, value in aux_values.items():
+            writer.write_object(aux_id, struct.pack("<f", value))
         writer.finish()
     except BaseException:
         writer.abort()

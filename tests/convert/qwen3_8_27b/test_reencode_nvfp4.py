@@ -704,6 +704,12 @@ def test_converts_an_fp8_layer_to_calibrated_nvfp4(tmp_path) -> None:
         # A conversion switches the recipe so the engine resolves the full-a weights profile.
         assert out.directory.provenance["recipe"] == "qwen3_8_27b_nvfp4-full-a"
         assert out.directory.provenance["reencode"]["base_recipe"] == "qwen3_8_27b_nvfp4"
+        # Converted leaves carry AllowA4 and an activation input divisor auxiliary.
+        down_use = next(use for use in out.directory.uses
+                        if use["parameter"] == "text/layers/1/mlp/down")
+        assert down_use["activation_policy"] == "AllowA4"
+        aux_id = down_use["auxiliaries"]["activation_input_divisor"]["object"]
+        assert out.object(aux_id).format == "fp32"
     codes, scales, divisor, _ = _words(out_path, "weight/000003", (DOWN_ROWS, INTERMEDIATE))
     local = fixture.weights[source + "down_proj.weight"].float()
     divisor_word = DIVISOR_WORDS[DOWN_SCALE_2[1]]
