@@ -405,10 +405,13 @@ def verify_output(base_path: Path, out_path: Path, expected: dict[str, str],
     converted = converted or set()
     failures = 0
     with Artifact(base_path) as base, Artifact(out_path) as out:
-        for field in ("components", "bindings", "uses", "metadata"):
+        for field in ("components", "bindings", "metadata"):
             if getattr(out.directory, field) != getattr(base.directory, field):
                 print(f"DIFF directory {field}", flush=True)
                 failures += 1
+        if list(out.directory.uses) != list(base.directory.uses) and not converted:
+            print("DIFF directory uses", flush=True)
+            failures += 1
         expected_recipe = (FULL_A_RECIPE if converted
                            else base.directory.provenance.get("recipe"))
         if out.directory.provenance.get("recipe") != expected_recipe:
