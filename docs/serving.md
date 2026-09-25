@@ -890,7 +890,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-response-store` | retain no Responses; see [Zero data retention](#zero-data-retention) | store on |
 | `--no-structured-output` | build no grammar compiler and reject constrained requests; see [Structured output](#structured-output) | on |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
-| `--text-residual bf16\|fp32` | text residual stream storage; `fp32` on Volta for Qwen3.8-27B `nvfp4`, `nvfp4-full-a` and `nvfp4-full-b` without DFlash | `bf16` |
+| `--text-residual bf16\|fp32` | text residual stream storage; `fp32` on Volta for Qwen3.8-27B `nvfp4`, `nvfp4-full-a`, `nvfp4-full-b` and `nvfp4-full-c` without DFlash | `bf16` |
 | `--prefill-attention auto\|splitd\|flash\|reference` | Volta wide prefill attention kernel | `auto` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..7`; DFlash/DFlash2 `1..15` | unset |
