@@ -318,9 +318,24 @@ def test_a_small_misplaced_parameter_is_not_diluted_in_its_object(tmp_path) -> N
     entry = next(item for item in _report(tmp_path)["objects"]
                  if item["object"] == OBJECTS["attention"])
     by_parameter = entry["relative_rms_error_vs_base_by_parameter"]
-    assert entry["relative_rms_error_vs_base"] < 0.3
+    assert 0.2 < entry["relative_rms_error_vs_base"] < 0.3
     assert min(by_parameter["text/layers/1/attention/key"],
                by_parameter["text/layers/1/attention/value"]) > 1.0
+
+
+def test_provenance_records_each_role_s_layers(tmp_path) -> None:
+    """--layers 1: layer 0's MLP is NVFP4 and keeps its words, the input projections of both
+    layers convert, and the record keeps the two lists apart."""
+
+    fixture = _build_inputs(tmp_path)
+    arguments = full_b(fixture, tmp_path / "out.ninfer")
+    arguments[arguments.index("--layers") + 1] = "1"
+    assert reencode_nvfp4.main(arguments) == 0
+    with Artifact(tmp_path / "out.ninfer") as out:
+        record = out.directory.provenance["reencode"]
+        assert out.directory.provenance["recipe"] == FULL_B
+    assert record["mlp_layers"] == [1] and record["output_head"] is True
+    assert record["input_donor"] == {"label": INPUT_LABEL, "layers": [0, 1]}
 
 
 def _edit_input_donor(name: str, value):
