@@ -342,7 +342,8 @@ def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path, monkeypatch,
     report = _report(tmp_path)
     assert report["verified"] is True
     assert report["recipe"] == "qwen3_8_27b_nvfp4"
-    assert report["reencode"]["layers"] == list(LAYERS)
+    assert report["reencode"]["mlp_layers"] == list(LAYERS)
+    assert report["reencode"]["output_head"] is False
     assert report["inexact_divisors"] == (1 if layout == "modelopt" else 0)
     entries = {item["object"]: item for item in report["objects"]}
     donor_sha256, weights_sha256 = _stored_sha256(fixture.donor_dir), _stored_sha256(
@@ -388,6 +389,9 @@ def test_reencodes_mlp_objects_and_copies_everything_else(tmp_path, monkeypatch,
             assert entry["divisor_exact"] is (
                 layout != "modelopt" or _scale_2_word(layer, names[0]) not in INEXACT_SCALES_2)
             assert entry["relative_rms_error_vs_base"] < 0.3
+            by_parameter = entry["relative_rms_error_vs_base_by_parameter"]
+            assert list(by_parameter) == entry["parameters"]
+            assert max(by_parameter.values()) < 0.3
             assert entry["relative_rms_error_vs_weights"] < 0.2
             tensors = [source + name + suffix for name in names for suffix in DONOR_SUFFIXES[layout]]
             assert entry["donor_sha256"] == {name: donor_sha256[name] for name in tensors}
@@ -652,7 +656,9 @@ def test_verify_rejects_corrupted_copied_and_reencoded_objects(tmp_path) -> None
     assert reencode_nvfp4.main(_arguments(fixture, out_path, "--round", "down",
                                           weights=True)) == 0
     expected = {item["object"]: item["payload_sha256"] for item in _report(tmp_path)["objects"]}
-    keywords = {"converted": {}, "recipe": "qwen3_8_27b_nvfp4"}
+    with Artifact(fixture.base) as base:
+        keywords = {"converted": {}, "uses": list(base.directory.uses),
+                    "recipe": "qwen3_8_27b_nvfp4"}
     assert reencode_nvfp4.verify_output(fixture.base, out_path, expected, **keywords) == 0
     for object_id in ("weight/head", "weight/000001"):
         with Artifact(out_path) as out:

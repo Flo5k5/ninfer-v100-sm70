@@ -232,7 +232,7 @@ def _weight_base(source: str) -> str:
     return source[: -len(".weight")]
 
 
-def _select_rows(tensor: torch.Tensor, rows: tuple[tuple[int, int], ...] | None) -> torch.Tensor:
+def select_rows(tensor: torch.Tensor, rows: tuple[tuple[int, int], ...] | None) -> torch.Tensor:
     if rows is None:
         return tensor
     pieces = [tensor[begin:end] for begin, end in rows]
@@ -303,7 +303,7 @@ class ObjectBuilder:
         dtype = self.source.dtype(matrix.source)
         if dtype != "BF16":
             raise GraftError(f"{matrix.source}: expected BF16 source, got {dtype or 'missing'}")
-        return _select_rows(self.source.get(matrix.source), matrix.rows)
+        return select_rows(self.source.get(matrix.source), matrix.rows)
 
     def _values(self, obj: TensorObject, parts: list[Part]) -> torch.Tensor:
         if obj.id.startswith("weight/") and parts[0].logical == "proposal/head":
@@ -346,9 +346,9 @@ class ObjectBuilder:
             if scales.dtype != torch.bfloat16 or scales.numel() != codes.shape[0]:
                 raise GraftError(f"{matrix.source}: FP8 channel scale signature mismatch")
             scales = scales.reshape(-1)
-            return _select_rows(codes, matrix.rows), _select_rows(scales, matrix.rows)
+            return select_rows(codes, matrix.rows), select_rows(scales, matrix.rows)
         if dtype == "BF16":
-            quantized = quantize_bf16_rows(_select_rows(self.source.get(matrix.source), matrix.rows))
+            quantized = quantize_bf16_rows(select_rows(self.source.get(matrix.source), matrix.rows))
             return quantized.codes, quantized.scales
         raise GraftError(f"{matrix.source}: no FP8 route for source dtype {dtype or 'missing'}")
 
@@ -400,9 +400,9 @@ class ObjectBuilder:
             base = _weight_base(matrix.source)
             if self.source.dtype(base + ".weight_packed") != "U8":
                 raise GraftError(f"{base}: expected an NVFP4 source (weight_packed U8)")
-            packed.append(_select_rows(self.source.get(base + ".weight_packed"), matrix.rows))
+            packed.append(select_rows(self.source.get(base + ".weight_packed"), matrix.rows))
             scales.append(
-                _select_rows(self.source.get(base + ".weight_scale").view(torch.uint8), matrix.rows)
+                select_rows(self.source.get(base + ".weight_scale").view(torch.uint8), matrix.rows)
             )
             divisor = self.source.get(base + ".weight_global_scale")
             divisors.add(divisor.float().reshape(()).view(torch.int32).item() & 0xFFFFFFFF)

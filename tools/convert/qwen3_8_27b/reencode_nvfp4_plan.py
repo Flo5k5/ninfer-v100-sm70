@@ -47,7 +47,10 @@ DONOR_TENSORS = {
 # compressed-tensors stores the activation input divisor itself under this suffix.
 INPUT_GLOBAL_SCALE = ".input_global_scale"
 DIVISOR_ROLE = "activation_input_divisor"
+AUX_FORMAT = "fp32"
+AUX_LAYOUT = "contiguous_le_v1"
 OUTPUT_HEAD = "text/output_head"
+HEAD_ROLE = "output_head"
 # Leaves of the per-layer roles, in the row order of their object.
 MLP_ROLES = {"mlp/gate_up": ("mlp/gate", "mlp/up"), "mlp/down": ("mlp/down",)}
 # The fused input projections the engine binds as attention/query_key_gate_value and
@@ -307,7 +310,7 @@ def plan_targets(base: Artifact, layers: Sequence[int], rounded: set[str],
         # The full-a and full-b profiles bind the output head as NVFP4 too: convert it with the
         # donor's calibrated lm_head words (orca's head is the base model's, so the words
         # transpose as-is).
-        targets.append(_target(base, "output_head", -1, (OUTPUT_HEAD,), donor, weights, False))
+        targets.append(_target(base, HEAD_ROLE, -1, (OUTPUT_HEAD,), donor, weights, False))
     return targets
 
 
@@ -350,7 +353,7 @@ def _neighbor_divisor(base: Artifact, layer: int, leaf: str) -> tuple[float, str
 def _activation_divisor(base: Artifact, target: Target, parameter: str) -> tuple[float, str]:
     if target.role in INPUT_ROLES:
         return float(target.input_divisor), "input_global_scale of the input donor"
-    if target.role == "output_head":
+    if target.role == HEAD_ROLE:
         # As in full-a: the sm_70 routes run NVFP4 with 16-bit activations and never read it,
         # and the donor's head input scale (a ModelOpt input_scale) is not imported.
         return 1.0, "unit placeholder"
@@ -358,9 +361,17 @@ def _activation_divisor(base: Artifact, target: Target, parameter: str) -> tuple
                              parameter.removeprefix(f"text/layers/{target.layer}/"))
 
 
-def plan_uses(base: Artifact,
-              targets: Sequence[Target]) -> tuple[dict[str, float], dict[str, str], list[dict]]:
-    """Divisor values and labels of the new auxiliary objects, and the Uses of the output.
+@dataclass(frozen=True, slots=True)
+class UsesPlan:
+    """The Uses of the output and the auxiliary divisor objects they add."""
+
+    uses: list[dict]
+    divisors: dict[str, float]  # new auxiliary object id -> divisor
+    labels: dict[str, str]  # new auxiliary object id -> "parameter: where the divisor comes from"
+
+
+def plan_uses(base: Artifact, targets: Sequence[Target]) -> UsesPlan:
+    """The Uses of the output and the auxiliary divisor objects they add.
 
     Every Use of a converted leaf takes ``AllowA4`` and an activation input divisor auxiliary, as
     the full-a and full-b profiles require of NVFP4 leaves (a divisor the base Use has is kept);
@@ -378,14 +389,14 @@ def plan_uses(base: Artifact,
                                       if use["parameter"] in converted),
                         key=lambda parameter: converted[parameter].role in INPUT_ROLES)
     aux_ids: dict[str, str] = {}
-    aux_values: dict[str, float] = {}
-    aux_labels: dict[str, str] = {}
+    divisors: dict[str, float] = {}
+    labels: dict[str, str] = {}
     for number, parameter in enumerate(parameters, start=max(numbers, default=-1) + 1):
         aux_id = f"auxiliary/{number:06d}"
         value, label = _activation_divisor(base, converted[parameter], parameter)
         aux_ids[parameter] = aux_id
-        aux_values[aux_id] = value
-        aux_labels[aux_id] = f"{parameter}: {label}"
+        divisors[aux_id] = value
+        labels[aux_id] = f"{parameter}: {label}"
     uses = []
     for use in base.directory.uses:
         use = copy.deepcopy(use)
@@ -394,4 +405,4 @@ def plan_uses(base: Artifact,
             use["activation_policy"] = "AllowA4"
             use.setdefault("auxiliaries", {}).setdefault(DIVISOR_ROLE, {"object": aux_id})
         uses.append(use)
-    return aux_values, aux_labels, uses
+    return UsesPlan(uses, divisors, labels)

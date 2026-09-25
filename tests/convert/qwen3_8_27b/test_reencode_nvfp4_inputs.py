@@ -49,10 +49,19 @@ LEAVES = {
     "attention": (("query", 6144), ("key", 1024), ("gate", 6144), ("value", 1024)),
     "gdn": (("query", 2048), ("key", 2048), ("value", 6144), ("z", 6144)),
 }
+# The attention key and value rows have 0.4 times the norm of the others: swapped, they move so
+# little of their object's norm that the whole-object error stays under --max-error.
+SMALL_LEAVES = {("attention", "key"), ("attention", "value")}
 # (weight_global_scale, input_global_scale) shared by the donor matrices of each projection.
 SCALES = {"attention": (5120.5, 0.10498046875), "gdn": (6144.25, 0.1171875)}
 ROLES = {0: "gdn", 1: "attention"}
 OBJECTS = {"gdn": "weight/gdn0", "attention": "weight/attention1"}
+# Checkpoints that store an input projection in a wrong row order, and what each misplaces.
+MISPLACED = {
+    "naive q_proj": ("attention", "query|gate"),  # all query rows, then all gate rows
+    "swapped query and key": ("gdn", "query|key"),  # in_proj_qkv as key, query, value
+    "swapped key and value": ("attention", "key|value"),  # k_proj holds v_proj's rows
+}
 FULL_A, FULL_B = "qwen3_8_27b_nvfp4-full-a", "qwen3_8_27b_nvfp4-full-b"
 
 
@@ -65,19 +74,19 @@ class InputFixture:
 
 
 def _hf_matrices(kind: str, leaves: dict[str, torch.Tensor],
-                 misplaced: bool) -> dict[str, torch.Tensor]:
-    """One layer's input projection as the checkpoint stores it; ``misplaced`` stores it in a
-    wrong row order: q_proj as all query rows then all gate rows, in_proj_qkv as key, query."""
+                 misplaced: str | None) -> dict[str, torch.Tensor]:
+    """One layer's input projection as the checkpoint stores it, or as ``misplaced`` stores it."""
 
     if kind == "attention":
-        if misplaced:
+        if misplaced == "naive q_proj":
             q_proj = torch.cat([leaves["query"], leaves["gate"]])
         else:
             q_proj = torch.stack([leaves["query"].reshape(HEADS, HEAD_ROWS, -1),
                                   leaves["gate"].reshape(HEADS, HEAD_ROWS, -1)], dim=1)
+        key, value = ("value", "key") if misplaced == "swapped key and value" else ("key", "value")
         return {"self_attn.q_proj": q_proj.reshape(2 * HEADS * HEAD_ROWS, -1),
-                "self_attn.k_proj": leaves["key"], "self_attn.v_proj": leaves["value"]}
-    first, second = ("key", "query") if misplaced else ("query", "key")
+                "self_attn.k_proj": leaves[key], "self_attn.v_proj": leaves[value]}
+    first, second = ("key", "query") if misplaced == "swapped query and key" else ("query", "key")
     return {"linear_attn.in_proj_qkv": torch.cat([leaves[first], leaves[second],
                                                    leaves["value"]]),
             "linear_attn.in_proj_z": leaves["z"]}
@@ -93,40 +102,56 @@ def _object_rows(kind: str, matrices: dict[str, torch.Tensor]) -> torch.Tensor:
     return torch.cat([matrices["linear_attn.in_proj_qkv"], matrices["linear_attn.in_proj_z"]])
 
 
-def _build_inputs(tmp_path, *, roles=None, misplaced: str | None = None) -> InputFixture:
+def specs_of(artifact: Artifact, shapes: dict[str, tuple[int, ...]] | None = None) -> list:
+    """Specs of an artifact's objects, with some tensor shapes replaced."""
+
+    return [TensorSpec(obj.id, tuple((shapes or {}).get(obj.id, obj.shape)), obj.format,
+                       obj.layout) if isinstance(obj, TensorObject)
+            else ResourceSpec(obj.id, obj.bytes, obj.encoding) for obj in artifact.objects]
+
+
+def _build_inputs(tmp_path, *, roles=None, misplaced: str | None = None,
+                  order: tuple[str, ...] | None = None, short: str | None = None) -> InputFixture:
     """The MLP fixture (layer 1's down in FP8) plus FP8 input projections placed first, as in
-    the real artifact, their Uses first too, and the compressed-tensors input donor."""
+    the real artifact, their Uses first too, and the compressed-tensors input donor.
+
+    ``order`` stores and binds the attention leaves in another row order; ``short`` (a leaf such
+    as ``gdn/z``) leaves its binding's last row unbound."""
 
     fixture = _build(tmp_path, layer1_down_format="fp8")
     generator = torch.Generator().manual_seed(11)
     with Artifact(fixture.base) as base:
         directory = base.directory
-        specs = [TensorSpec(obj.id, tuple(obj.shape), obj.format, obj.layout)
-                 if isinstance(obj, TensorObject) else ResourceSpec(obj.id, obj.bytes, obj.encoding)
-                 for obj in base.objects]
+        specs = specs_of(base)
         payloads = {obj.id: base.read_object(obj.id) for obj in base.objects}
         bindings, uses = dict(directory.bindings), list(directory.uses)
     donor, expected, input_specs, input_uses = {}, {}, [], []
     for layer, kind in (ROLES if roles is None else roles).items():
         object_id = OBJECTS[kind]
-        leaves = {name: (torch.randn(rows, HIDDEN, generator=generator) * 0.02).to(torch.bfloat16)
+        leaves = {name: (torch.randn(rows, HIDDEN, generator=generator) * 0.02
+                         * (0.4 if (kind, name) in SMALL_LEAVES else 1.0)).to(torch.bfloat16)
                   for name, rows in LEAVES[kind]}
-        values = torch.cat([leaves[name] for name, _ in LEAVES[kind]])
+        stored = order if kind == "attention" and order else [name for name, _ in LEAVES[kind]]
+        values = torch.cat([leaves[name] for name in stored])
         fp8 = quantize_bf16_rows(values)
         payloads[object_id] = encode_fp8_row_scaled(fp8.codes, fp8.scales, tuple(values.shape))
         input_specs.append(TensorSpec(object_id, tuple(values.shape), "fp8_e4m3fn_row_bf16",
                                       "row_scale_v1"))
         cursor = 0
-        for name, rows in LEAVES[kind]:
+        for name in stored:
             parameter = f"text/layers/{layer}/{kind}/{name}"
-            bindings[parameter] = {"parts": [{"object": object_id,
-                                              "range": [cursor, cursor + rows * HIDDEN]}]}
-            cursor += rows * HIDDEN
-            input_uses.append({"parameter": parameter, "input": f"text/layers/{layer}/mixer_input",
+            end = cursor + leaves[name].shape[0] * HIDDEN
+            bindings[parameter] = {"parts": [{"object": object_id, "range": [
+                cursor, end - HIDDEN if short == f"{kind}/{name}" else end]}]}
+            cursor = end
+        for name, _ in LEAVES[kind]:
+            input_uses.append({"parameter": f"text/layers/{layer}/{kind}/{name}",
+                               "input": f"text/layers/{layer}/mixer_input",
                                "activation_policy": "AllowA8"})
         weight_scale, input_scale = SCALES[kind]
         codes, words = {}, {}
-        for suffix, matrix in _hf_matrices(kind, leaves, misplaced == kind).items():
+        wrong = misplaced if misplaced and MISPLACED[misplaced][0] == kind else None
+        for suffix, matrix in _hf_matrices(kind, leaves, wrong).items():
             module = f"model.language_model.layers.{layer}.{suffix}"
             shift = torch.randint(-1, 5, (matrix.shape[0], HIDDEN // 16), generator=generator,
                                   dtype=torch.int16)
@@ -155,10 +180,11 @@ def _build_inputs(tmp_path, *, roles=None, misplaced: str | None = None) -> Inpu
     return InputFixture(replace(fixture, base=path), donor_dir, donor, expected)
 
 
-def _full_b(fixture: InputFixture, out_path: Path, *extra: str) -> list[str]:
-    return _arguments(fixture.mlp, out_path, "--layers", "0-1", "--round", "down",
+def full_b(fixture: InputFixture, out_path: Path, *extra: str, weights: bool = True) -> list[str]:
+    rounding = ("--round", "down") if weights else ()
+    return _arguments(fixture.mlp, out_path, "--layers", "0-1", *rounding,
                       "--input-donor", str(fixture.donor_dir), "--input-donor-label", INPUT_LABEL,
-                      *extra, weights=True)
+                      *extra, weights=weights)
 
 
 def _divisor_uses(out: Artifact) -> dict[str, tuple[str, str, int]]:
@@ -179,19 +205,20 @@ def test_full_b_converts_the_input_projections_with_the_input_donor_words(tmp_pa
     monkeypatch.setattr(reencode_nvfp4, "ROW_CHUNK", 100)
     fixture = _build_inputs(tmp_path)
     out_path = tmp_path / "out.ninfer"
-    assert reencode_nvfp4.main(_full_b(fixture, out_path, "--verify")) == 0
+    assert reencode_nvfp4.main(full_b(fixture, out_path, "--verify")) == 0
     report = _report(tmp_path)
     assert report["verified"] is True and report["recipe"] == FULL_B
     with Artifact(out_path) as out:
-        provenance = out.directory.provenance
-        assert provenance["recipe"] == FULL_B
-        assert provenance["reencode"]["base_recipe"] == "qwen3_8_27b_nvfp4"
-        assert provenance["reencode"]["input_donor"] == {"label": INPUT_LABEL}
+        record = out.directory.provenance["reencode"]
+        assert out.directory.provenance["recipe"] == FULL_B
+        assert record["base_recipe"] == "qwen3_8_27b_nvfp4"
+        assert record["input_donor"] == {"label": INPUT_LABEL, "layers": [0, 1]}
+        assert record["mlp_layers"] == [0, 1] and record["output_head"] is True
         divisors = _divisor_uses(out)
-        for kind, object_id in OBJECTS.items():
-            obj = out.object(object_id)
-            assert (obj.format, obj.layout) == ("nvfp4", NVFP4_LAYOUT)
-        labels = provenance["reencode"]["activation_input_divisors"]
+        for object_id in OBJECTS.values():
+            assert (out.object(object_id).format, out.object(object_id).layout) == (
+                "nvfp4", NVFP4_LAYOUT)
+        labels = record["activation_input_divisors"]
     entries = {item["object"]: item for item in report["objects"]}
     stored = _stored_sha256(fixture.mlp.weights_dir)
     for layer, kind in ROLES.items():
@@ -213,7 +240,8 @@ def test_full_b_converts_the_input_projections_with_the_input_donor_words(tmp_pa
             f"{parameter}: input_global_scale of the input donor" for parameter in parameters}
         entry = entries[object_id]
         assert entry["role"] == f"{kind}/input" and entry["codes"] == "donor"
-        assert entry["relative_rms_error_vs_base"] < 0.3
+        assert list(entry["relative_rms_error_vs_base_by_parameter"]) == parameters
+        assert max(entry["relative_rms_error_vs_base_by_parameter"].values()) < 0.3
         assert entry["relative_rms_error_vs_weights"] < 0.2
         assert entry["codes_equal_to_rounded_weights"] == 1.0
         module = f"model.language_model.layers.{layer}."
@@ -239,16 +267,17 @@ def test_full_b_is_full_a_plus_the_input_projections(tmp_path) -> None:
     full_a_path, full_b_path = tmp_path / "full-a.ninfer", tmp_path / "full-b.ninfer"
     assert reencode_nvfp4.main(_arguments(fixture.mlp, full_a_path, "--layers", "0-1", "--round",
                                           "down", weights=True)) == 0
-    assert reencode_nvfp4.main(_full_b(fixture, full_b_path)) == 0
+    assert reencode_nvfp4.main(full_b(fixture, full_b_path)) == 0
     inputs = set(OBJECTS.values())
-    with Artifact(full_a_path) as full_a, Artifact(full_b_path) as full_b:
+    with Artifact(full_a_path) as full_a, Artifact(full_b_path) as full_b_out:
         assert full_a.directory.provenance["recipe"] == FULL_A
-        a_ids, b_ids = [obj.id for obj in full_a.objects], [obj.id for obj in full_b.objects]
+        assert "input_donor" not in full_a.directory.provenance["reencode"]
+        a_ids, b_ids = [obj.id for obj in full_a.objects], [obj.id for obj in full_b_out.objects]
         assert b_ids[:len(a_ids)] == a_ids
         for object_id in a_ids:
             if object_id not in inputs:
-                assert full_b.read_object(object_id) == full_a.read_object(object_id), object_id
-        a_divisors, b_divisors = _divisor_uses(full_a), _divisor_uses(full_b)
+                assert full_b_out.read_object(object_id) == full_a.read_object(object_id)
+        a_divisors, b_divisors = _divisor_uses(full_a), _divisor_uses(full_b_out)
         assert {parameter: b_divisors[parameter] for parameter in a_divisors} == a_divisors
         new = {aux for parameter, (_, aux, _) in b_divisors.items() if parameter not in a_divisors}
         assert set(b_ids[len(a_ids):]) == new and len(new) == 8
@@ -257,23 +286,41 @@ def test_full_b_is_full_a_plus_the_input_projections(tmp_path) -> None:
         assert all(word != _word(1.0) for parameter, (_, _, word) in b_divisors.items()
                    if parameter not in a_divisors)
         a_uses = {(use["parameter"], use["input"]): use for use in full_a.directory.uses}
-        for use in full_b.directory.uses:
+        for use in full_b_out.directory.uses:
             if "/attention/" not in use["parameter"] and "/gdn/" not in use["parameter"]:
                 assert a_uses[(use["parameter"], use["input"])] == use
 
 
-@pytest.mark.parametrize("misplaced", ["attention", "gdn"])
-def test_rows_in_a_wrong_order_are_refused_against_the_base(tmp_path, misplaced) -> None:
-    """vs_base blocking regression: rows taken in a wrong order (a naive q_proj, swapped query and
-    key) match --weights stored the same way, so only the base comparison can refuse them; it
-    was reported but not enforced for converted objects."""
+@pytest.mark.parametrize("weights", [True, False])
+@pytest.mark.parametrize("misplaced", list(MISPLACED))
+def test_rows_in_a_wrong_order_are_refused_against_the_base(tmp_path, misplaced, weights) -> None:
+    """vs_base blocking regression: rows taken in a wrong order match --weights stored the same
+    way, so only the base comparison can refuse them; it was reported but not enforced for
+    converted objects, and is now made per parameter."""
 
     fixture = _build_inputs(tmp_path, misplaced=misplaced)
+    kind, leaves = MISPLACED[misplaced]
+    layer = next(layer for layer, role in ROLES.items() if role == kind)
     with pytest.raises(reencode_nvfp4.ReencodeError,
-                       match=rf"{OBJECTS[misplaced]}: relative RMS error \d\.\d+ against the base "
-                             "object's values exceeds --max-error 0.3"):
-        reencode_nvfp4.main(_full_b(fixture, tmp_path / "out.ninfer"))
+                       match=rf"{OBJECTS[kind]}: relative RMS error 1\.\d+ against the base "
+                             rf"object's values of text/layers/{layer}/{kind}/({leaves}) exceeds "
+                             "--max-error 0.3"):
+        reencode_nvfp4.main(full_b(fixture, tmp_path / "out.ninfer", weights=weights))
     _assert_nothing_written(tmp_path)
+
+
+def test_a_small_misplaced_parameter_is_not_diluted_in_its_object(tmp_path) -> None:
+    """The key and value rows are 1/7 of the attention object and have 0.4 times the norm of
+    the others: swapped, the whole object stays under 0.3, the swapped parameters do not."""
+
+    fixture = _build_inputs(tmp_path, misplaced="swapped key and value")
+    assert reencode_nvfp4.main(full_b(fixture, tmp_path / "out.ninfer", "--max-error", "5")) == 0
+    entry = next(item for item in _report(tmp_path)["objects"]
+                 if item["object"] == OBJECTS["attention"])
+    by_parameter = entry["relative_rms_error_vs_base_by_parameter"]
+    assert entry["relative_rms_error_vs_base"] < 0.3
+    assert min(by_parameter["text/layers/1/attention/key"],
+               by_parameter["text/layers/1/attention/value"]) > 1.0
 
 
 def _edit_input_donor(name: str, value):
@@ -305,6 +352,7 @@ def _grow_rows(module: str, rows: int):
 
 ATTENTION = "model.language_model.layers.1.self_attn."
 GDN = "model.language_model.layers.0.linear_attn."
+UNTILED = "do not tile it in this order"
 
 
 @pytest.mark.parametrize(
@@ -330,6 +378,12 @@ GDN = "model.language_model.layers.0.linear_attn."
         ({}, _grow_rows(ATTENTION + "k_proj", 2048), (),
          "weight/attention1: donor matrices have 2048 rows for text/layers/1/attention/key, "
          "object has 1024"),
+        # The base stores and binds attention as [query | gate | key | value].
+        ({"order": ("query", "gate", "key", "value")}, None, (),
+         f"weight/attention1: .* {UNTILED}"),
+        # A one-row gap between the query and key bindings, then after the last binding.
+        ({"short": "gdn/query"}, None, (), f"weight/gdn0: .* {UNTILED}"),
+        ({"short": "gdn/z"}, None, (), f"weight/gdn0: .* {UNTILED}"),
         # Layer 1 keeps its FP8 down projection: full-b binds every MLP layer as NVFP4.
         ({}, None, ("--layers", "0"), r"text MLP layers \[1\] would stay FP8"),
         ({"roles": {1: "attention"}}, None, (), "text layer 0 binds 0 input projections, not one"),
@@ -344,7 +398,7 @@ def test_input_projection_refusals_before_writing(tmp_path, monkeypatch, build, 
     if mutate is not None:
         mutate(fixture)
     monkeypatch.setattr(reencode_nvfp4, "ArtifactWriter", no_writer)
-    arguments = _full_b(fixture, tmp_path / "out.ninfer")
+    arguments = full_b(fixture, tmp_path / "out.ninfer")
     if extra:
         arguments[arguments.index("--layers") + 1] = extra[1]
     with pytest.raises(reencode_nvfp4.ReencodeError, match=match):
@@ -366,38 +420,3 @@ def test_input_donor_arguments(tmp_path, options) -> None:
         reencode_nvfp4.main(_arguments(fixture.mlp, tmp_path / "out.ninfer", "--layers", "0-1",
                                        *resolved))
     _assert_nothing_written(tmp_path)
-
-
-def test_verify_expects_the_recipe_and_uses_of_the_conversion(tmp_path) -> None:
-    fixture = _build_inputs(tmp_path)
-    out_path = tmp_path / "out.ninfer"
-    assert reencode_nvfp4.main(_full_b(fixture, out_path)) == 0
-    report = _report(tmp_path)
-    expected = {item["object"]: item["payload_sha256"]
-                for item in (*report["objects"], *report["auxiliaries"])}
-    with Artifact(fixture.mlp.base) as base:
-        converted = {item["object"]: tuple(item["parameters"]) for item in report["objects"]
-                     if base.object(item["object"]).format != "nvfp4"}
-    assert set(converted) == {*OBJECTS.values(), "weight/000003", "weight/head"}
-
-    def verify(expected=expected, converted=converted, recipe=FULL_B) -> int:
-        return reencode_nvfp4.verify_output(fixture.mlp.base, out_path, expected,
-                                            converted=converted, recipe=recipe)
-
-    assert verify() == 0
-    assert verify(recipe=FULL_A) == 1
-    # Without the conversion plan, the new records and Uses of the input projections differ.
-    assert verify(converted={key: value for key, value in converted.items()
-                             if key not in OBJECTS.values()}) == 1
-    # An auxiliary object that nothing planned is refused.
-    aux = report["auxiliaries"][-1]["object"]
-    assert verify(expected={key: value for key, value in expected.items() if key != aux}) == 1
-    # A corrupted input divisor is refused.
-    with Artifact(out_path) as out:
-        offset = out.payload_offset + out.object(aux).offset
-    with out_path.open("r+b") as handle:
-        handle.seek(offset)
-        byte = handle.read(1)[0]
-        handle.seek(offset)
-        handle.write(bytes([byte ^ 0x01]))
-    assert verify() == 1

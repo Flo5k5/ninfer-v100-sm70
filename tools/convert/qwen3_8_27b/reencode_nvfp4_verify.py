@@ -1,10 +1,11 @@
 """Re-read a ``reencode_nvfp4`` output and compare it with the written payloads and the base.
 
 The output must keep the base's components, bindings and metadata, carry the recipe of its
-conversion, and hold, for every object, the payload the tool wrote (re-encoded objects and new
-auxiliary objects) or the base's bytes (everything else). Converted objects change format and
-layout only, and the Uses of their leaves change only by taking ``AllowA4`` and an activation
-input divisor; every other record and Use is the base's.
+conversion and the planned Uses, and hold, for every object, the payload the tool wrote
+(re-encoded objects and new FP32 scalar auxiliary objects) or the base's bytes (everything else).
+Converted objects change format and layout only, and the planned Uses of their leaves differ from
+the base's only by ``AllowA4`` and an activation input divisor; every other record and Use is the
+base's.
 """
 
 from __future__ import annotations
@@ -14,7 +15,14 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from tools.artifact.reader import Artifact
-from tools.convert.qwen3_8_27b.reencode_nvfp4_plan import DIVISOR_ROLE, NVFP4_FORMAT, NVFP4_LAYOUT
+from tools.artifact.schema import TensorObject
+from tools.convert.qwen3_8_27b.reencode_nvfp4_plan import (
+    AUX_FORMAT,
+    AUX_LAYOUT,
+    DIVISOR_ROLE,
+    NVFP4_FORMAT,
+    NVFP4_LAYOUT,
+)
 
 
 def _digest(chunks: Iterable[bytes]) -> str:
@@ -24,14 +32,14 @@ def _digest(chunks: Iterable[bytes]) -> str:
     return digest.hexdigest()
 
 
-def _expected_uses(base_uses: Sequence[dict], out_uses: Sequence[dict],
+def _expected_uses(base_uses: Sequence[dict], planned_uses: Sequence[dict],
                    converted_parameters: set[str]) -> list[dict]:
-    """The base's Uses as a conversion leaves them, taking the divisor objects the output names."""
+    """The base's Uses as a conversion leaves them, with the divisor objects of the plan."""
 
     expected = []
-    for base_use, out_use in zip(base_uses, out_uses):
+    for base_use, planned_use in zip(base_uses, planned_uses):
         if base_use["parameter"] in converted_parameters:
-            divisor = out_use.get("auxiliaries", {}).get(DIVISOR_ROLE)
+            divisor = planned_use.get("auxiliaries", {}).get(DIVISOR_ROLE)
             base_use = {**base_use, "activation_policy": "AllowA4",
                         "auxiliaries": {**base_use.get("auxiliaries", {}), DIVISOR_ROLE: divisor}}
         expected.append(base_use)
@@ -45,12 +53,14 @@ def _record(obj) -> dict:
 
 
 def verify_output(base_path: Path, out_path: Path, expected: Mapping[str, str], *,
-                  converted: Mapping[str, Sequence[str]], recipe: str) -> int:
+                  converted: Mapping[str, Sequence[str]], uses: Sequence[dict],
+                  recipe: str) -> int:
     """0 when the output holds the written payloads, Uses and recipe and all else is the base's.
 
     ``expected`` maps every object the tool wrote (re-encoded objects and new auxiliary objects)
     to its payload SHA-256; ``converted`` maps the objects converted from another format to their
-    parameters; ``recipe`` is the recipe the output must carry."""
+    parameters; ``uses`` are the planned Uses of the output; ``recipe`` is the recipe the output
+    must carry."""
 
     converted_parameters = {parameter for parameters in converted.values()
                             for parameter in parameters}
@@ -60,9 +70,9 @@ def verify_output(base_path: Path, out_path: Path, expected: Mapping[str, str], 
             if getattr(out.directory, field) != getattr(base.directory, field):
                 print(f"DIFF directory {field}", flush=True)
                 failures += 1
-        base_uses, out_uses = list(base.directory.uses), list(out.directory.uses)
-        if len(out_uses) != len(base_uses) or \
-                out_uses != _expected_uses(base_uses, out_uses, converted_parameters):
+        base_uses, planned = list(base.directory.uses), list(uses)
+        if len(planned) != len(base_uses) or list(out.directory.uses) != planned or \
+                planned != _expected_uses(base_uses, planned, converted_parameters):
             print("DIFF directory uses", flush=True)
             failures += 1
         if out.directory.provenance.get("recipe") != recipe:
@@ -84,6 +94,10 @@ def verify_output(base_path: Path, out_path: Path, expected: Mapping[str, str], 
         for obj in out.objects[len(base.objects):]:
             if obj.id not in expected:
                 print(f"DIFF unexpected object {obj.id}", flush=True)
+                return 1
+            if not isinstance(obj, TensorObject) or \
+                    (obj.format, obj.layout, tuple(obj.shape)) != (AUX_FORMAT, AUX_LAYOUT, ()):
+                print(f"DIFF auxiliary record {obj.id}", flush=True)
                 return 1
         for obj in out.objects:
             want = expected.get(obj.id) or _digest(base.iter_object(obj.id))

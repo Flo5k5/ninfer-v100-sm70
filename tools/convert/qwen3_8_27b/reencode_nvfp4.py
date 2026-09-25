@@ -56,22 +56,25 @@ divisor: their donor tensor scales must be equal.
 Before the output is created, every selected object is checked against the donors' safetensors
 headers and scalars (tensors present, NVFP4 dtypes and geometry, rows matching the object's
 bindings, finite positive divisors, one tensor scale per fused object) and against the
-``--weights`` headers. While encoding, every object is compared with the base object's decoded
-values (the dequantized FP8 values for a conversion), and with ``--weights`` when given; the tool
-refuses an object whose relative RMS error exceeds ``--max-error`` against either, and
-``--weights`` rows that are not finite. The base comparison is the one guard on row order: rows
-taken in a wrong order match ``--weights`` read in that same order, not the base object.
-``--verify`` re-reads the output: written objects must hold the encoded payloads, every other
-object the base's, and the directory must differ from the base only as the conversion planned; a
-failed verification removes the output.
+``--weights`` headers. Row order rests on the bindings: an object's parameters must tile it in
+their order, and each takes its donor rows from the converter's source routes. While encoding,
+every parameter's rows are compared with the base object's decoded values (the dequantized FP8
+values for a conversion), and the object with ``--weights`` when given; the tool refuses a
+parameter, or an object, whose relative RMS error exceeds ``--max-error``, and ``--weights`` rows
+that are not finite. The comparison with the base, per parameter so that a small misplaced block
+is not diluted in its object, is the numeric backstop on row order: rows taken in a wrong order
+match ``--weights`` read in that same order, not the base object. ``--verify`` re-reads the
+output: written objects must hold the encoded payloads and every other object the base's, the
+Uses must be the planned ones, and the directory must differ from the base only as the conversion
+planned; a failed verification removes the output.
 
 The artifact's provenance names the donors and the weights by their required labels (a repository
 id, for example), never by path, and drops the path members of the base's provenance, listed under
 ``removed_base_paths``. The report ``<out>.reencode.json`` records, per object, its role, the donor
-layout, the divisor and whether it is exact, the errors, the counts of saturated and zeroed rounded
-values, the SHA-256 of the donor tensors read, of the ``--weights`` rows read (in object row order,
-so the stored matrix when it is read whole) and of the payload written, and each new auxiliary
-divisor with its payload SHA-256.
+layout, the divisor and whether it is exact, the errors (against the base per parameter too), the
+counts of saturated and zeroed rounded values, the SHA-256 of the donor tensors read, of the
+``--weights`` rows read (in object row order, the stored matrix when read whole) and of the payload
+written, and each new auxiliary divisor with its payload SHA-256.
 
 Example (full-b: every MLP layer and the head from NVIDIA's Local-Hessian words, down rounded from
 the abliterated BF16 weights under NVIDIA's scales, the input projections from QUASAR's QAT
@@ -107,7 +110,7 @@ from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorObject, TensorSpec
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.provenance import input_label, local_name, strip_local_paths
-from tools.convert.qwen3_8_27b.graft_single_source import SourceCheckpoint, _select_rows
+from tools.convert.qwen3_8_27b.graft_single_source import SourceCheckpoint, select_rows
 from tools.convert.qwen3_8_27b.reencode_nvfp4_numeric import (
     RelativeError,
     dequantize_words,
@@ -118,11 +121,17 @@ from tools.convert.qwen3_8_27b.reencode_nvfp4_numeric import (
     update_digest,
 )
 from tools.convert.qwen3_8_27b.reencode_nvfp4_plan import (
+    AUX_FORMAT,
+    AUX_LAYOUT,
+    HEAD_ROLE,
     INPUT_GLOBAL_SCALE,
+    INPUT_ROLES,
+    MLP_ROLES,
     NVFP4_FORMAT,
     NVFP4_LAYOUT,
     ReencodeError,
     Target,
+    UsesPlan,
     check_base,
     nvfp4_layers,
     output_recipe,
@@ -136,8 +145,6 @@ TOOL = "tools.convert.qwen3_8_27b.reencode_nvfp4"
 PROJECTIONS = ("gate", "up", "down")
 DEFAULT_MAX_ERROR = 0.3
 ROW_CHUNK = 4096
-AUX_FORMAT = "fp32"
-AUX_LAYOUT = "contiguous_le_v1"
 
 
 class Encoder:
@@ -157,8 +164,8 @@ class Encoder:
             codes_name, scales_name, scale_name = item.tensors
             codes = target.donor.get(codes_name)
             block_scales = target.donor.get(scales_name).view(torch.uint8)
-            packed.append(_select_rows(codes, item.ranges))
-            scales.append(_select_rows(block_scales, item.ranges))
+            packed.append(select_rows(codes, item.ranges))
+            scales.append(select_rows(block_scales, item.ranges))
             read = [(codes_name, codes), (scales_name, block_scales),
                     (scale_name, target.donor.get(scale_name))]
             if target.input_divisor is not None:
@@ -197,10 +204,11 @@ class Encoder:
         else:
             base_codes, base_scales, base_divisor = decode_nvfp4_words(
                 self.base.read_object(target.object_id), target.shape)
-        against_base, against_weights = RelativeError(), RelativeError()
+        against_base = [RelativeError() for _ in target.donors]
+        against_weights = RelativeError()
         rounded, same, saturated, zeroed = [], 0, 0, 0
         digests: dict = {}
-        for begin, end, weights in self._row_chunks(target, digests):
+        for leaf, begin, end, weights in self._row_chunks(target, digests):
             codes = packed[begin:end]
             if weights is not None:
                 result = round_to_nearest(weights, scales[begin:end], target.divisor)
@@ -219,15 +227,21 @@ class Encoder:
             if weights is not None:
                 against_weights.add(values, weights)
             if target.converts:
-                against_base.add(values, base_values[begin:end])
+                against_base[leaf].add(values, base_values[begin:end])
             else:
-                against_base.add(values, dequantize_words(base_codes[begin:end],
-                                                          base_scales[begin:end], base_divisor))
-        report["relative_rms_error_vs_base"] = against_base.value()
-        # Blocking for conversions too: --weights rows are read in the object's row order, so
-        # only the base object shows rows taken in a wrong order (a relative error near 1.4). A
-        # conversion compares two quantizations of the same weights, 0.09 to 0.13 on the model.
-        self._refuse(target, against_base.value(), "the base object's values")
+                against_base[leaf].add(values, dequantize_words(
+                    base_codes[begin:end], base_scales[begin:end], base_divisor))
+        by_parameter = {parameter: error.value()
+                        for parameter, error in zip(target.parameters, against_base)}
+        report["relative_rms_error_vs_base"] = RelativeError.merged(against_base).value()
+        report["relative_rms_error_vs_base_by_parameter"] = by_parameter
+        # Per parameter, conversions included: --weights rows are read in the object's row
+        # order, so only the base object shows rows taken in a wrong order (a relative error near
+        # 1.4 where they land), and a whole-object figure would dilute a small misplaced block.
+        # Two quantizations of the same weights differ by 0.09 to 0.13 on the real model.
+        worst = max(by_parameter, key=lambda parameter: math.inf
+                    if math.isnan(by_parameter[parameter]) else by_parameter[parameter])
+        self._refuse(target, by_parameter[worst], f"the base object's values of {worst}")
         if self.weights is None:
             return packed
         report["relative_rms_error_vs_weights"] = against_weights.value()
@@ -247,16 +261,18 @@ class Encoder:
                                 "donor quantize these weights, in this row order?")
 
     def _row_chunks(self, target: Target,
-                    digests: dict) -> Iterator[tuple[int, int, torch.Tensor | None]]:
-        """Row ranges of the object with their finite --weights rows, when given; ``digests``
-        accumulates, per --weights matrix, the SHA-256 of the rows read in that order."""
+                    digests: dict) -> Iterator[tuple[int, int, int, torch.Tensor | None]]:
+        """Row ranges of the object, each within one parameter (its index is given first), with
+        their finite --weights rows when given; ``digests`` accumulates, per --weights matrix,
+        the SHA-256 of the rows read in that order."""
 
-        if self.weights is None:
-            for begin in range(0, target.shape[0], ROW_CHUNK):
-                yield begin, min(begin + ROW_CHUNK, target.shape[0]), None
-            return
         row = 0
-        for item in target.donors:
+        for leaf, item in enumerate(target.donors):
+            if self.weights is None:
+                for begin in range(row, row + item.rows, ROW_CHUNK):
+                    yield leaf, begin, min(begin + ROW_CHUNK, row + item.rows), None
+                row += item.rows
+                continue
             name = item.module + ".weight"
             digest = digests.setdefault(name, hashlib.sha256())
             for first, last in item.ranges or ((0, item.rows),):
@@ -268,7 +284,7 @@ class Encoder:
                     if not bool(torch.isfinite(values).all()):
                         raise ReencodeError(f"{name}: rows [{begin}, {end}) of --weights hold "
                                             "non-finite values")
-                    yield row, row + end - begin, values
+                    yield leaf, row, row + end - begin, values
                     row += end - begin
 
 
@@ -296,11 +312,15 @@ def _record(arguments, base: Artifact, targets: Sequence[Target], removed: list[
         "base": local_name(arguments.base),
         "base_artifact_id": base.artifact_id.hex(),
         "donor": {"label": arguments.donor_label},
+        "mlp_layers": sorted({target.layer for target in targets if target.role in MLP_ROLES}),
+        "output_head": any(target.role == HEAD_ROLE for target in targets),
     }
     if arguments.input_donor is not None:
-        record["input_donor"] = {"label": arguments.input_donor_label}
+        record["input_donor"] = {
+            "label": arguments.input_donor_label,
+            "layers": sorted({target.layer for target in targets if target.role in INPUT_ROLES}),
+        }
     record.update({
-        "layers": sorted({target.layer for target in targets}),
         "codes": {projection: ("rounded from weights" if projection in arguments.round else "donor")
                   for projection in PROJECTIONS},
         "divisor": "donor global scale, or the FP32 word whose FP32 reciprocal is the ModelOpt "
@@ -315,7 +335,8 @@ def _record(arguments, base: Artifact, targets: Sequence[Target], removed: list[
     return record
 
 
-def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Encoder) -> dict:
+def reencode(arguments, base: Artifact, targets: Sequence[Target], plan: UsesPlan,
+             encoder: Encoder) -> dict:
     directory = base.directory
     provenance, removed = strip_local_paths(directory.provenance)
     record = _record(arguments, base, targets, removed)
@@ -326,17 +347,16 @@ def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Enco
         # profiles bind the converted roles as NVFP4.
         record["base_recipe"] = provenance.get("recipe")
         provenance["recipe"] = recipe
-    aux_values, aux_labels, uses = plan_uses(base, targets)
-    if aux_labels:
-        record["activation_input_divisors"] = aux_labels
+    if plan.labels:
+        record["activation_input_divisors"] = plan.labels
     by_id = {target.object_id: target for target in targets}
     started = time.perf_counter()
     writer = ArtifactWriter(
         arguments.out,
-        _specs(base, targets, aux_values),
+        _specs(base, targets, plan.divisors),
         components=directory.components,
         bindings=directory.bindings,
-        uses=uses,
+        uses=plan.uses,
         metadata=directory.metadata,
         provenance=provenance,
     )
@@ -352,13 +372,14 @@ def reencode(arguments, base: Artifact, targets: Sequence[Target], encoder: Enco
             writer.write_object(obj.id, payload)
             reports.append(report)
             error = report.get("relative_rms_error_vs_weights")
+            leaf = max(report["relative_rms_error_vs_base_by_parameter"].values())
             print(f"[{index}/{total}] {obj.id} {','.join(report['parameters'])} "
                   f"{report['codes']} divisor={report['weight_divisor']:.9g}"
                   f"{'' if report['divisor_exact'] else ' (inexact reciprocal)'} "
-                  f"vs_base={report['relative_rms_error_vs_base']:.5f}"
-                  f"{'' if error is None else f' vs_weights={error:.5f}'} ({report['seconds']}s)",
-                  flush=True)
-        for aux_id, value in aux_values.items():
+                  f"vs_base={report['relative_rms_error_vs_base']:.5f} (worst parameter "
+                  f"{leaf:.5f}){'' if error is None else f' vs_weights={error:.5f}'} "
+                  f"({report['seconds']}s)", flush=True)
+        for aux_id, value in plan.divisors.items():
             payload = struct.pack("<f", value)
             writer.write_object(aux_id, payload)
             auxiliaries.append({"object": aux_id, "value": value,
@@ -447,7 +468,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             check_base(base)
             layers = arguments.layers if arguments.layers is not None else nvfp4_layers(base)
             targets = plan_targets(base, layers, arguments.round, donor, weights, input_donor)
-            report = reencode(arguments, base, targets,
+            plan = plan_uses(base, targets)
+            report = reencode(arguments, base, targets, plan,
                               Encoder(base, weights, arguments.max_error))
     finally:
         for checkpoint in (donor, input_donor, weights):
@@ -460,7 +482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         status = verify_output(arguments.base, arguments.out, expected,
                                converted={target.object_id: target.parameters
                                           for target in targets if target.converts},
-                               recipe=output_recipe(targets))
+                               uses=plan.uses, recipe=output_recipe(targets))
         report["verified"] = status == 0
         if status:
             remove_output(arguments.out)

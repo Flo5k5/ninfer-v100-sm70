@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import math
+from typing import Iterable
 
 import numpy as np
 import torch
@@ -117,6 +118,16 @@ class RelativeError:
     def __init__(self) -> None:
         self.squared_error = 0.0
         self.squared_norm = 0.0
+
+    @classmethod
+    def merged(cls, parts: Iterable[RelativeError]) -> RelativeError:
+        """The error of the parts' values and references taken together."""
+
+        result = cls()
+        for part in parts:
+            result.squared_error += part.squared_error
+            result.squared_norm += part.squared_norm
+        return result
 
     def add(self, values: torch.Tensor, reference: torch.Tensor) -> None:
         reference = reference.double()
