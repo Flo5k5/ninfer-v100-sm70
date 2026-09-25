@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -360,6 +361,55 @@ int run_fp32_residual_shape(std::int32_t n, std::int32_t k, std::int32_t first_w
     failures += device_weight.verify_guards("FP32-residual linear_add weight");
     return failures;
 }
+
+// The W4A4 route reads the checkpoint-native planes only. A QPN-prepacked weight, the layout of
+// every NVFP4 down and mixer output projection loaded on Volta, must be refused before any launch
+// and leave the residual as it was.
+int run_prepacked_w4a4_refusal(std::int32_t n, std::int32_t k, std::int32_t first_w4a4,
+                               std::uint32_t seed) {
+    quantized_weight::PatternedWeightOptions options;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor  = 3.5F;
+    const quantized_weight::PackedWeight host_weight =
+        quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
+    const std::vector<std::uint16_t> activation = make_activation(k, first_w4a4, seed + 1U);
+    const std::vector<std::uint16_t> initial    = make_residual(n, first_w4a4, seed + 2U);
+
+    GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(activation.data(), device_activation.bytes());
+    GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    Weight weight = host_weight.device_weight(device_weight.data());
+    ops::detail::nvfp4_prepack_qpn_sm70(weight);
+    GuardedDeviceBuffer output(initial.size() * sizeof(std::uint16_t));
+    output.copy_from_host(initial.data(), output.bytes());
+
+    Tensor x(device_activation.data(), DType::BF16, {k, first_w4a4});
+    Tensor residual(output.data(), DType::BF16, {n, first_w4a4});
+    const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
+        QType::NVFP4, n, k, ops::LinearPolicy::AllowA4, first_w4a4, first_w4a4);
+    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+    const std::string label = "NVFP4 linear_add W4A4 route, prepacked [" + std::to_string(n) + "," +
+                              std::to_string(k) + "]";
+    bool refused            = false;
+    try {
+        ops::linear_add(x, weight, residual, ops::LinearPolicy::AllowA4, workspace, nullptr);
+    } catch (const std::invalid_argument& error) {
+        refused = true;
+        std::cout << label << ": refused (" << error.what() << ")\n";
+    }
+    int failures = 0;
+    if (!refused) {
+        std::cerr << label << ": a prepacked weight was accepted\n";
+        ++failures;
+    }
+    cuda_check(cudaDeviceSynchronize(), "synchronize refused NVFP4 linear_add");
+    std::vector<std::uint16_t> after(initial.size());
+    output.copy_to_host(after.data(), output.bytes());
+    failures += verify_exact((label + " residual unchanged").c_str(), after, initial);
+    failures += output.verify_guards(label);
+    return failures;
+}
 #endif
 } // namespace
 
@@ -376,6 +426,7 @@ int main() {
     failures += run_shape(5120, 17408, 822U, true);
     failures += run_fp32_residual_shape(5120, 6144, 7, 815U);
     failures += run_fp32_residual_shape(5120, 17408, 8, 825U);
+    failures += run_prepacked_w4a4_refusal(5120, 6144, 7, 817U);
 #endif
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
