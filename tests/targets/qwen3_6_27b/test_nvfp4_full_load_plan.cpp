@@ -187,9 +187,9 @@ int verify_fp32_residual_form(const BindingPlan& bindings) {
 // The v3 leaves of an NVFP4 parent, `columns` wide. Each binds one part of the bound parent object,
 // the rows of section 8.1 (all of them for an output): the binder only checks that the leaves
 // follow each other and cover the object, not where each one ends, so leaves with the wrong row
-// counts would pass it. Every leaf Use carries the activation input divisor: a scalar FP32 object,
-// finite and positive, bit-identical across the leaves, and the value the binder bound for the
-// parent.
+// counts would pass it. Each leaf has at least one Use carrying the activation input divisor, as
+// the binder requires; every divisor found is a scalar FP32 object, finite and positive,
+// bit-identical across the leaves, and the value the binder bound for the parent.
 int verify_leaves(const ninfer::artifact::Reader& reader, const std::string& group,
                   std::span<const Leaf> leaves, std::uint64_t columns, const WeightPlan& parent) {
     const ninfer::artifact::Directory& directory = reader.directory();

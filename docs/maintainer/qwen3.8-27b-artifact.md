@@ -1045,11 +1045,12 @@ are those of `nvfp4`. The input parents and their divisors follow Section 15.
 
 Each output projection, `text/layers/{l}/attention/output` or `text/layers/{l}/gdn/output`, is one
 NVFP4 object in `blockscale-k16-m128x4-v1` with its own trailing FP32 weight divisor. It is not a
-fused parent: its v3 binding of the same name covers the whole object. Every Use of it (input
-`text/layers/{l}/attention/gated_output` or `text/layers/{l}/gdn/gated_output`) switches to
-`AllowA4` and carries an `activation_input_divisor` auxiliary: a whole rank-zero FP32 object, finite
-and positive. When an output has several Uses, they all name the same divisor object. The binder
-reads it as `attention/output_projection/input_scale_divisor` or
+fused parent: its v3 binding of the same name covers the whole object. The converter switches
+every Use of it (input `text/layers/{l}/attention/gated_output` or
+`text/layers/{l}/gdn/gated_output`) to `AllowA4` and gives it an `activation_input_divisor`
+auxiliary: a whole rank-zero FP32 object, finite and positive. The binder enforces less: at least
+one Use of the output carries that auxiliary, and all the Uses that carry one name the same object.
+It reads it as `attention/output_projection/input_scale_divisor` or
 `gdn/output_projection/input_scale_divisor`, the names of the Qwen3.6-27B `nvfp4` outputs. As for
 the other NVFP4 roles, sm_70 runs these matrices with 16-bit activations and never scales by the
 input divisor.
