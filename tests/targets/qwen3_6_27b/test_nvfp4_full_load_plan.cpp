@@ -1,10 +1,17 @@
-// Host-only binding check for the Qwen3.8 NVFP4 "full A" profile: MLP 0-63 and the output head in
-// NVFP4, the token embedding, attention and GDN in FP8. Binding reads the directory and a few small
-// host objects (divisors, proposal ids); nothing here touches a device. The bound formats must also
-// give the text residual stream its FP32 form, which Variant must then accept for the profile.
+// Host-only binding check for the derived Qwen3.8 NVFP4 profiles, one per run:
+//   full A (no argument): MLP 0-63 and the output head in NVFP4, the token embedding, attention
+//     and GDN in FP8;
+//   full B (--full-b): full A with the attention and GDN input projections in NVFP4 too.
+// Binding reads the directory and a few small host objects (divisors, proposal ids); nothing here
+// touches a device. The bound formats must also give the text residual stream its FP32 form, which
+// Variant must then accept for the profile.
 //
-//   NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS=<stage A artifact>
-//   NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=<mixed NVFP4/FP8 artifact it was derived from>   (optional)
+//   NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS=<full A artifact>
+//   NINFER_QWEN3_8_27B_NVFP4_FULL_B_WEIGHTS=<full B artifact>                         (--full-b)
+//   NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=<mixed NVFP4/FP8 artifact full A derives from>   (optional)
+//
+// When the artifact a profile derives from is also set (the mixed artifact for full A, full A for
+// full B), the run checks that the profile needs fewer device weight bytes.
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
@@ -13,15 +20,21 @@
 
 #include <ninfer/targets/qwen3_6_27b/package.h>
 
+#include <array>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
+#include <vector>
 
 namespace {
 
@@ -29,12 +42,44 @@ using ninfer::artifact::NumericFormat;
 using ninfer::targets::qwen3_6_27b::Package;
 using namespace ninfer::targets::qwen3_6_27b::detail;
 
+constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
+
 // Bindings that meet the FP32 residual criterion below must be accepted by Variant's per-profile
-// guard, which Engine startup checks. Checked at compile time, so a build that drops either profile
-// from the guard fails even where this test cannot run (no artifact).
+// guard, which Engine startup checks. Checked at compile time, so a build that drops a profile from
+// the guard fails even where this test cannot run (no artifact).
 static_assert(Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4) &&
-                  Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullA),
-              "both Qwen3.8 NVFP4 profiles must allow the FP32 text residual");
+                  Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullA) &&
+                  Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullB),
+              "the three Qwen3.8 NVFP4 profiles must allow the FP32 text residual");
+
+// A derived profile under test, and the artifact it derives from.
+struct DerivedProfile {
+    const char* label;
+    WeightsProfile profile;
+    const char* variable;
+    // Format of the attention and GDN input projections; every other checked role is shared.
+    NumericFormat input_projection;
+    WeightsProfile parent_profile;
+    const char* parent_variable;
+};
+
+constexpr DerivedProfile kFullA{
+    .label            = "full A",
+    .profile          = WeightsProfile::Qwen38Nvfp4FullA,
+    .variable         = "NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS",
+    .input_projection = kFp8,
+    .parent_profile   = WeightsProfile::Qwen38Nvfp4,
+    .parent_variable  = "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS",
+};
+
+constexpr DerivedProfile kFullB{
+    .label            = "full B",
+    .profile          = WeightsProfile::Qwen38Nvfp4FullB,
+    .variable         = "NINFER_QWEN3_8_27B_NVFP4_FULL_B_WEIGHTS",
+    .input_projection = NumericFormat::NVFP4,
+    .parent_profile   = WeightsProfile::Qwen38Nvfp4FullA,
+    .parent_variable  = "NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS",
+};
 
 std::filesystem::path environment_path(const char* name) {
     const char* value = std::getenv(name);
@@ -56,6 +101,10 @@ bool valid_nvfp4(const WeightPlan& weight) {
            weight_divisor > 0.0F && std::isfinite(input_divisor) && input_divisor > 0.0F;
 }
 
+bool has_format(const WeightPlan& weight, NumericFormat format) {
+    return format == NumericFormat::NVFP4 ? valid_nvfp4(weight) : weight.format == format;
+}
+
 std::uint64_t device_bytes(const std::filesystem::path& path, WeightsProfile profile) {
     ninfer::artifact::Reader reader(path);
     ninfer::artifact::Binder binder(reader);
@@ -64,15 +113,15 @@ std::uint64_t device_bytes(const std::filesystem::path& path, WeightsProfile pro
 
 // linear_add updates an FP32 residual stream from FP8 and NVFP4 weights only.
 bool fp32_residual_projection(NumericFormat format) {
-    return format == NumericFormat::FP8_E4M3FN_ROW_BF16S || format == NumericFormat::NVFP4;
+    return format == kFp8 || format == NumericFormat::NVFP4;
 }
 
 // The FP32 residual stream needs an FP32 form of every op that writes it: the FP8 embedding gather
-// and, in each layer, the attention or GDN output projection and the MLP down projection. The
-// output head reads the normed BF16 hidden state, not the stream. The guard side of the contract is
-// the static_assert above.
+// and, in each layer, the attention or GDN output projection and the MLP down projection. The input
+// projections and the output head read normed BF16 hidden states, not the stream. The guard side of
+// the contract is the static_assert above.
 int verify_fp32_residual_form(const BindingPlan& bindings) {
-    if (bindings.token_embedding.format != NumericFormat::FP8_E4M3FN_ROW_BF16S) {
+    if (bindings.token_embedding.format != kFp8) {
         std::cerr << "token embedding is not FP8\n";
         return 1;
     }
@@ -89,52 +138,130 @@ int verify_fp32_residual_form(const BindingPlan& bindings) {
     return 0;
 }
 
-int verify_full_a(const std::filesystem::path& path) {
-    ninfer::artifact::Reader reader(path);
-    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen38Nvfp4FullA) {
-        std::cerr << "identity '" << reader.identity().model_id << "/"
-                  << reader.identity().weights_id << "' did not resolve to Qwen38Nvfp4FullA\n";
+// The activation input divisor that every v3 leaf Use of an NVFP4 input parent carries: a scalar
+// FP32 object, finite and positive, bit-identical across the leaves, and the value the binder bound
+// for the parent.
+int verify_input_divisors(const ninfer::artifact::Reader& reader, const std::string& group,
+                          std::span<const std::string_view> leaves, const WeightPlan& parent) {
+    const ninfer::artifact::Directory& directory = reader.directory();
+    std::optional<std::uint32_t> shared;
+    for (const std::string_view leaf : leaves) {
+        const std::string parameter = group + std::string(leaf);
+        std::size_t divisors        = 0;
+        for (auto use = directory.uses.lower_bound({parameter, std::string()});
+             use != directory.uses.end() && use->first.first == parameter; ++use) {
+            const auto aux = use->second.auxiliaries.find("activation_input_divisor");
+            if (aux == use->second.auxiliaries.end()) { continue; }
+            ++divisors;
+            if (aux->second.parts.size() != 1) {
+                std::cerr << parameter << ": input divisor spans several objects\n";
+                return 1;
+            }
+            const std::vector<std::byte> bytes = reader.read_object(aux->second.parts[0].object);
+            if (bytes.size() != sizeof(std::uint32_t)) {
+                std::cerr << parameter << ": input divisor is not one FP32 word\n";
+                return 1;
+            }
+            const std::uint32_t bits = std::to_integer<std::uint32_t>(bytes[0]) |
+                                       (std::to_integer<std::uint32_t>(bytes[1]) << 8U) |
+                                       (std::to_integer<std::uint32_t>(bytes[2]) << 16U) |
+                                       (std::to_integer<std::uint32_t>(bytes[3]) << 24U);
+            const float value        = std::bit_cast<float>(bits);
+            if (!std::isfinite(value) || value <= 0.0F) {
+                std::cerr << parameter << ": input divisor " << value << " is not positive\n";
+                return 1;
+            }
+            if (shared.has_value() && *shared != bits) {
+                std::cerr << parameter << ": input divisor differs from the other leaves of "
+                          << group << '\n';
+                return 1;
+            }
+            shared = bits;
+        }
+        if (divisors == 0) {
+            std::cerr << parameter << ": no Use carries an activation input divisor\n";
+            return 1;
+        }
+    }
+    if (!shared.has_value() || *shared != parent.input_scale_divisor_bits) {
+        std::cerr << group << ": the bound input divisor is not the leaves' divisor\n";
         return 1;
     }
-    ninfer::artifact::Binder binder(reader);
-    const ArtifactLoadPlan plan =
-        bind_artifact(binder, WeightsProfile::Qwen38Nvfp4FullA, mtp_features());
-    const BindingPlan& bindings = plan.bindings;
+    return 0;
+}
+
+// Formats per role: the input projections in the profile's format (with their divisors when
+// NVFP4), FP8 attention and GDN outputs, every MLP and the output head in NVFP4.
+int verify_formats(const ninfer::artifact::Reader& reader, const BindingPlan& bindings,
+                   const DerivedProfile& tested) {
+    constexpr std::array<std::string_view, 4> kAttentionLeaves{"query", "key", "gate", "value"};
+    constexpr std::array<std::string_view, 4> kGdnLeaves{"query", "key", "value", "z"};
     if (!valid_nvfp4(bindings.output_head)) {
         std::cerr << "output head is not NVFP4 with valid divisors\n";
         return 1;
     }
-    std::size_t nvfp4_mlp = 0;
-    for (const TextLayerPlan& layer : bindings.text_layers) {
-        nvfp4_mlp += valid_nvfp4(layer.mlp.gate_up) && valid_nvfp4(layer.mlp.down) ? 1 : 0;
-        if (layer.is_full_attention) {
-            const auto& fused = std::get<FusedAttentionProjectionPlan>(layer.attention.projection);
-            if (fused.query_key_gate_value.format != NumericFormat::FP8_E4M3FN_ROW_BF16S ||
-                layer.attention.output.format != NumericFormat::FP8_E4M3FN_ROW_BF16S) {
-                std::cerr << "attention left FP8\n";
-                return 1;
-            }
+    std::size_t nvfp4_mlp        = 0;
+    std::size_t attention_inputs = 0;
+    std::size_t gdn_inputs       = 0;
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        const TextLayerPlan& plan = bindings.text_layers[layer];
+        const std::string prefix  = "text/layers/" + std::to_string(layer) + "/";
+        nvfp4_mlp += valid_nvfp4(plan.mlp.gate_up) && valid_nvfp4(plan.mlp.down) ? 1 : 0;
+        const bool full = plan.is_full_attention;
+        const WeightPlan& input =
+            full ? std::get<FusedAttentionProjectionPlan>(plan.attention.projection)
+                       .query_key_gate_value
+                 : std::get<FusedGdnInputProjectionPlan>(plan.gdn.input_projection)
+                       .query_key_value_z;
+        const WeightPlan& output = full ? plan.attention.output : plan.gdn.output;
+        if (!has_format(input, tested.input_projection) || output.format != kFp8) {
+            std::cerr << "layer " << layer << ": " << (full ? "attention" : "GDN")
+                      << " input or output projection has the wrong format\n";
+            return 1;
+        }
+        if (tested.input_projection == NumericFormat::NVFP4) {
+            const int divisors =
+                full ? verify_input_divisors(reader, prefix + "attention/", kAttentionLeaves, input)
+                     : verify_input_divisors(reader, prefix + "gdn/", kGdnLeaves, input);
+            if (divisors != 0) { return divisors; }
+        }
+        if (full) {
+            ++attention_inputs;
         } else {
-            const auto& fused = std::get<FusedGdnInputProjectionPlan>(layer.gdn.input_projection);
-            if (fused.query_key_value_z.format != NumericFormat::FP8_E4M3FN_ROW_BF16S ||
-                layer.gdn.output.format != NumericFormat::FP8_E4M3FN_ROW_BF16S) {
-                std::cerr << "GDN left FP8\n";
-                return 1;
-            }
+            ++gdn_inputs;
         }
     }
-    if (nvfp4_mlp != kTextLayers) {
-        std::cerr << "expected every MLP in NVFP4, found " << nvfp4_mlp << '\n';
+    if (nvfp4_mlp != kTextLayers || attention_inputs != kFullAttentionLayers ||
+        gdn_inputs != kGdnLayers) {
+        std::cerr << "expected " << kTextLayers << " NVFP4 MLPs, " << kFullAttentionLayers
+                  << " attention and " << kGdnLayers << " GDN inputs; found " << nvfp4_mlp << ", "
+                  << attention_inputs << " and " << gdn_inputs << '\n';
         return 1;
     }
-    if (const int result = verify_fp32_residual_form(bindings); result != 0) { return result; }
-    std::cout << "full A: " << plan.materialization.device_objects.size() << " device objects, "
-              << plan.materialization.device_capacity_bytes << " device bytes (MTP, optimized "
-              << "proposal head)\n";
+    return 0;
+}
+
+int verify_profile(const DerivedProfile& tested, const std::filesystem::path& path) {
+    ninfer::artifact::Reader reader(path);
+    if (Package::resolve_weights(reader.identity()) != tested.profile) {
+        std::cerr << "identity '" << reader.identity().model_id << "/"
+                  << reader.identity().weights_id << "' did not resolve to " << tested.label
+                  << '\n';
+        return 1;
+    }
+    ninfer::artifact::Binder binder(reader);
+    const ArtifactLoadPlan plan = bind_artifact(binder, tested.profile, mtp_features());
+    if (const int result = verify_formats(reader, plan.bindings, tested); result != 0) {
+        return result;
+    }
+    if (const int result = verify_fp32_residual_form(plan.bindings); result != 0) { return result; }
+    std::cout << tested.label << ": " << plan.materialization.device_objects.size()
+              << " device objects, " << plan.materialization.device_capacity_bytes
+              << " device bytes (MTP, optimized proposal head)\n";
 
     ninfer::artifact::Binder dflash2_binder(reader);
     try {
-        (void)bind_artifact(dflash2_binder, WeightsProfile::Qwen38Nvfp4FullA,
+        (void)bind_artifact(dflash2_binder, tested.profile,
                             {.vision        = false,
                              .speculative   = ninfer::SpeculativeBackend::DFlash2,
                              .proposal_head = ninfer::ProposalHead::Full});
@@ -146,38 +273,48 @@ int verify_full_a(const std::filesystem::path& path) {
     return 0;
 }
 
+// The derived profile must need fewer device weight bytes than the artifact it derives from.
+int verify_smaller_than_parent(const DerivedProfile& tested, const std::filesystem::path& path) {
+    const std::filesystem::path parent = environment_path(tested.parent_variable);
+    if (parent.empty() || !std::filesystem::is_regular_file(parent)) { return 0; }
+    // NINFER_QWEN3_8_27B_NVFP4_WEIGHTS also names the artifact of the real FP32 tests, which may be
+    // a derived one.
+    if (Package::resolve_weights(ninfer::artifact::Reader(parent).identity()) !=
+        tested.parent_profile) {
+        std::cout << "skip device bytes: " << tested.parent_variable
+                  << " does not name the artifact " << tested.label << " derives from\n";
+        return 0;
+    }
+    const std::uint64_t before = device_bytes(parent, tested.parent_profile);
+    const std::uint64_t after  = device_bytes(path, tested.profile);
+    std::cout << "device weight bytes: parent " << before << ", " << tested.label << ' ' << after
+              << ", saved " << static_cast<std::int64_t>(before - after) << '\n';
+    if (after >= before) {
+        std::cerr << tested.label << " does not reduce device weight bytes\n";
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
-int main() {
-    const std::filesystem::path full_a =
-        environment_path("NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS");
-    if (full_a.empty() || !std::filesystem::is_regular_file(full_a)) {
-        std::cerr << "skip: set NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS\n";
+int main(int argc, char** argv) {
+    const bool full_b = argc == 2 && std::string_view(argv[1]) == "--full-b";
+    if (argc != 1 && !full_b) {
+        std::cerr << "usage: " << argv[0] << " [--full-b]\n";
+        return 2;
+    }
+    const DerivedProfile& tested         = full_b ? kFullB : kFullA;
+    const std::filesystem::path artifact = environment_path(tested.variable);
+    if (artifact.empty() || !std::filesystem::is_regular_file(artifact)) {
+        std::cerr << "skip: set " << tested.variable << '\n';
         return 77;
     }
     try {
-        if (const int result = verify_full_a(full_a); result != 0) { return result; }
-        const std::filesystem::path mixed = environment_path("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
-        if (!mixed.empty() && std::filesystem::is_regular_file(mixed)) {
-            // The variable also names the artifact of the real FP32 tests, which may be full A.
-            if (Package::resolve_weights(ninfer::artifact::Reader(mixed).identity()) !=
-                WeightsProfile::Qwen38Nvfp4) {
-                std::cout << "skip device bytes: NINFER_QWEN3_8_27B_NVFP4_WEIGHTS is not a "
-                             "qwen3.8-27b/nvfp4 artifact\n";
-                return 0;
-            }
-            const std::uint64_t before = device_bytes(mixed, WeightsProfile::Qwen38Nvfp4);
-            const std::uint64_t after  = device_bytes(full_a, WeightsProfile::Qwen38Nvfp4FullA);
-            std::cout << "device weight bytes: mixed " << before << ", full A " << after
-                      << ", saved " << static_cast<std::int64_t>(before - after) << '\n';
-            if (after >= before) {
-                std::cerr << "full A does not reduce device weight bytes\n";
-                return 1;
-            }
-        }
+        if (const int result = verify_profile(tested, artifact); result != 0) { return result; }
+        return verify_smaller_than_parent(tested, artifact);
     } catch (const std::exception& error) {
         std::cerr << "binding failed: " << error.what() << '\n';
         return 1;
     }
-    return 0;
 }

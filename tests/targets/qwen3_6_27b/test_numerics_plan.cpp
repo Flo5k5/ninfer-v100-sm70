@@ -2,12 +2,12 @@
 // (EngineOptions::text_residual and prefill_attention) on the 27B package. Planning needs a CUDA
 // Volta device for the compute-capability check, but no artifact.
 //
-// The FP32 residual stream is accepted only for qwen3.8-27b/nvfp4 and qwen3.8-27b/nvfp4-full-a
+// The FP32 residual stream is accepted only for qwen3.8-27b/nvfp4, nvfp4-full-a and nvfp4-full-b
 // without DFlash, and unknown option values are rejected. The residual is the root allocation of
 // the prefill chunk, the ordinary decode batch (TextContext::ordinary_decode_batch) and the MTP
 // lookup verify aggregate (TextContext::target_verify_batch_impl), so planning it in FP32 must grow
-// each of these phases by exactly two more bytes per element on both profiles. The prefill plan
-// must also reserve the staging of the selected attention kernel.
+// each of these phases by exactly two more bytes per element on the three profiles. The prefill
+// plan must also reserve the staging of the selected attention kernel.
 
 #include "targets/qwen3_6_27b/impl/variant.h"
 
@@ -43,6 +43,7 @@ constexpr std::size_t kHidden = 5120;
 constexpr std::array kFp32ResidualProfiles = {
     std::pair{WeightsProfile::Qwen38Nvfp4, "qwen3.8-27b/nvfp4"},
     std::pair{WeightsProfile::Qwen38Nvfp4FullA, "qwen3.8-27b/nvfp4-full-a"},
+    std::pair{WeightsProfile::Qwen38Nvfp4FullB, "qwen3.8-27b/nvfp4-full-b"},
 };
 
 ninfer::EngineOptions production_options() {
