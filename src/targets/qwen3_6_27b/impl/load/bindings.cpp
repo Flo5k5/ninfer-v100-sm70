@@ -45,6 +45,7 @@ NumericFormat token_embedding_format(WeightsProfile weights_profile) {
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
     case WeightsProfile::Qwen38Nvfp4FullA:
+    case WeightsProfile::Qwen38Nvfp4FullB:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
     }
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
@@ -53,13 +54,39 @@ NumericFormat token_embedding_format(WeightsProfile weights_profile) {
 // The output head shares the embedding format except where a profile moves it to NVFP4 alone:
 // the embedding gather reads rows directly and has no NVFP4 route.
 NumericFormat output_head_format(WeightsProfile weights_profile) {
-    if (weights_profile == WeightsProfile::Qwen38Nvfp4FullA) { return NumericFormat::NVFP4; }
+    if (weights_profile == WeightsProfile::Qwen38Nvfp4FullA ||
+        weights_profile == WeightsProfile::Qwen38Nvfp4FullB) {
+        return NumericFormat::NVFP4;
+    }
     return token_embedding_format(weights_profile);
 }
 
-// First MLP layer the Qwen3.8 NVFP4 profiles keep in FP8 (kTextLayers: every MLP is NVFP4).
-std::size_t qwen38_first_fp8_mlp_layer(WeightsProfile weights_profile) {
-    return weights_profile == WeightsProfile::Qwen38Nvfp4FullA ? kTextLayers : 56;
+// Text-layer roles whose format differs between the Qwen3.8 NVFP4 profiles. The other roles are
+// the same in all of them: FP8 attention and GDN output projections, the BF16 GDN a_b projection
+// and BF16 norms.
+struct Qwen38Nvfp4Formats {
+    NumericFormat attention_input;   // query/key/gate/value [14336,5120], full-attention layers
+    NumericFormat gdn_input;         // query/key/value/z [16384,5120], GDN layers
+    std::size_t first_fp8_mlp_layer; // MLP layers below it are NVFP4 (kTextLayers: all of them)
+};
+
+Qwen38Nvfp4Formats qwen38_nvfp4_formats(WeightsProfile weights_profile) {
+    constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    switch (weights_profile) {
+    case WeightsProfile::Qwen38Nvfp4:
+        return {.attention_input = kFp8, .gdn_input = kFp8, .first_fp8_mlp_layer = 56};
+    case WeightsProfile::Qwen38Nvfp4FullA:
+        return {.attention_input = kFp8, .gdn_input = kFp8, .first_fp8_mlp_layer = kTextLayers};
+    case WeightsProfile::Qwen38Nvfp4FullB:
+        return {.attention_input     = NumericFormat::NVFP4,
+                .gdn_input           = NumericFormat::NVFP4,
+                .first_fp8_mlp_layer = kTextLayers};
+    case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen36Nvfp4:
+        break;
+    }
+    throw std::invalid_argument("qwen3_6_27b: not a Qwen3.8 NVFP4 weights profile");
 }
 
 std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::uint64_t offset,
@@ -115,6 +142,17 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
                       .format                    = NumericFormat::NVFP4,
                       .weight_scale_divisor_bits = weight_bits,
                       .input_scale_divisor_bits  = input_bits};
+}
+
+// A projection stored in `format`; an NVFP4 one also binds its activation input divisor.
+WeightPlan bind_projection(artifact::Binder& binder, std::string_view name, NumericFormat format,
+                           std::int32_t rows, std::int32_t columns,
+                           std::string_view input_divisor_name) {
+    if (format == NumericFormat::NVFP4) {
+        return bind_nvfp4_weight(binder, name, rows, columns, input_divisor_name);
+    }
+    return bind_weight(binder, name, format,
+                       {static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns)});
 }
 
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
@@ -199,6 +237,10 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
     return out;
 }
 
+// materialized_weight prepacks FP8 input projections for QPN but leaves an NVFP4 one in its
+// checkpoint-native layout, and it must stay there: on Volta the NVFP4 attn_input_proj and
+// gdn_input_proj routes are the SIMT kernels, which read that layout only, and their weight check
+// admits a QPN-prepacked weight, so they would read it wrong without failing.
 FullAttentionProjectionPayload
 load_attention_projection(const FullAttentionPlan& plan,
                           const artifact::MaterializedArtifact& materialized) {
@@ -215,6 +257,7 @@ load_attention_projection(const FullAttentionPlan& plan,
     };
 }
 
+// An NVFP4 parent stays checkpoint-native, like the attention input (see above).
 GdnInputProjectionPayload
 load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtifact& materialized) {
     if (const auto* split = std::get_if<SplitGdnInputProjectionPlan>(&plan.input_projection)) {
@@ -369,7 +412,7 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
 }
 
 void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out,
-                                   std::size_t first_fp8_mlp_layer) {
+                                   const Qwen38Nvfp4Formats& formats) {
     constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
@@ -379,8 +422,9 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out,
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             target.attention.projection = FusedAttentionProjectionPlan{
-                .query_key_gate_value = bind_weight(
-                    binder, prefix + "attention/query_key_gate_value", kFp8, {14336, 5120}),
+                .query_key_gate_value = bind_projection(
+                    binder, prefix + "attention/query_key_gate_value", formats.attention_input,
+                    14336, 5120, prefix + "attention/input_projection/input_scale_divisor"),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
@@ -400,8 +444,9 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out,
                                               NumericFormat::BF16, {96, 5120}),
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
-                .query_key_value_z =
-                    bind_weight(binder, prefix + "gdn/query_key_value_z", kFp8, {16384, 5120}),
+                .query_key_value_z = bind_projection(
+                    binder, prefix + "gdn/query_key_value_z", formats.gdn_input, 16384, 5120,
+                    prefix + "gdn/input_projection/input_scale_divisor"),
             };
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {128});
@@ -409,16 +454,13 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out,
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (layer < first_fp8_mlp_layer) {
-            target.mlp.gate_up =
-                bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
-                                  prefix + "mlp/gate_up_projection/input_scale_divisor");
-            target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 5120, 17408,
-                                                prefix + "mlp/down_projection/input_scale_divisor");
-        } else {
-            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", kFp8, {34816, 5120});
-            target.mlp.down    = bind_weight(binder, prefix + "mlp/down", kFp8, {5120, 17408});
-        }
+        const NumericFormat mlp_format =
+            layer < formats.first_fp8_mlp_layer ? NumericFormat::NVFP4 : kFp8;
+        target.mlp.gate_up =
+            bind_projection(binder, prefix + "mlp/gate_up", mlp_format, 34816, 5120,
+                            prefix + "mlp/gate_up_projection/input_scale_divisor");
+        target.mlp.down = bind_projection(binder, prefix + "mlp/down", mlp_format, 5120, 17408,
+                                          prefix + "mlp/down_projection/input_scale_divisor");
     }
 }
 
@@ -529,18 +571,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         break;
     case WeightsProfile::Qwen38Nvfp4:
     case WeightsProfile::Qwen38Nvfp4FullA:
-        bind_qwen38_nvfp4_text_layers(binder, out, qwen38_first_fp8_mlp_layer(weights_profile));
+    case WeightsProfile::Qwen38Nvfp4FullB:
+        bind_qwen38_nvfp4_text_layers(binder, out, qwen38_nvfp4_formats(weights_profile));
         break;
     default:
         throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head =
-        head_format == NumericFormat::NVFP4
-            ? bind_nvfp4_weight(binder, "text/output_head", 248320, 5120,
-                                "text/output_head_projection/input_scale_divisor")
-            : bind_weight(binder, "text/output_head", head_format, {248320, 5120});
+    out.output_head = bind_projection(binder, "text/output_head", head_format, 248320, 5120,
+                                      "text/output_head_projection/input_scale_divisor");
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
