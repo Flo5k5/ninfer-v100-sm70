@@ -148,6 +148,26 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
             input_rows == Nvfp4Residual17408Geometry::kInputRows);
 }
 
+// The [248320,5120] output head. It is not an Nvfp4Problem: the decode, small-T and W4A4 kernels
+// are specialized per registered geometry and none is instantiated for it. On Volta every A16
+// linear call goes through the shape-generic QPN2 route, which serves it; nvfp4_dispatch accepts
+// it there and nowhere else.
+using Nvfp4VocabularyGeometry = Nvfp4GemvGeometry<248320, 5120>;
+
+inline constexpr bool is_nvfp4_vocabulary_problem(std::int32_t output_rows,
+                                                  std::int32_t input_rows) {
+    return output_rows == Nvfp4VocabularyGeometry::kOutputRows &&
+           input_rows == Nvfp4VocabularyGeometry::kInputRows;
+}
+
+// Shapes nvfp4_dispatch() accepts on this build.
+inline constexpr bool is_nvfp4_dispatch_problem(std::int32_t output_rows, std::int32_t input_rows) {
+#ifdef NINFER_VOLTA_BUILD
+    if (is_nvfp4_vocabulary_problem(output_rows, input_rows)) { return true; }
+#endif
+    return is_nvfp4_linear_problem(output_rows, input_rows);
+}
+
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
     if (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
         input_rows == Nvfp4AttnInputGeometry::kInputRows) {
