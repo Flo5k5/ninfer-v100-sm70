@@ -185,7 +185,13 @@ class Encoder:
                 against_base.add(values, dequantize_words(base_codes[begin:end],
                                                           base_scales[begin:end], base_divisor))
         report["relative_rms_error_vs_base"] = against_base.value()
-        self._refuse(target, against_base.value(), "the base object's values")
+        if target.converts and self.weights is not None:
+            # A converted target replaces another numeric format: the cross-format distance to
+            # the base object mixes two quantization noises. The meaningful fidelity guard is
+            # against the unquantized --weights, checked below; the base distance is reported.
+            pass
+        else:
+            self._refuse(target, against_base.value(), "the base object's values")
         if self.weights is None:
             return packed
         report["relative_rms_error_vs_weights"] = against_weights.value()
