@@ -317,6 +317,12 @@ target_include_directories(ninfer_per_device_once_test PRIVATE ${PROJECT_SOURCE_
 target_link_libraries(ninfer_per_device_once_test PRIVATE Threads::Threads)
 add_test(NAME ninfer_per_device_once_test COMMAND ninfer_per_device_once_test)
 
+# Source lint: kernel attributes belong to one device, so src/ops never sets one from a plain
+# static initializer (docs/maintainer/op-development.md, section 4.2).
+add_test(NAME ninfer_per_device_setup_lint_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/lint_per_device_setup.py
+          ${PROJECT_SOURCE_DIR}/src/ops)
+
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
   add_bias

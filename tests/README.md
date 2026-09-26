@@ -64,6 +64,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `test_per_device_once.cpp` — per-device keying, once-per-device initialization, concurrent first
   use, and the allocation-free steady state of the cache used for kernel attributes and device
   facts, under a simulated device ordinal (no GPU);
+- `lint_per_device_setup.py` — source lint rejecting a `cudaFuncSetAttribute` or
+  `cudaFuncSetCacheConfig` issued from a plain `static` initializer under `src/ops`;
 - `test_per_device_kernel_attributes.cu` — a kernel above the 48 KiB dynamic shared-memory default,
   configured and launched on device 0 then device 1 (skips with fewer than two GPUs);
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
