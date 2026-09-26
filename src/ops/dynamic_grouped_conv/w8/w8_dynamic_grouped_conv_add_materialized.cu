@@ -1,5 +1,6 @@
 #include "ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_kernels.h"
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/linear/w8/w8_config.h"
 #include "ops/linear/w8/w8_launch.h"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
@@ -42,11 +43,14 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
                                                     W8SmallTMmaScaleAccess::Shared, Activation>;
     constexpr int SharedBytes = TileColumns > 64 ? sizeof(W8SmallTMmaSharedStorage<Schedule>) : 0;
     if constexpr (SharedBytes > 0) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
-            w8_small_t_mma_kernel<Geometry, TileColumns, Schedule, W8ContiguousOutput,
-                                  W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, SharedBytes);
-        CUDA_CHECK(attribute);
+        static PerDeviceOnce<cudaError_t> attribute;
+        CUDA_CHECK(attribute.get([&] {
+            return cudaFuncSetAttribute(
+                w8_small_t_mma_kernel<Geometry, TileColumns, Schedule, W8ContiguousOutput,
+                                      W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false,
+                                      true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, SharedBytes);
+        }));
     }
     const int columns = x.ne[1];
     W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};

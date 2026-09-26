@@ -2,6 +2,7 @@
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh"
@@ -34,10 +35,12 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
     CUDA_CHECK(cudaGetLastError());
     return;
 #else
-    static const cudaError_t attr = cudaFuncSetAttribute(
-        causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes);
-    CUDA_CHECK(attr);
+    static PerDeviceOnce<cudaError_t> attr;
+    CUDA_CHECK(attr.get([&] {
+        return cudaFuncSetAttribute(causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kCausalPromptFp8SmemBytes);
+    }));
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptFp8Br)),

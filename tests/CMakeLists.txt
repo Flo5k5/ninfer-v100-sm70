@@ -73,6 +73,8 @@ ninfer_add_test(ninfer_media_decode_test
   SOURCES test_media_decode.cpp
   LIBRARIES ninfer_media_decode)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
+ninfer_add_test(ninfer_per_device_kernel_attributes_test
+  SOURCES test_per_device_kernel_attributes.cu)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
@@ -127,6 +129,7 @@ ninfer_add_test(ninfer_gdn_replay_records_test
 set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test
+  ninfer_per_device_kernel_attributes_test
   ninfer_decode_graph_test
   ninfer_arena_test
   ninfer_kv_cache_test
@@ -306,6 +309,13 @@ add_executable(ninfer_context_cost_measure_test
 target_include_directories(ninfer_context_cost_measure_test PRIVATE
   ${PROJECT_SOURCE_DIR}/bench/context_cost)
 add_test(NAME ninfer_context_cost_measure_test COMMAND ninfer_context_cost_measure_test)
+
+# Pure host-side qualification of the per-device once cache under a simulated device ordinal. It
+# deliberately links no CUDA target, so it runs on machines without a GPU.
+add_executable(ninfer_per_device_once_test test_per_device_once.cpp)
+target_include_directories(ninfer_per_device_once_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(ninfer_per_device_once_test PRIVATE Threads::Threads)
+add_test(NAME ninfer_per_device_once_test COMMAND ninfer_per_device_once_test)
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
@@ -501,6 +511,7 @@ endforeach()
 set(ninfer_gpu_contract_tests
   ninfer_artifact_materialization_test
   ninfer_device_test
+  ninfer_per_device_kernel_attributes_test
   ninfer_decode_graph_test
   ninfer_arena_test
   ninfer_kv_cache_test

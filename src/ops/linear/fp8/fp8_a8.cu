@@ -1,6 +1,7 @@
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/fp8/fp8_a8_schedule.cuh"
@@ -78,11 +79,13 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
-            fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
-                           Fp8ContiguousOutput>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attribute);
+        static PerDeviceOnce<cudaError_t> attribute;
+        CUDA_CHECK(attribute.get([&] {
+            return cudaFuncSetAttribute(fp8_mma_kernel<Geometry, Schedule, FullTokens,
+                                                       Fp8IdentityEpilogue, Fp8ContiguousOutput>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        Schedule::kSharedBytes);
+        }));
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(

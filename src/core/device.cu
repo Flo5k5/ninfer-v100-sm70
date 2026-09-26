@@ -1,5 +1,7 @@
 #include "core/device.h"
 
+#include "core/per_device.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -41,6 +43,12 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,
                  cudaGetErrorName(err), cudaGetErrorString(err));
     std::abort();
+}
+
+int CurrentCudaDevice::operator()() const {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    return device;
 }
 
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
