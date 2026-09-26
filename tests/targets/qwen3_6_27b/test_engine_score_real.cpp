@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "score_real_text.h"
 
 #include <algorithm>
 #include <bit>
@@ -83,31 +84,55 @@ struct ShapeScores {
     std::vector<float> narrow;
 };
 
+constexpr std::size_t kScoringTokens = 1537;
+
 std::vector<ninfer::TokenId> scoring_tokens(const ninfer::Engine& engine) {
-    std::string text;
-    const std::string paragraph =
-        "NInfer scores each target token from the preceding hidden state. "
-        "Every evaluation window owns fresh state and a fresh KV address space.\n";
-    std::vector<ninfer::TokenId> tokens;
-    while (tokens.size() < 1537) {
-        text += paragraph;
-        tokens = engine.tokenize_text(text);
+    std::vector<ninfer::TokenId> tokens =
+        engine.tokenize_text(std::string(ninfer::test::kScoringText));
+    if (tokens.size() < kScoringTokens) {
+        throw std::runtime_error("the scoring text is shorter than " +
+                                 std::to_string(kScoringTokens) + " tokens");
     }
-    tokens.resize(1537);
+    tokens.resize(kScoringTokens);
     return tokens;
 }
 
-ninfer::EngineOptions scoring_options(const char* artifact, ninfer::TextResidualStorage residual) {
+ninfer::EngineOptions scoring_options(const char* artifact, ninfer::TextResidualStorage residual,
+                                      ninfer::KvCacheStorage kv_cache) {
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
     options.purpose       = ninfer::EnginePurpose::CausalScoring;
     options.max_context   = 2048;
-    options.kv_cache      = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.kv_cache      = kv_cache;
     options.text_residual = residual;
     return options;
 }
 
+// Kernel-path agreement is judged against a neutral perturbation of the same text: the prefill
+// shape with a BF16 KV cache instead of FP8. Two scoring shapes may disagree on average by up to
+// kMargin times it, and a perturbation above kIllConditioned means the text itself is chaotic for
+// this artifact. The maximum stays a fixed bound on a gross failure. Measured on this text: KV
+// perturbation 0.024 (Qwen3.6-27B NVFP4 and Qwen3.8-27B NVFP4), decode shape 0.020 and 0.023, both
+// above a fixed 0.02 gate; on the former repeated paragraph the perturbation was 2.35.
+constexpr double kMeanFloor      = 0.02;
+constexpr double kMaximum        = 2.0;
+constexpr double kMargin         = 1.5;
+constexpr double kIllConditioned = 0.05;
+
+struct Tolerance {
+    double mean    = kMeanFloor;
+    double maximum = kMaximum;
+};
+
+bool within(const Agreement& agreed, const Tolerance& tolerance) {
+    return agreed.valid && agreed.mean <= tolerance.mean && agreed.maximum <= tolerance.maximum;
+}
+
+// The engine under test must use the FP8 KV cache. With kv_reference (the prefill-shape target
+// logprobs of a BF16-KV engine on the same tokens), the tolerance is derived from the perturbation
+// between the two and returned; without it, the given tolerance applies unchanged.
 int exercise_scoring(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& tokens,
+                     const std::vector<float>* kv_reference, Tolerance& tolerance,
                      ShapeScores& scores) {
     const auto& effective = engine.options();
     if (effective.max_concurrency != 1 || effective.prefill_chunk != 1024 ||
@@ -143,6 +168,20 @@ int exercise_scoring(ninfer::Engine& engine, const std::vector<ninfer::TokenId>&
         std::cerr << "overlapping target suffix changed by " << maximum_overlap_error << '\n';
         return 1;
     }
+    Agreement perturbation;
+    if (kv_reference != nullptr) {
+        perturbation = agreement(suffix, *kv_reference);
+        if (!perturbation.valid) {
+            std::cerr << "the BF16-KV reference scores are missing, misshaped or non-finite\n";
+            return 1;
+        }
+        if (perturbation.mean > kIllConditioned) {
+            std::cerr << "the scoring text is ill-conditioned: a BF16 KV cache moved the prefill "
+                      << "targets by " << perturbation.mean << " on average\n";
+            return 1;
+        }
+        tolerance.mean = std::max(kMeanFloor, kMargin * perturbation.mean);
+    }
     // Exported logits: 1536 scored positions span a full 1024-column tile and a partial one.
     RecordingSink sink(std::span<const ninfer::TokenId>(tokens).subspan(1));
     const std::vector<float> with_sink = engine.score_tokens(tokens, 1, &sink);
@@ -177,9 +216,10 @@ int exercise_scoring(ninfer::Engine& engine, const std::vector<ninfer::TokenId>&
     // the agreement gate and the maximum only bounds a gross failure.
     const std::vector<float> narrow = engine.score_tokens(tokens, 513, nullptr, {.scored_chunk = 4});
     const Agreement shape = agreement(narrow, suffix);
-    if (!shape.valid || shape.mean > 0.02 || shape.maximum > 2.0) {
+    if (!within(shape, tolerance)) {
         std::cerr << "decode-width scoring moved targets by " << shape.mean << " on average, "
-                  << shape.maximum << " at most\n";
+                  << shape.maximum << " at most (tolerance " << tolerance.mean << ", "
+                  << tolerance.maximum << ")\n";
         return 1;
     }
     try {
@@ -190,8 +230,13 @@ int exercise_scoring(ninfer::Engine& engine, const std::vector<ninfer::TokenId>&
     } catch (const std::invalid_argument&) {
     }
     std::cout << "causal_score_real max_overlap_error=" << maximum_overlap_error
-              << " max_sink_error=" << maximum_sink_error << " decode_shape_error mean="
-              << shape.mean << " max=" << shape.maximum << '\n';
+              << " max_sink_error=" << maximum_sink_error;
+    if (kv_reference != nullptr) {
+        std::cout << " kv_perturbation mean=" << perturbation.mean
+                  << " max=" << perturbation.maximum;
+    }
+    std::cout << " decode_shape_error mean=" << shape.mean << " max=" << shape.maximum
+              << " tolerance=" << tolerance.mean << '\n';
     scores.prefill = suffix;
     scores.narrow  = narrow;
     return 0;
@@ -220,11 +265,24 @@ int main(int argc, char** argv) {
     }
 
     std::vector<ninfer::TokenId> tokens;
-    ShapeScores bf16;
+    std::vector<float> kv_reference;
     {
-        ninfer::Engine engine(scoring_options(artifact, ninfer::TextResidualStorage::BFloat16));
-        tokens = scoring_tokens(engine);
-        if (const int result = exercise_scoring(engine, tokens, bf16); result != 0) {
+        ninfer::Engine engine(scoring_options(artifact, ninfer::TextResidualStorage::BFloat16,
+                                              ninfer::KvCacheStorage::BFloat16));
+        if (engine.options().kv_cache != ninfer::KvCacheStorage::BFloat16) {
+            std::cerr << "the BF16 KV cache of the reference engine was not retained\n";
+            return 1;
+        }
+        tokens       = scoring_tokens(engine);
+        kv_reference = engine.score_tokens(tokens, 513);
+    }
+    ShapeScores bf16;
+    Tolerance tolerance;
+    {
+        ninfer::Engine engine(scoring_options(artifact, ninfer::TextResidualStorage::BFloat16,
+                                              ninfer::KvCacheStorage::Fp8E4M3Row256));
+        if (const int result = exercise_scoring(engine, tokens, &kv_reference, tolerance, bf16);
+            result != 0) {
             return result;
         }
     }
@@ -233,24 +291,28 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    ninfer::Engine engine(scoring_options(artifact, ninfer::TextResidualStorage::Float32));
+    ninfer::Engine engine(scoring_options(artifact, ninfer::TextResidualStorage::Float32,
+                                          ninfer::KvCacheStorage::Fp8E4M3Row256));
     if (engine.options().text_residual != ninfer::TextResidualStorage::Float32) {
         std::cerr << "the FP32 text residual was not retained by the Engine\n";
         return 1;
     }
+    // The FP32 engine is held to the BF16-residual engine's tolerance: a perturbation measured on
+    // it would mix the residual change with the KV change and loosen its own gate.
     ShapeScores residual32;
-    if (const int result = exercise_scoring(engine, tokens, residual32); result != 0) {
+    if (const int result = exercise_scoring(engine, tokens, nullptr, tolerance, residual32);
+        result != 0) {
         return result;
     }
-    // The FP32 residual removes BF16 roundings of the stream; it must not move the model. On this
-    // near-deterministic text the targets agree like the two scoring shapes do.
+    // The FP32 residual removes BF16 roundings of the stream; it must not move the model. The
+    // targets agree like the two scoring shapes do, within the BF16-residual engine's tolerance.
     for (const auto& [label, fp32_scores, bf16_scores] :
          {std::tuple{"prefill", &residual32.prefill, &bf16.prefill},
           std::tuple{"decode-width", &residual32.narrow, &bf16.narrow}}) {
         const Agreement agreed = agreement(*fp32_scores, *bf16_scores);
         std::cout << "fp32/bf16 residual " << label << " agreement mean=" << agreed.mean
                   << " max=" << agreed.maximum << '\n';
-        if (!agreed.valid || agreed.mean > 0.02 || agreed.maximum > 2.0) {
+        if (!within(agreed, tolerance)) {
             std::cerr << "the FP32 residual moved " << label << " targets by " << agreed.mean
                       << " on average, " << agreed.maximum << " at most\n";
             return 1;

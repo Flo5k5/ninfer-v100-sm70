@@ -1,0 +1,45 @@
+#pragma once
+
+#include <string_view>
+
+namespace ninfer::test {
+
+// Ordinary, non-repeating English prose written for the causal scoring tests (no external source).
+// A scoring text must be well-conditioned: on a paragraph repeated end to end, Qwen3.6-27B NVFP4
+// is chaotic, and switching only the prefill KV cache from FP8 to BF16 already moves the targets
+// by about two nats, which hides any real disagreement between two scoring shapes.
+inline constexpr std::string_view kScoringText =
+    R"text(The harbour town of Keldmouth sits where a slow brown river meets a cold grey sea. For most of its history it was known for two things: herring and bad weather. The herring have mostly gone, but the weather has stayed, and the people who remain have learned to talk about it with a mix of pride and resignation that visitors rarely understand on their first day.
+
+In the early morning the quay is quiet. A few boats still go out, painted in colours that fade within a season, and the men who crew them move without hurry. They check ropes, knock ice from the rails in winter, and argue about the forecast as if it were a neighbour who could not be trusted. The harbour master keeps a chalkboard outside his office. On it he writes the tide times, the wind speed, and, when he is in a good mood, a line of poetry that nobody admits to reading.
+
+The town grew up around the river crossing long before anyone built a proper bridge. Old maps show a ford, then a ferry, then a wooden bridge that burned down twice. The stone bridge that stands today was finished in 1841, and the date is carved into the central arch alongside the names of three masons who, according to local legend, argued so much that each of them insisted on signing it separately. Children still run their fingers along the letters on the way to school.
+
+Most of the older houses are built from the same dark stone as the bridge. They have thick walls, small windows, and roofs of heavy slate that sound like drums in a storm. Inside, the rooms are low and the stairs are steep. People who move here from the cities often complain that they keep hitting their heads on the beams; within a year they stop complaining and start ducking without thinking about it.
+
+The market is held every Thursday in the square behind the church. There are stalls selling vegetables, cheese, bread, wool, secondhand books, and tools that look older than the town itself. One woman sells nothing but honey, in jars of different shades from pale gold to almost black, and she will tell anyone who asks exactly which fields and which months each jar comes from. A man at the far corner repairs clocks while you wait. His table is covered in tiny screws, springs, and glass faces, and he works with a lens screwed into one eye, humming songs that were popular before most of his customers were born.
+
+Cooking in Keldmouth has always depended on what the sea and the soil would allow. A typical winter supper might be a fish stew thickened with potatoes, flavoured with leeks and a little smoked bacon, and served with bread that has been baked that afternoon. In summer there are salads of new potatoes and peas, mackerel grilled over driftwood on the beach, and strawberries from the farms up the valley. The recipes are rarely written down. They pass from one kitchen to another through watching, tasting, and occasional disagreement about how much salt is too much.
+
+Education came late to the town. The first school was a single room above a warehouse, and the teacher was paid partly in coal. Records from the 1870s show forty-two pupils on the register, although attendance dropped sharply during the herring season, when every pair of hands was needed to gut and salt the catch. Today the school has a library, a science laboratory, and a football pitch that floods every spring. The pupils learn French and Spanish, but they also learn the names of the rocks along the coast, which the fishermen have been using for centuries to navigate in poor visibility.
+
+Those names are worth recording. There is the Widow, a tall pillar that leans slightly towards the shore. There is the Anvil, flat and broad, which disappears at high tide. There are the Seven Sisters, although anyone who counts them will find only six, and the story of the missing seventh changes depending on who is telling it. Some say she was struck by lightning; others say she walked into the sea one night and never came back. A retired lifeboat captain once explained, with complete seriousness, that the seventh sister is still there but only visible to people who have never told a lie.
+
+The lifeboat station stands at the end of the eastern pier. It was founded after a winter in which three boats were lost within sight of the harbour, and the volunteers who crew it are among the most respected people in town. They train twice a week, whatever the weather, and they keep a logbook that goes back more than a century. Reading it is a sobering experience. The entries are short and practical: the time the alarm was raised, the conditions at sea, the number of people rescued, and occasionally a single line noting that nobody could be found.
+
+Not everything in Keldmouth is serious. Every August the town holds a regatta that includes proper sailing races, a swimming contest across the harbour, and a competition to build the strangest boat that will float for at least five minutes. Entries have included a bathtub fitted with a sail, a raft made entirely from plastic bottles, and a wooden duck large enough for four people to sit inside. The judges are chosen by drawing names from a hat, and their decisions are final, even when they are obviously wrong.
+
+The economy has changed a great deal over the past fifty years. When the herring stocks collapsed, many families left to look for work elsewhere. Those who stayed found other ways to make a living. Some turned their boats to lobster and crab. Others opened guest houses, cafés, and small workshops. A boatyard that once built fishing vessels now restores old wooden yachts for owners who live hundreds of miles away. A disused net loft has become a studio where two sisters weave rugs from wool dyed with plants gathered on the cliffs.
+
+Technology arrived in the town slowly and then all at once. For years the only reliable telephone was in the post office, and news from the outside world came mainly through the newspaper, which was delivered by bus and was usually a day late. Now almost every house has a fast internet connection, and the harbour master checks satellite images of approaching weather systems on a tablet before he writes anything on his chalkboard. He says the new tools are useful, but that they have not made the sea any more predictable. The old rule still applies: if the gulls come inland and sit on the roofs, stay in port.
+
+Scientists from a university on the mainland have set up a small research station near the lighthouse. They measure water temperature, salinity, and the concentration of plankton, and they tag seals to follow their movements along the coast. The data suggest that the waters around Keldmouth are warming by a fraction of a degree each decade, and that some species of fish are moving north while others are arriving from the south. Local fishermen were sceptical at first, but several of them now keep their own records and share them with the researchers, who in return explain what the numbers mean.
+
+Walking is the best way to understand the landscape. A path follows the cliffs for twelve miles, climbing and dropping through heather, gorse, and patches of short grass kept tidy by rabbits. On clear days it is possible to see the mountains on the far side of the bay, their tops white until late spring. On most days, however, the view is limited to a few hundred yards of wet rock and the sound of waves somewhere below. Experienced walkers carry a map, a compass, a flask of tea, and a sense of humour, and they always tell someone in town where they are going.
+
+In the evenings people gather in one of the two pubs. The older one has a low ceiling, a fire that is lit from October to May, and a collection of photographs showing boats, storms, and weddings from the past hundred years. The newer one serves food and occasionally hosts live music, which is loud enough to be heard on the far side of the harbour. Loyalty to one pub or the other is taken seriously, and it is said that at least one engagement was broken off over the question of which of them should host the reception.
+
+Visitors often ask what keeps people in a place with so much wind and so little work. The answers vary. Some talk about the light, which changes by the minute and turns the water silver, green, or black. Some talk about the quiet, and about knowing the names of everyone they pass in the street. Others simply shrug and say that they tried living somewhere else and did not like it. The harbour master, when asked, points to his chalkboard, where he has written the tide times for the following day, and says that someone has to be here to read them.
+)text";
+
+} // namespace ninfer::test
