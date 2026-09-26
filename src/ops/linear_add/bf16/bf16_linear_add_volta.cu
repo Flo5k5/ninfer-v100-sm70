@@ -50,6 +50,9 @@ __launch_bounds__(kThreads, 2) __global__ void bf16_linear_add_volta_kernel(
                 residual[offset] = __float2bfloat16_rn(
                     sum + __bfloat162float(residual[offset]));
             }
+            // warp 0 reads warp_sums after the reduction's only barrier; the next token's
+            // reduction must not overwrite it before that read. `active` is block-uniform.
+            __syncthreads();
         }
     }
 }
