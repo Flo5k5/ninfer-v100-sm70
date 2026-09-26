@@ -50,15 +50,19 @@ struct Variant {
     static constexpr std::int32_t draft_head_rows              = 131072;
 
     // True when every op that reads or writes the text residual stream has an FP32 form for this
-    // weights profile: an FP8 token embedding and FP8/NVFP4 residual projections. The three Qwen3.8
-    // NVFP4 profiles meet it: the NVFP4 down projections of MLP 56-63 (full-a and full-b) take the
-    // route of layers 0-55, their NVFP4 output head reads the normed BF16 hidden state, not the
-    // stream, and the NVFP4 attention and GDN input projections of full-b read that normed hidden
-    // state too, never the stream.
+    // weights profile: an FP8 token embedding and FP8/NVFP4 residual projections. The four Qwen3.8
+    // NVFP4 profiles meet it: the NVFP4 down projections of MLP 56-63 (full-a, full-b and full-c)
+    // take the route of layers 0-55, their NVFP4 output head reads the normed BF16 hidden state,
+    // not the stream, and the NVFP4 attention and GDN input projections (full-b and full-c) read
+    // that normed hidden state too. The NVFP4 attention and GDN output projections of full-c update
+    // the stream through the linear_add routes of the down projections, which take an FP32
+    // residual on the [5120,6144] shape as well: the QPN2 epilogue up to 32 columns, the CUTLASS
+    // FP32 accumulators from 33.
     [[nodiscard]] static constexpr bool fp32_residual_supported(WeightsProfile profile) {
         return profile == WeightsProfile::Qwen38Nvfp4 ||
                profile == WeightsProfile::Qwen38Nvfp4FullA ||
-               profile == WeightsProfile::Qwen38Nvfp4FullB;
+               profile == WeightsProfile::Qwen38Nvfp4FullB ||
+               profile == WeightsProfile::Qwen38Nvfp4FullC;
     }
 
     static void attention_projection(const Tensor& hidden,

@@ -1,17 +1,19 @@
 // Host-only binding check for the derived Qwen3.8 NVFP4 profiles, one per run:
 //   full A (no argument): MLP 0-63 and the output head in NVFP4, the token embedding, attention
 //     and GDN in FP8;
-//   full B (--full-b): full A with the attention and GDN input projections in NVFP4 too.
+//   full B (--full-b): full A with the attention and GDN input projections in NVFP4 too;
+//   full C (--full-c): full B with the attention and GDN output projections in NVFP4 too.
 // Binding reads the directory and a few small host objects (divisors, proposal ids); nothing here
 // touches a device. The bound formats must also give the text residual stream its FP32 form, which
 // Variant must then accept for the profile.
 //
 //   NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS=<full A artifact>
 //   NINFER_QWEN3_8_27B_NVFP4_FULL_B_WEIGHTS=<full B artifact>                         (--full-b)
+//   NINFER_QWEN3_8_27B_NVFP4_FULL_C_WEIGHTS=<full C artifact>                         (--full-c)
 //   NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=<mixed NVFP4/FP8 artifact full A derives from>   (optional)
 //
 // When the artifact a profile derives from is also set (the mixed artifact for full A, full A for
-// full B), the run checks that the profile needs fewer device weight bytes.
+// full B, full B for full C), the run checks that the profile needs fewer device weight bytes.
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
@@ -44,65 +46,91 @@ using namespace ninfer::targets::qwen3_6_27b::detail;
 
 constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
 
-// A v3 leaf of a fused input parent and the parent rows it covers (docs/maintainer/
-// qwen3.8-27b-artifact.md, section 8.1); every parent row has 5120 columns.
-struct FusedLeaf {
+// A v3 leaf of an NVFP4 parent and the parent rows it covers (docs/maintainer/
+// qwen3.8-27b-artifact.md, section 8.1).
+struct Leaf {
     std::string_view name;
     std::uint64_t first_row;
     std::uint64_t rows;
 };
 
-constexpr std::uint64_t kParentColumns = 5120;
+// Columns of the input parents ([14336,5120], [16384,5120]) and of the outputs ([5120,6144]).
+constexpr std::uint64_t kInputColumns  = 5120;
+constexpr std::uint64_t kOutputColumns = 6144;
 
-constexpr std::array<FusedLeaf, 4> kAttentionLeaves{{
+constexpr std::array<Leaf, 4> kAttentionLeaves{{
     {.name = "query", .first_row = 0, .rows = 6144},
     {.name = "key", .first_row = 6144, .rows = 1024},
     {.name = "gate", .first_row = 7168, .rows = 6144},
     {.name = "value", .first_row = 13312, .rows = 1024},
 }};
 
-constexpr std::array<FusedLeaf, 4> kGdnLeaves{{
+constexpr std::array<Leaf, 4> kGdnLeaves{{
     {.name = "query", .first_row = 0, .rows = 2048},
     {.name = "key", .first_row = 2048, .rows = 2048},
     {.name = "value", .first_row = 4096, .rows = 6144},
     {.name = "z", .first_row = 10240, .rows = 6144},
 }};
 
+// An attention or GDN output is not fused: its one leaf is the whole object.
+constexpr std::array<Leaf, 1> kOutputLeaf{{{.name = "output", .first_row = 0, .rows = 5120}}};
+
 // Bindings that meet the FP32 residual criterion below must be accepted by Variant's per-profile
 // guard, which Engine startup checks. Checked at compile time, so a build that drops a profile from
 // the guard fails even where this test cannot run (no artifact).
 static_assert(Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4) &&
                   Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullA) &&
-                  Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullB),
-              "the three Qwen3.8 NVFP4 profiles must allow the FP32 text residual");
+                  Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullB) &&
+                  Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullC),
+              "the four Qwen3.8 NVFP4 profiles must allow the FP32 text residual");
+
+// Only full C prepacks its NVFP4 attention and GDN outputs at load; the Qwen3.6-27B nvfp4 profile,
+// whose outputs are NVFP4 too, keeps them checkpoint-native.
+static_assert(prepacks_nvfp4_mixer_outputs(WeightsProfile::Qwen38Nvfp4FullC) &&
+                  !prepacks_nvfp4_mixer_outputs(WeightsProfile::Qwen36Nvfp4),
+              "only the full-c profile prepacks its NVFP4 mixer outputs");
 
 // A derived profile under test, and the artifact it derives from.
 struct DerivedProfile {
     const char* label;
     WeightsProfile profile;
     const char* variable;
-    // Format of the attention and GDN input projections; every other checked role is shared.
+    // Formats of the attention and GDN input and output projections; every other checked role is
+    // shared.
     NumericFormat input_projection;
+    NumericFormat output_projection;
     WeightsProfile parent_profile;
     const char* parent_variable;
 };
 
 constexpr DerivedProfile kFullA{
-    .label            = "full A",
-    .profile          = WeightsProfile::Qwen38Nvfp4FullA,
-    .variable         = "NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS",
-    .input_projection = kFp8,
-    .parent_profile   = WeightsProfile::Qwen38Nvfp4,
-    .parent_variable  = "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS",
+    .label             = "full A",
+    .profile           = WeightsProfile::Qwen38Nvfp4FullA,
+    .variable          = "NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS",
+    .input_projection  = kFp8,
+    .output_projection = kFp8,
+    .parent_profile    = WeightsProfile::Qwen38Nvfp4,
+    .parent_variable   = "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS",
 };
 
 constexpr DerivedProfile kFullB{
-    .label            = "full B",
-    .profile          = WeightsProfile::Qwen38Nvfp4FullB,
-    .variable         = "NINFER_QWEN3_8_27B_NVFP4_FULL_B_WEIGHTS",
-    .input_projection = NumericFormat::NVFP4,
-    .parent_profile   = WeightsProfile::Qwen38Nvfp4FullA,
-    .parent_variable  = "NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS",
+    .label             = "full B",
+    .profile           = WeightsProfile::Qwen38Nvfp4FullB,
+    .variable          = "NINFER_QWEN3_8_27B_NVFP4_FULL_B_WEIGHTS",
+    .input_projection  = NumericFormat::NVFP4,
+    .output_projection = kFp8,
+    .parent_profile    = WeightsProfile::Qwen38Nvfp4FullA,
+    .parent_variable   = "NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS",
+};
+
+constexpr DerivedProfile kFullC{
+    .label             = "full C",
+    .profile           = WeightsProfile::Qwen38Nvfp4FullC,
+    .variable          = "NINFER_QWEN3_8_27B_NVFP4_FULL_C_WEIGHTS",
+    .input_projection  = NumericFormat::NVFP4,
+    .output_projection = NumericFormat::NVFP4,
+    .parent_profile    = WeightsProfile::Qwen38Nvfp4FullB,
+    .parent_variable   = "NINFER_QWEN3_8_27B_NVFP4_FULL_B_WEIGHTS",
 };
 
 std::filesystem::path environment_path(const char* name) {
@@ -162,16 +190,17 @@ int verify_fp32_residual_form(const BindingPlan& bindings) {
     return 0;
 }
 
-// The v3 leaves of an NVFP4 input parent. Each binds one part of the bound parent object, the rows
-// of section 8.1: the binder only checks that the leaves follow each other and cover the object,
-// not where each one ends, so leaves with the wrong row counts would pass it. Every leaf Use
-// carries the activation input divisor: a scalar FP32 object, finite and positive, bit-identical
-// across the leaves, and the value the binder bound for the parent.
-int verify_input_leaves(const ninfer::artifact::Reader& reader, const std::string& group,
-                        std::span<const FusedLeaf> leaves, const WeightPlan& parent) {
+// The v3 leaves of an NVFP4 parent, `columns` wide. Each binds one part of the bound parent object,
+// the rows of section 8.1 (all of them for an output): the binder only checks that the leaves
+// follow each other and cover the object, not where each one ends, so leaves with the wrong row
+// counts would pass it. Each leaf has at least one Use carrying the activation input divisor, as
+// the binder requires; every divisor found is a scalar FP32 object, finite and positive,
+// bit-identical across the leaves, and the value the binder bound for the parent.
+int verify_leaves(const ninfer::artifact::Reader& reader, const std::string& group,
+                  std::span<const Leaf> leaves, std::uint64_t columns, const WeightPlan& parent) {
     const ninfer::artifact::Directory& directory = reader.directory();
     std::optional<std::uint32_t> shared;
-    for (const FusedLeaf& leaf : leaves) {
+    for (const Leaf& leaf : leaves) {
         const std::string parameter = group + std::string(leaf.name);
         const auto binding          = directory.bindings.find(parameter);
         if (binding == directory.bindings.end() || binding->second.parts.size() != 1) {
@@ -179,12 +208,12 @@ int verify_input_leaves(const ninfer::artifact::Reader& reader, const std::strin
             return 1;
         }
         const ninfer::artifact::Part& part = binding->second.parts.front();
-        const std::uint64_t begin          = leaf.first_row * kParentColumns;
-        const std::uint64_t end            = (leaf.first_row + leaf.rows) * kParentColumns;
+        const std::uint64_t begin          = leaf.first_row * columns;
+        const std::uint64_t end            = (leaf.first_row + leaf.rows) * columns;
         if (!(part.object == parent.object) || part.begin != begin || part.end != end) {
             std::cerr << parameter << ": binds elements [" << part.begin << "," << part.end
                       << ") instead of rows [" << leaf.first_row << ","
-                      << leaf.first_row + leaf.rows << ") x " << kParentColumns
+                      << leaf.first_row + leaf.rows << ") x " << columns
                       << " of the bound parent\n";
             return 1;
         }
@@ -231,8 +260,8 @@ int verify_input_leaves(const ninfer::artifact::Reader& reader, const std::strin
     return 0;
 }
 
-// Formats per role: the input projections in the profile's format (with their leaf rows and
-// divisors when NVFP4), FP8 attention and GDN outputs, every MLP and the output head in NVFP4.
+// Formats per role: the input and output projections in the profile's formats (with their leaf rows
+// and divisors when NVFP4), every MLP and the output head in NVFP4.
 int verify_formats(const ninfer::artifact::Reader& reader, const BindingPlan& bindings,
                    const DerivedProfile& tested) {
     if (!valid_nvfp4(bindings.output_head)) {
@@ -253,15 +282,21 @@ int verify_formats(const ninfer::artifact::Reader& reader, const BindingPlan& bi
                  : std::get<FusedGdnInputProjectionPlan>(plan.gdn.input_projection)
                        .query_key_value_z;
         const WeightPlan& output = full ? plan.attention.output : plan.gdn.output;
-        if (!has_format(input, tested.input_projection) || output.format != kFp8) {
+        if (!has_format(input, tested.input_projection) ||
+            !has_format(output, tested.output_projection)) {
             std::cerr << "layer " << layer << ": " << (full ? "attention" : "GDN")
                       << " input or output projection has the wrong format\n";
             return 1;
         }
+        const std::string group = prefix + (full ? "attention/" : "gdn/");
+        const std::span<const Leaf> input_leaves =
+            full ? std::span<const Leaf>(kAttentionLeaves) : std::span<const Leaf>(kGdnLeaves);
         if (tested.input_projection == NumericFormat::NVFP4) {
-            const int leaves =
-                full ? verify_input_leaves(reader, prefix + "attention/", kAttentionLeaves, input)
-                     : verify_input_leaves(reader, prefix + "gdn/", kGdnLeaves, input);
+            const int leaves = verify_leaves(reader, group, input_leaves, kInputColumns, input);
+            if (leaves != 0) { return leaves; }
+        }
+        if (tested.output_projection == NumericFormat::NVFP4) {
+            const int leaves = verify_leaves(reader, group, kOutputLeaf, kOutputColumns, output);
             if (leaves != 0) { return leaves; }
         }
         if (full) {
@@ -294,6 +329,10 @@ int verify_profile(const DerivedProfile& tested, const std::filesystem::path& pa
         return result;
     }
     if (const int result = verify_fp32_residual_form(plan.bindings); result != 0) { return result; }
+    if (plan.bindings.prepack_nvfp4_mixer_outputs != prepacks_nvfp4_mixer_outputs(tested.profile)) {
+        std::cerr << "the binding plan does not carry the profile's mixer output prepack\n";
+        return 1;
+    }
     std::cout << tested.label << ": " << plan.materialization.device_objects.size()
               << " device objects, " << plan.materialization.device_capacity_bytes
               << " device bytes (MTP, optimized proposal head)\n";
@@ -342,15 +381,25 @@ int verify_smaller_than_parent(const DerivedProfile& tested, const std::filesyst
     return 0;
 }
 
+// The profile a run checks: full A without an argument, full B or full C with its flag.
+const DerivedProfile* selected_profile(int argc, char** argv) {
+    if (argc == 1) { return &kFullA; }
+    if (argc != 2) { return nullptr; }
+    const std::string_view flag(argv[1]);
+    if (flag == "--full-b") { return &kFullB; }
+    if (flag == "--full-c") { return &kFullC; }
+    return nullptr;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool full_b = argc == 2 && std::string_view(argv[1]) == "--full-b";
-    if (argc != 1 && !full_b) {
-        std::cerr << "usage: " << argv[0] << " [--full-b]\n";
+    const DerivedProfile* selected = selected_profile(argc, argv);
+    if (selected == nullptr) {
+        std::cerr << "usage: " << argv[0] << " [--full-b|--full-c]\n";
         return 2;
     }
-    const DerivedProfile& tested         = full_b ? kFullB : kFullA;
+    const DerivedProfile& tested         = *selected;
     const std::filesystem::path artifact = environment_path(tested.variable);
     if (artifact.empty() || !std::filesystem::is_regular_file(artifact)) {
         std::cerr << "skip: set " << tested.variable << '\n';

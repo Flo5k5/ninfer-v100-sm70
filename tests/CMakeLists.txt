@@ -185,10 +185,10 @@ ninfer_add_test(ninfer_qwen3_6_27b_structured_real_test
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_structured_real_test PROPERTIES SKIP_RETURN_CODE 77)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  # The FP32 text residual stream (Volta): startup planning on the three qwen3.8-27b NVFP4
+  # The FP32 text residual stream (Volta): startup planning on the four qwen3.8-27b NVFP4
   # profiles; scoring in both shapes against a BF16-residual engine and the production MTP + CUDA
-  # Graph decode on the artifact named by NINFER_QWEN3_8_27B_NVFP4_WEIGHTS (nvfp4, nvfp4-full-a or
-  # nvfp4-full-b).
+  # Graph decode on the artifact named by NINFER_QWEN3_8_27B_NVFP4_WEIGHTS (nvfp4, nvfp4-full-a,
+  # nvfp4-full-b or nvfp4-full-c).
   add_test(NAME ninfer_qwen3_6_27b_score_real_fp32_test
     COMMAND ninfer_qwen3_6_27b_score_real_test --text-residual fp32)
   ninfer_add_test(ninfer_qwen3_6_27b_residual_real_test
@@ -217,9 +217,9 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  # nvfp4-full-a and nvfp4-full-b bind on sm_70 builds only: other builds refuse their NVFP4 output
-  # head. One binary checks either profile; each entry skips unless its artifact is set
-  # (NINFER_QWEN3_8_27B_NVFP4_FULL_A_WEIGHTS, NINFER_QWEN3_8_27B_NVFP4_FULL_B_WEIGHTS).
+  # nvfp4-full-a, nvfp4-full-b and nvfp4-full-c bind on sm_70 builds only: other builds refuse
+  # their NVFP4 output head. One binary checks one profile per run; each entry skips unless its
+  # artifact is set (NINFER_QWEN3_8_27B_NVFP4_FULL_{A,B,C}_WEIGHTS).
   ninfer_add_test(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test
     SOURCES targets/qwen3_6_27b/test_nvfp4_full_load_plan.cpp
     LIBRARIES ninfer_engine)
@@ -229,9 +229,12 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   target_link_libraries(ninfer_qwen3_8_27b_nvfp4_full_load_plan_test PRIVATE CUDA::cudart)
   add_test(NAME ninfer_qwen3_8_27b_nvfp4_full_b_load_plan_test
     COMMAND ninfer_qwen3_8_27b_nvfp4_full_load_plan_test --full-b)
+  add_test(NAME ninfer_qwen3_8_27b_nvfp4_full_c_load_plan_test
+    COMMAND ninfer_qwen3_8_27b_nvfp4_full_load_plan_test --full-c)
   set_tests_properties(
     ninfer_qwen3_8_27b_nvfp4_full_load_plan_test
     ninfer_qwen3_8_27b_nvfp4_full_b_load_plan_test
+    ninfer_qwen3_8_27b_nvfp4_full_c_load_plan_test
     PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test

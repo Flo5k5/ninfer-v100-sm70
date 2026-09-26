@@ -33,9 +33,10 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     }
     if (policy == LinearPolicy::A16Only) {
 #ifdef NINFER_VOLTA_BUILD
-        // Prepacked down projections are consumed by QPN2 for every decode width. Materialize the
-        // projection and add the residual separately because the row-major fused kernels cannot
-        // read that load-time layout.
+        // The loader prepacks the NVFP4 down projections, and the NVFP4 attention and GDN output
+        // projections of nvfp4-full-c, for QPN2, which serves every decode width. Wider calls
+        // materialize the projection and add the residual separately, because the row-major fused
+        // kernels cannot read that load-time layout.
         return Nvfp4LinearAddRoute::LinearThenAdd;
 #else
         return Nvfp4LinearAddRoute::A16;
@@ -188,16 +189,24 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
     const Nvfp4LinearAddRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
-    if (route == Nvfp4LinearAddRoute::A16) {
-        launch_a16(x, weight, residual, stream);
-        return;
-    }
 #ifdef NINFER_VOLTA_BUILD
     if (route == Nvfp4LinearAddRoute::LinearThenAdd) {
         launch_linear_then_add(x, weight, residual, workspace, stream);
         return;
     }
 #endif
+    // The A16 kernels and the W4A4 GEMM read the checkpoint-native planes only, and
+    // validate_nvfp4_weight admits a weight prepacked for the Volta QPN kernels: refuse it before
+    // any launch instead of reading it wrong.
+    if (weight.layout != QuantLayout::BlockScaleK16M128x4) {
+        throw std::invalid_argument(
+            "nvfp4 linear_add: a QPN-prepacked weight cannot take the A16/W4A4 routes "
+            "(checkpoint-native planes only); use A16Only on sm_70");
+    }
+    if (route == Nvfp4LinearAddRoute::A16) {
+        launch_a16(x, weight, residual, stream);
+        return;
+    }
     auto scope                       = workspace.scope();
     const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(workspace, x.ne[1], weight.k);
     nvfp4_linear_add_w4a4_launch(x, weight, residual, scratch, stream);

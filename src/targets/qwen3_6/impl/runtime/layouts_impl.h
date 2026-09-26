@@ -902,7 +902,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
             throw std::invalid_argument(
                 "an FP32 text residual stream needs an FP8 embedding and FP8/NVFP4 residual "
                 "projections; this weights profile has no FP32 form (qwen3.8-27b/nvfp4, "
-                "nvfp4-full-a and nvfp4-full-b only)");
+                "nvfp4-full-a, nvfp4-full-b and nvfp4-full-c only)");
         }
         if (options.speculative.backend == SpeculativeBackend::DFlash ||
             options.speculative.backend == SpeculativeBackend::DFlash2) {

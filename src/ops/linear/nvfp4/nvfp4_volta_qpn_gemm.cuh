@@ -521,9 +521,11 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
 //   - down (5120 rows, 160 CTAs): SPLITK=8 tops out, 16 is worse -- for the unbatched loop. The
 //     prepacked kernel's batched group loads flip that: SPLITK=16 there (see `down` below).
 // NACC barely moves any of them once SPLITK is right, so it only varies where it measured a real
-// (if small) edge. Geometries this dispatch doesn't name (attn/gdn input, the 6144-residual)
-// aren't reached by the mixed artifact's routing and fall to the SPLITK=8 default, which was never
-// worse than production's SPLITK=4 baseline on any measured shape.
+// (if small) edge. Geometries this dispatch doesn't name fall to the SPLITK=8 default, which was
+// never worse than production's SPLITK=4 baseline on any measured shape: the attn/gdn inputs, and
+// the 6144-residual, the attention and GDN output projections (prepacked for Qwen3.8 nvfp4-full-c,
+// checkpoint-native for Qwen3.6 nvfp4). SPLITK=16 on the prepacked 6144-residual, as on `down`,
+// has not been measured.
 template <int kTiles, int SPLITK, int NACC, class Activation, class OutputPolicy>
 void launch_nvfp4_qpn_schedule(bool prepacked, dim3 grid, const std::uint8_t* codes,
                                const std::uint8_t* scales, const Activation* x, int n, int k,

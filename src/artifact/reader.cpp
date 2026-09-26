@@ -24,6 +24,7 @@ constexpr std::array kOfficialRecipes = {
     std::pair{std::string_view{"qwen3_8_27b_nvfp4"}, std::string_view{"nvfp4"}},
     std::pair{std::string_view{"qwen3_8_27b_nvfp4-full-a"}, std::string_view{"nvfp4-full-a"}},
     std::pair{std::string_view{"qwen3_8_27b_nvfp4-full-b"}, std::string_view{"nvfp4-full-b"}},
+    std::pair{std::string_view{"qwen3_8_27b_nvfp4-full-c"}, std::string_view{"nvfp4-full-c"}},
 };
 
 ArtifactIdentity derive_identity(const Directory& directory, const std::filesystem::path& entry) {

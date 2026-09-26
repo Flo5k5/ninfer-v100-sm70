@@ -37,6 +37,8 @@ enum class WeightsProfile : std::uint8_t {
     Qwen38Nvfp4FullA,
     // Qwen38Nvfp4FullA with the attention and GDN input projections moved from FP8 to NVFP4.
     Qwen38Nvfp4FullB,
+    // Qwen38Nvfp4FullB with the attention and GDN output projections moved from FP8 to NVFP4.
+    Qwen38Nvfp4FullC,
 };
 
 using Frontend        = qwen3_6::Frontend;
