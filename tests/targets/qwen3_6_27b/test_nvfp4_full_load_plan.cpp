@@ -84,6 +84,12 @@ static_assert(Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4) &&
                   Variant::fp32_residual_supported(WeightsProfile::Qwen38Nvfp4FullC),
               "the four Qwen3.8 NVFP4 profiles must allow the FP32 text residual");
 
+// Only full C prepacks its NVFP4 attention and GDN outputs at load; the Qwen3.6-27B nvfp4 profile,
+// whose outputs are NVFP4 too, keeps them checkpoint-native.
+static_assert(prepacks_nvfp4_mixer_outputs(WeightsProfile::Qwen38Nvfp4FullC) &&
+                  !prepacks_nvfp4_mixer_outputs(WeightsProfile::Qwen36Nvfp4),
+              "only the full-c profile prepacks its NVFP4 mixer outputs");
+
 // A derived profile under test, and the artifact it derives from.
 struct DerivedProfile {
     const char* label;
@@ -323,6 +329,10 @@ int verify_profile(const DerivedProfile& tested, const std::filesystem::path& pa
         return result;
     }
     if (const int result = verify_fp32_residual_form(plan.bindings); result != 0) { return result; }
+    if (plan.bindings.prepack_nvfp4_mixer_outputs != prepacks_nvfp4_mixer_outputs(tested.profile)) {
+        std::cerr << "the binding plan does not carry the profile's mixer output prepack\n";
+        return 1;
+    }
     std::cout << tested.label << ": " << plan.materialization.device_objects.size()
               << " device objects, " << plan.materialization.device_capacity_bytes
               << " device bytes (MTP, optimized proposal head)\n";

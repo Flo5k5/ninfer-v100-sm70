@@ -258,15 +258,21 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
 }
 
 // An attention or GDN output projection [5120,6144]. It updates the residual stream through
-// linear_add, like the MLP down projection, and an NVFP4 one is prepacked for QPN the same way:
-// every Volta route of the NVFP4 linear_add reads that layout (QPN2 up to 32 columns, the CUTLASS
-// GEMM from 33, for a BF16 or an FP32 residual), and the prepacked QPN2 kernel batches its group
-// loads. FP8 outputs are prepacked by materialized_weight.
-Weight load_mixer_output(const artifact::MaterializedArtifact& materialized,
-                         const WeightPlan& plan) {
+// linear_add, like the MLP down projection. When the profile asks for it
+// (prepacks_nvfp4_mixer_outputs), an NVFP4 one is prepacked for QPN the same way: every Volta route
+// of the NVFP4 linear_add reads that layout (QPN2 up to 32 columns, the CUTLASS GEMM from 33, for a
+// BF16 or an FP32 residual), and the prepacked QPN2 kernel batches its group loads. Otherwise it
+// stays checkpoint-native, which the same routes also read. FP8 outputs are prepacked by
+// materialized_weight.
+Weight load_mixer_output(const artifact::MaterializedArtifact& materialized, const WeightPlan& plan,
+                         bool prepack_nvfp4) {
     Weight out = materialized_weight(materialized, plan, 5120, 6144);
 #ifdef NINFER_VOLTA_BUILD
-    if (out.qtype == QType::NVFP4) { ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out); }
+    if (prepack_nvfp4 && out.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out);
+    }
+#else
+    (void)prepack_nvfp4;
 #endif
     return out;
 }
@@ -577,6 +583,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     BindingPlan& out = load_plan.bindings;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
+    out.prepack_nvfp4_mixer_outputs = prepacks_nvfp4_mixer_outputs(weights_profile);
 
     const NumericFormat head_format = output_head_format(weights_profile);
 #ifndef NINFER_VOLTA_BUILD
@@ -714,7 +721,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                               NumericFormat::BF16, {256});
             target.key_norm   = artifact::materialized_tensor(backing, source.attention.key_norm,
                                                               NumericFormat::BF16, {256});
-            target.output     = load_mixer_output(backing, source.attention.output);
+            target.output     = load_mixer_output(backing, source.attention.output,
+                                                  plan.prepack_nvfp4_mixer_outputs);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120});
             target.post_mixer = load_mlp(source.mlp, backing);
@@ -732,7 +740,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.projection.input_projection   = load_gdn_input_projection(source.gdn, backing);
             target.norm =
                 artifact::materialized_tensor(backing, source.gdn.norm, NumericFormat::BF16, {128});
-            target.output              = load_mixer_output(backing, source.gdn.output);
+            target.output =
+                load_mixer_output(backing, source.gdn.output, plan.prepack_nvfp4_mixer_outputs);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120});
             target.post_mixer = load_mlp(source.mlp, backing);

@@ -33,10 +33,10 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     }
     if (policy == LinearPolicy::A16Only) {
 #ifdef NINFER_VOLTA_BUILD
-        // The loader prepacks the NVFP4 down projections and the NVFP4 attention and GDN output
-        // projections for QPN2, which serves every decode width. Wider calls materialize the
-        // projection and add the residual separately, because the row-major fused kernels cannot
-        // read that load-time layout.
+        // The loader prepacks the NVFP4 down projections, and the NVFP4 attention and GDN output
+        // projections of nvfp4-full-c, for QPN2, which serves every decode width. Wider calls
+        // materialize the projection and add the residual separately, because the row-major fused
+        // kernels cannot read that load-time layout.
         return Nvfp4LinearAddRoute::LinearThenAdd;
 #else
         return Nvfp4LinearAddRoute::A16;

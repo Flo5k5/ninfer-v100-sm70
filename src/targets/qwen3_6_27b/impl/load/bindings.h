@@ -156,7 +156,19 @@ struct BindingPlan {
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
     qwen3_6::VisionMergerNormPlan vision_merger_norm;
+
+    // Whether the loader prepacks NVFP4 attention and GDN output projections for QPN on Volta
+    // (prepacks_nvfp4_mixer_outputs of the bound profile).
+    bool prepack_nvfp4_mixer_outputs = false;
 };
+
+// Profiles whose NVFP4 attention and GDN output projections are prepacked for QPN at load on
+// Volta. Qwen36Nvfp4 keeps its outputs checkpoint-native, its load path unchanged by the full-c
+// profile: the prepacked and native QPN2 kernels decode the same FP16 weights, but that profile
+// has not been validated with the prepacked layout.
+[[nodiscard]] constexpr bool prepacks_nvfp4_mixer_outputs(WeightsProfile weights_profile) {
+    return weights_profile == WeightsProfile::Qwen38Nvfp4FullC;
+}
 
 struct ArtifactLoadPlan {
     BindingPlan bindings;
