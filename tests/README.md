@@ -14,6 +14,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
   that rewrite a published artifact;
 - `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
   using independent numerical/state-transition oracles at real supported shapes;
+- `ops/test_shared_carveout_sm70.cu` — Volta only: every q5 row-split GEMV and w8 SIMT kernel its
+  launchers run carries its own shared-memory carveout request (private launch attribute, pinned
+  on purpose);
 - `ops/linear/` — weight/activation-profile-specific public Linear conformance tests plus their
   one shared input generator, FP64 GEMM oracle, tolerance registry, and output/effects mechanics;
 - `ops/linear_add/`, `ops/linear_pair/`, `ops/linear_swiglu/` — fused-Op suites split by registered
@@ -58,6 +61,13 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `test_artifact_typed_binding.cpp` — resolution of the fused Qwen3.6-35B-A3B MoE parents that the
   Volta binder requests by v2 name onto the v3 logical parameters that cover them, and rejection
   of a v3 layout whose parameters are out of v2 row order, incomplete, or a partial slice;
+- `test_per_device_once.cpp` — per-device keying, once-per-device initialization, concurrent first
+  use, and the allocation-free steady state of the cache used for kernel attributes and device
+  facts, under a simulated device ordinal (no GPU);
+- `lint_per_device_setup.py` — source lint rejecting a `cudaFuncSetAttribute` or
+  `cudaFuncSetCacheConfig` issued from a plain `static` initializer under `src/ops`;
+- `test_per_device_kernel_attributes.cu` — a kernel above the 48 KiB dynamic shared-memory default,
+  configured and launched on device 0 then device 1 (skips with fewer than two GPUs);
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.

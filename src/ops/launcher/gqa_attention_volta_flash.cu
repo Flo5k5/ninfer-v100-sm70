@@ -21,6 +21,7 @@
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
+#include "core/per_device.h"
 #include "core/tensor.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
@@ -328,19 +329,21 @@ struct FlashLaunchConfig {
     int    nsm            = 0;
 };
 
-// One cached config per geometry: the shared-memory and occupancy figures depend
-// only on the tiling, so they are resolved once per instantiation.
+// One cached config per geometry and device: the shared-memory figure depends only on
+// the tiling, but the SM count, the occupancy and the kernel's shared-memory attribute
+// belong to the current device, so they are resolved once per instantiation and device.
 template <typename Geometry>
 const FlashLaunchConfig& flash_launch_config() {
     using P = VoltaFlashParams<Geometry>;
 
-    static const FlashLaunchConfig config = [] {
+    static PerDeviceOnce<FlashLaunchConfig> configs;
+    return configs.get([] {
         FlashLaunchConfig c;
 
         int device = 0;
-        cudaGetDevice(&device);
+        CUDA_CHECK(cudaGetDevice(&device));
         cudaDeviceProp prop{};
-        cudaGetDeviceProperties(&prop, device);
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
         c.nsm = prop.multiProcessorCount;
 
         const int cc = prop.major * 100 + prop.minor * 10;
@@ -369,14 +372,14 @@ const FlashLaunchConfig& flash_launch_config() {
             :          shared_Q + shared_KV + shared_mask);
 
         auto kernel = flash_attn_ext_f16<kDKQ, kDV, P::kNcols1, P::kNcols2, false, false>;
-        cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel),
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, c.nbytes_shared);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &c.blocks_per_sm, reinterpret_cast<const void *>(kernel), c.nthreads, c.nbytes_shared);
+        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(c.nbytes_shared)));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &c.blocks_per_sm, reinterpret_cast<const void*>(kernel), c.nthreads, c.nbytes_shared));
         if (c.blocks_per_sm <= 0) { c.blocks_per_sm = 1; }
         return c;
-    }();
-    return config;
+    });
 }
 
 // One Q-block through the vendored kernel plus its stream-K fixup.

@@ -18,7 +18,9 @@
 // (8 uint4), 32 scale bytes (2 uint4). All weight reads are fully coalesced 128-bit
 // loads, so the kernel runs DRAM-bound instead of L1/LSU- or latency-bound.
 
+#include "core/device.h"
 #include "core/pdl.cuh"
+#include "core/per_device.h"
 #include "ops/common/math.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -211,16 +213,17 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
 // 96KB Volta permits), which -- combined with the register fix above -- still caps occupancy at
 // 3 blocks/SM by shared memory (65.54KB / ~21.5KB per block) even after registers stop being the
 // limiter. cudaFuncAttributePreferredSharedMemoryCarveout=100 asks the driver to favor shared
-// memory over L1 for this specific kernel; done once per instantiation (static local, so each
-// distinct template instantiation gets its own one-time call) since this is a driver call, not
-// free to repeat every decode step.
-template <typename KernelPtr>
-inline void q5_rowsplit_gemv_request_max_shared_carveout(KernelPtr kernel) {
-    static bool done = [&] {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-        return true;
-    }();
-    (void)done;
+// memory over L1 for this specific kernel. The attribute belongs to one kernel on one device, so
+// the request is made once per kernel instantiation and device: it is a driver call, not free to
+// repeat every decode step.
+template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kResidual>
+inline void q5_rowsplit_gemv_request_max_shared_carveout() {
+    static PerDeviceOnce<cudaError_t> carveout;
+    CUDA_CHECK(carveout.get([] {
+        return cudaFuncSetAttribute(
+            q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, kResidual>,
+            cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    }));
 }
 #endif
 
@@ -233,8 +236,7 @@ inline void q5_rowsplit_gemv_launch_kernel(const __nv_bfloat16* x, const std::ui
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     const int grid              = kN / kRowsPerBlock;
 #ifdef NINFER_VOLTA_BUILD
-    q5_rowsplit_gemv_request_max_shared_carveout(
-        q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, false>);
+    q5_rowsplit_gemv_request_max_shared_carveout<kN, kK, kRowsPerBlock, kStages, kStageX, false>();
 #endif
     q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, false>
         <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, out, nullptr);
@@ -248,8 +250,7 @@ q5_rowsplit_gemv_residual_launch_kernel(const __nv_bfloat16* x, const std::uint8
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     const int grid              = kN / kRowsPerBlock;
 #ifdef NINFER_VOLTA_BUILD
-    q5_rowsplit_gemv_request_max_shared_carveout(
-        q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, true>);
+    q5_rowsplit_gemv_request_max_shared_carveout<kN, kK, kRowsPerBlock, kStages, kStageX, true>();
 #endif
     q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, true>
         <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, residual_out, nullptr);

@@ -268,6 +268,11 @@ policy, template instantiation, and launch-error handling. Launcher headers are 
 contract headers, targets, product code, permanent tests, and public benchmarks do not include
 them.
 
+Kernel attributes (`cudaFuncSetAttribute`, `cudaFuncSetCacheConfig`) and device facts (SM count,
+occupancy, shared-memory limits) belong to one device. A launcher that sets or caches one lazily
+keys it by device with a function-local `static PerDeviceOnce<T>` (`src/core/per_device.h`), never
+with a plain `static` initialized once per process.
+
 ### 4.3 Kernel and common facilities
 
 The kernel layer owns `__global__` functions and Op-local `__device__` computation. A kernel may

@@ -73,6 +73,8 @@ ninfer_add_test(ninfer_media_decode_test
   SOURCES test_media_decode.cpp
   LIBRARIES ninfer_media_decode)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
+ninfer_add_test(ninfer_per_device_kernel_attributes_test
+  SOURCES test_per_device_kernel_attributes.cu)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
@@ -127,6 +129,7 @@ ninfer_add_test(ninfer_gdn_replay_records_test
 set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test
+  ninfer_per_device_kernel_attributes_test
   ninfer_decode_graph_test
   ninfer_arena_test
   ninfer_kv_cache_test
@@ -307,6 +310,19 @@ target_include_directories(ninfer_context_cost_measure_test PRIVATE
   ${PROJECT_SOURCE_DIR}/bench/context_cost)
 add_test(NAME ninfer_context_cost_measure_test COMMAND ninfer_context_cost_measure_test)
 
+# Pure host-side qualification of the per-device once cache under a simulated device ordinal. It
+# deliberately links no CUDA target, so it runs on machines without a GPU.
+add_executable(ninfer_per_device_once_test test_per_device_once.cpp)
+target_include_directories(ninfer_per_device_once_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(ninfer_per_device_once_test PRIVATE Threads::Threads)
+add_test(NAME ninfer_per_device_once_test COMMAND ninfer_per_device_once_test)
+
+# Source lint: kernel attributes belong to one device, so src/ops never sets one from a plain
+# static initializer (docs/maintainer/op-development.md, section 4.2).
+add_test(NAME ninfer_per_device_setup_lint_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/lint_per_device_setup.py
+          ${PROJECT_SOURCE_DIR}/src/ops)
+
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
   add_bias
@@ -413,6 +429,9 @@ else()
 ninfer_add_op_test(ninfer_linear_fp8_row_scale_sm70_test
   SOURCES ops/linear/test_fp8_row_scale_sm70.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_shared_carveout_sm70_test
+  SOURCES ops/test_shared_carveout_sm70.cu
+  LIBRARIES ninfer_ops)
 endif()
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
@@ -501,6 +520,7 @@ endforeach()
 set(ninfer_gpu_contract_tests
   ninfer_artifact_materialization_test
   ninfer_device_test
+  ninfer_per_device_kernel_attributes_test
   ninfer_decode_graph_test
   ninfer_arena_test
   ninfer_kv_cache_test

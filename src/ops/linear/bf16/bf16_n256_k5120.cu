@@ -1,6 +1,7 @@
 #include "ops/linear/bf16/bf16_launch.h"
 
 #include "core/device.h"
+#include "core/per_device.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/bf16/bf16_n256_k5120.cuh"
 
@@ -16,10 +17,12 @@ void launch_chunk(const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bflo
                   std::int32_t tokens, cudaStream_t stream) {
     constexpr int kRowTiles = 256 / Schedule::kOutputRowsPerCta;
     const dim3 grid(kRowTiles, (tokens + Schedule::kTileTokens - 1) / Schedule::kTileTokens);
-    static const cudaError_t attr =
-        cudaFuncSetAttribute(bf16_n256_k5120_mma_kernel<Schedule>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-    CUDA_CHECK(attr);
+    static PerDeviceOnce<cudaError_t> attr;
+    CUDA_CHECK(attr.get([&] {
+        return cudaFuncSetAttribute(bf16_n256_k5120_mma_kernel<Schedule>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    Schedule::kSharedBytes);
+    }));
     bf16_n256_k5120_mma_kernel<Schedule>
         <<<grid, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(x, weight, out, tokens);
     CUDA_CHECK(cudaGetLastError());

@@ -18,6 +18,7 @@
 #include "fattn-sm70-d256-kernel.cuh" // vendored
 
 #include "core/device.h"
+#include "core/per_device.h"
 #include "core/tensor.h"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
@@ -91,12 +92,16 @@ const auto kSplitKernel =
     FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<Element, false, float, true, false, false>;
 
 void raise_shared_memory_limit() {
-    static const cudaError_t dense = cudaFuncSetAttribute(
-        kDenseKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SplitDTraits::kSmemBytes);
-    static const cudaError_t split = cudaFuncSetAttribute(
-        kSplitKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SplitDTraits::kSmemBytes);
-    CUDA_CHECK(dense);
-    CUDA_CHECK(split);
+    static PerDeviceOnce<cudaError_t> dense;
+    static PerDeviceOnce<cudaError_t> split;
+    CUDA_CHECK(dense.get([] {
+        return cudaFuncSetAttribute(kDenseKernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    SplitDTraits::kSmemBytes);
+    }));
+    CUDA_CHECK(split.get([] {
+        return cudaFuncSetAttribute(kSplitKernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    SplitDTraits::kSmemBytes);
+    }));
 }
 
 std::int32_t padded_rows(std::int32_t tokens) {
