@@ -14,6 +14,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
   that rewrite a published artifact;
 - `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
   using independent numerical/state-transition oracles at real supported shapes;
+- `ops/test_shared_carveout_sm70.cu` — Volta only: every q5 row-split GEMV and w8 SIMT kernel its
+  launchers run carries its own shared-memory carveout request (private launch attribute, pinned
+  on purpose);
 - `ops/linear/` — weight/activation-profile-specific public Linear conformance tests plus their
   one shared input generator, FP64 GEMM oracle, tolerance registry, and output/effects mechanics;
 - `ops/linear_add/`, `ops/linear_pair/`, `ops/linear_swiglu/` — fused-Op suites split by registered
