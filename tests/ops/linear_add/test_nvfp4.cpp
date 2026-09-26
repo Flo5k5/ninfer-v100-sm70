@@ -365,8 +365,8 @@ int run_fp32_residual_shape(std::int32_t n, std::int32_t k, std::int32_t first_w
 }
 
 // The W4A4 route reads the checkpoint-native planes only. A QPN-prepacked weight, the layout of
-// every NVFP4 down and mixer output projection loaded on Volta, must be refused before any launch
-// and leave the residual as it was.
+// every NVFP4 down projection and of the nvfp4-full-c attention and GDN output projections loaded
+// on Volta, must be refused before any launch and leave the residual as it was.
 int run_prepacked_w4a4_refusal(std::int32_t n, std::int32_t k, std::int32_t first_w4a4,
                                std::uint32_t seed) {
     quantized_weight::PatternedWeightOptions options;
