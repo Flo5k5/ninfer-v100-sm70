@@ -291,7 +291,7 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                         static_cast<unsigned>(Geometry::kHeads / kBf16GdnBlockM),
                         static_cast<unsigned>(SplitK));
         auto launch = [&](auto full_tokens) {
-            constexpr bool FullTokens     = decltype(full_tokens)::value;
+            constexpr bool FullTokens = decltype(full_tokens)::value;
             static PerDeviceOnce<cudaError_t> attr;
             CUDA_CHECK(attr.get([&] {
                 return cudaFuncSetAttribute(
